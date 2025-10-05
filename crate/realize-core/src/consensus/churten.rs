@@ -6,7 +6,7 @@ use super::tracker::{JobInfo, JobInfoTracker};
 use super::types::{ChurtenNotification, JobProgress};
 use crate::rpc::{Household, HouseholdOperationError, PeerStatus};
 use futures::StreamExt;
-use realize_storage::{Job, JobId, JobStatus, Storage};
+use realize_storage::{Job, JobId, JobStatus, Storage, StorageError};
 use realize_types::Arena;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -194,6 +194,7 @@ async fn background_job<H: JobHandler>(
                         Ok(status) => Ok(status),
                         Err(JobError::Household(HouseholdOperationError::NoPeers))  => Ok(JobStatus::NoPeers),
                         Err(JobError::Household(HouseholdOperationError::Disconnected))  => Ok(JobStatus::NoPeers),
+                        Err(JobError::Storage(StorageError::InvalidBlobState))  => Ok(JobStatus::Abandoned("invalid blob state")),
                         Err(err) => {
                             if shutdown.is_cancelled() {
                                 Ok(JobStatus::Cancelled)

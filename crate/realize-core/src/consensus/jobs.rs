@@ -18,10 +18,6 @@ use tokio_util::sync::CancellationToken;
 /// reasonably well into one message without slowing everything down.
 const RSYNC_BLOCK_SIZE: usize = 32 * 1024; // 32K
 
-/// Interval at which to update the database during downloads, in
-/// bytes.
-const UPDATE_DB_INTERVAL_BYTES: u64 = 4 * 1024 * 1024; // 4M
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum JobError {
     #[error("{0}")]
@@ -69,9 +65,10 @@ pub(crate) async fn download(
     if *blob.hash() != *hash {
         return Ok(JobStatus::Abandoned("hash mismatch"));
     }
-    match blob.cache_status() {
-        CacheStatus::Verified => return Ok(JobStatus::Done),
-        CacheStatus::Complete => {
+    match blob.cache_status().await {
+        None => return Ok(JobStatus::Abandoned("blob detached")),
+        Some(CacheStatus::Verified) => return Ok(JobStatus::Done),
+        Some(CacheStatus::Complete) => {
             let avail = match blob.remote_availability().await? {
                 Some(a) => a,
                 None => {
@@ -81,7 +78,7 @@ pub(crate) async fn download(
             return verify(household, job_id, blob, avail, progress, shutdown).await;
         }
 
-        CacheStatus::Missing | CacheStatus::Partial(_, _) => {
+        Some(CacheStatus::Missing) | Some(CacheStatus::Partial(_, _)) => {
             let avail = match blob.remote_availability().await? {
                 Some(a) => a,
                 None => {
@@ -122,13 +119,12 @@ async fn write_to_blob(
     progress: &mut impl ByteCountProgress,
     shutdown: CancellationToken,
 ) -> Result<JobStatus, JobError> {
-    let missing = ByteRanges::single(0, blob.size()).subtraction(blob.available_range());
+    let missing = ByteRanges::single(0, blob.size()).subtraction(&blob.available_range());
     if missing.is_empty() {
         return Ok(JobStatus::Done);
     }
     let total_bytes = missing.bytecount();
     let mut current_bytes: u64 = 0;
-    let mut last_update_bytes = 0;
     progress.update_action(JobAction::Download);
     progress.update(0, total_bytes);
     let arena = avail.arena;
@@ -155,11 +151,6 @@ async fn write_to_blob(
 
             current_bytes += chunk.len() as u64;
             progress.update(current_bytes, total_bytes);
-
-            if current_bytes - last_update_bytes >= UPDATE_DB_INTERVAL_BYTES {
-                let _ = blob.update_db().await;
-                last_update_bytes = current_bytes;
-            }
         }
     }
 
@@ -227,7 +218,6 @@ pub(crate) async fn verify(
 
         progress.update(range.end, size);
     }
-    blob.flush_and_sync().await?;
 
     log::debug!("[{arena}] Job #{job_id}: Repaired; Verify");
     progress.update_action(JobAction::Verify);
@@ -440,7 +430,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 12), *blob.available_range());
+                assert_eq!(ByteRanges::single(0, 12), blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;
@@ -548,7 +538,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
+                assert_eq!(ByteRanges::single(0, 21), blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;
@@ -606,7 +596,7 @@ mod tests {
                 );
 
                 let mut blob = fixture.open_file(a, "foobar").await?;
-                assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
+                assert_eq!(ByteRanges::single(0, 21), blob.available_range());
 
                 let mut buf = String::new();
                 blob.read_to_string(&mut buf).await?;

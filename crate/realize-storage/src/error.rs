@@ -69,6 +69,9 @@ pub enum StorageError {
 
     #[error("local file metadata not as expected")]
     LocalFileMismatch,
+
+    #[error("blob invalid for the operation")]
+    InvalidBlobState,
 }
 
 impl StorageError {
@@ -114,6 +117,7 @@ impl StorageError {
             StorageError::NoPeers => InvalidData,
             StorageError::NotIndexed => InvalidInput,
             StorageError::LocalFileMismatch => NotFound,
+            StorageError::InvalidBlobState => InvalidData,
         }
     }
 

@@ -10,21 +10,22 @@ use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{RemoteAvailability, StorageError};
 use priority_queue::PriorityQueue;
-use realize_types::{ByteRange, ByteRanges, Hash};
+use realize_types::{ByteRanges, Hash};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, ReadBuf};
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
+
+mod file;
 
 /// Background job that marks blobs that are accessed after a cooldown delay.
 ///
@@ -78,8 +79,6 @@ pub(crate) async fn mark_accessed_loop(
 
 pub(crate) struct Blobs {
     blob_dir: PathBuf,
-    /// Reference counter for open blobs. Maps PathId to the number of open handles.
-    open_blobs: OpenBlobRefCounter,
 
     disk_usage_tx: watch::Sender<DiskUsage>,
 
@@ -88,10 +87,11 @@ pub(crate) struct Blobs {
 
     /// Report blob accesses
     accessed_tx: broadcast::Sender<PathId>,
+
+    registry: Arc<file::BlobFileRegistry>,
 }
 impl Blobs {
     pub(crate) fn setup(
-        tag: Tag,
         blob_dir: &std::path::Path,
         blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
     ) -> Result<Blobs, StorageError> {
@@ -103,10 +103,10 @@ impl Blobs {
         let (accessed_tx, _) = broadcast::channel(16);
         Ok(Self {
             blob_dir: blob_dir.to_path_buf(),
-            open_blobs: OpenBlobRefCounter::new(tag),
             disk_usage_tx: tx,
             _disk_usage_tx: rx,
             accessed_tx,
+            registry: file::BlobFileRegistry::new(),
         })
     }
 
@@ -170,11 +170,14 @@ pub(crate) struct WritableOpenBlob<'a> {
     /// If true, an after-commit has been registered to report disk usage at
     /// the end of the transaction.
     will_report_disk_usage: bool,
+
+    registry: Arc<file::BlobFileRegistry>,
 }
 
 impl<'a> WritableOpenBlob<'a> {
     pub(crate) fn new(
         tag: Tag,
+        blobs: &Blobs,
         before_commit: &'a BeforeCommit,
         blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
@@ -187,6 +190,7 @@ impl<'a> WritableOpenBlob<'a> {
             blob_lru_queue_table,
             subsystem,
             will_report_disk_usage: false,
+            registry: Arc::clone(&blobs.registry),
         }
     }
 
@@ -514,7 +518,8 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(());
         }
         let blob_path = self.subsystem.blob_dir.join(pathid.hex());
-        if blob_path.exists() {
+        if let Ok(m) = blob_path.metadata() {
+            self.registry.realize_blocking(&m);
             std::fs::remove_file(&blob_path)?;
         }
         self.report_disk_usage_changed();
@@ -576,7 +581,7 @@ impl<'a> WritableOpenBlob<'a> {
     ///
     /// Upon success, return the path of the blob file. That file
     /// should be moved; The blob entry has been deleted already.
-    pub(crate) fn prepare_export<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn realize<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
@@ -586,11 +591,14 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(None), // Nothing to export
         };
         let realpath = self.subsystem.blob_dir.join(pathid.hex());
-        if !realpath.exists() {
-            return Ok(None);
-        }
+        let m = match realpath.metadata() {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+
         self.remove_blob_entry(tree, pathid)?;
         self.report_disk_usage_changed();
+        self.registry.realize_blocking(&m);
 
         Ok(Some(realpath))
     }
@@ -764,9 +772,6 @@ impl<'a> WritableOpenBlob<'a> {
             let current = follow_queue_link(&self.blob_table, current_id)?;
             prev = current.prev;
 
-            if self.subsystem.open_blobs.is_open(current_id) {
-                continue;
-            }
             log::debug!(
                 "[{}] Evicted blob from WorkingArea: {current_id} ({} bytes)",
                 current.disk_usage,
@@ -1120,10 +1125,8 @@ pub struct Blob {
     info: BlobInfo,
     file: tokio::fs::File,
     db: Arc<ArenaDatabase>,
-
-    /// Updates to the available range already integrated into
-    /// available_range but not yet reported to update_tx.
-    pending_ranges: ByteRanges,
+    shared: Arc<file::SharedBlobFile>,
+    range_rx: watch::Receiver<file::ReadableRange>,
 
     /// The read/write/seek position.
     offset: u64,
@@ -1157,7 +1160,7 @@ impl Blob {
             .write(true)
             .truncate(false)
             .create(true)
-            .open(path)?;
+            .open(&path)?;
         let file_meta = file.metadata()?;
         if info.size != file_meta.len() {
             file.set_len(info.size)?;
@@ -1165,15 +1168,17 @@ impl Blob {
         }
 
         let blobs = db.blobs();
-        blobs.open_blobs.increment(info.pathid);
+        let shared = blobs.registry.get(db, &path, &info)?;
+        let range_rx = shared.subscribe();
         let _ = blobs.accessed_tx.send(info.pathid);
 
         Ok(Self {
             info,
-            file: tokio::fs::File::from_std(file),
             db: Arc::clone(db),
-            pending_ranges: ByteRanges::new(),
+            file: tokio::fs::File::from_std(file),
+            shared,
             offset: 0,
+            range_rx,
         })
     }
 
@@ -1191,66 +1196,47 @@ impl Blob {
 
     /// Get the parts of the file that are available locally.
     ///
-    /// This might differ from local availability as reported by the
-    /// cache, since this:
-    /// - includes ranges that have been written to the file, but
-    ///   haven't been flushed yet.
-    /// - does not include ranges written through other file handles
-    pub fn available_range(&self) -> &ByteRanges {
-        &self.info.available_ranges
+    /// This might not include ranges that have recently been updated,
+    /// if [Blob::update_db] hasn't been called.
+    pub fn available_range(&self) -> ByteRanges {
+        match &*self.range_rx.borrow() {
+            file::ReadableRange::Limited(r) => r.clone(),
+            file::ReadableRange::Direct => ByteRanges::single(0, self.info.size),
+        }
     }
 
     /// Return local availability for the blob.
     ///
     /// This is based on the [Blob::available_range] so might return a
     /// different result than if you checked the database.
-    pub fn cache_status(&self) -> CacheStatus {
-        self.info.cache_status()
+    ///
+    /// Returns None if the blob has been taken out of the cache (realized).
+    pub async fn cache_status(&self) -> Option<CacheStatus> {
+        self.shared.cache_status().await
     }
 
     /// Cache data from a remote peer locally, into the blob file.
     ///
     /// This call writes to the file and modifies the file offset. It
     /// does nothing if the range is already available.
-    pub async fn update(&mut self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
-        if buf.len() == 0 {
-            return Ok(());
-        }
-        let start = offset;
-        let end = start + buf.len() as u64;
-        let range = ByteRanges::single(start, end);
-        if self.info.available_ranges.intersection(&range) == range {
-            return Ok(());
-        }
-
-        if offset != self.offset {
-            self.seek(SeekFrom::Start(offset)).await?;
-        }
-        self.file.write_all(buf).await?;
-
-        self.offset = end;
-
-        let range = ByteRange::new(start, end);
-        self.info.available_ranges.add(&range);
-        self.pending_ranges.add(&range);
-
-        Ok(())
+    ///
+    /// Return [StorageError::InvalidBlobState] if the blob is not
+    /// updatable. This might happen even if the blob was updatable
+    /// when the method was called, but was deleted or realized was
+    /// being updated.
+    pub async fn update(&mut self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        self.shared.update(offset, buf).await
     }
 
     /// Repair the file content at [offset], without updating
     /// available range.
-    pub async fn repair(&mut self, offset: u64, buf: &[u8]) -> Result<(), std::io::Error> {
-        if buf.len() == 0 {
-            return Ok(());
-        }
-        if offset != self.offset {
-            self.seek(SeekFrom::Start(offset)).await?;
-        }
-        self.file.write_all(buf).await?;
-
-        self.offset = offset + (buf.len() as u64);
-
-        Ok(())
+    ///
+    /// Return [StorageError::InvalidBlobState] if the blob is not
+    /// complete. This might happen even if the blob was complete when
+    /// the method was called, but was deleted or realized while it
+    /// was being repaired.
+    pub async fn repair(&mut self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        self.shared.repair(offset, buf).await
     }
 
     /// Return the information needed for fetching data for that blob
@@ -1292,95 +1278,29 @@ impl Blob {
 
     /// Check whether the file content matches the hash, if yes, mark
     /// the blob as verified and return true if the file was verified.
+    ///
+    /// Return:
+
+    /// - Ok(true) if the file was verified successfully
+    /// - Ok(false) if the hash didn't match.
+    /// - Err([StorageError::InvalidBlobState]) if the blob is not
+    ///   complete. This might happen even if the blob was complete
+    ///   when the method was called, but was deleted or realized
+    ///   while it was being verified.
     pub async fn verify(&mut self) -> Result<bool, StorageError> {
-        if self.info.verified {
-            return Ok(true);
-        }
+        self.shared.prepare_for_verification().await?;
         let hash = self.compute_hash().await?;
         if hash != self.info.hash {
             return Ok(false);
         }
+        self.shared.mark_verified().await?;
 
-        self.mark_verified().await?;
         Ok(true)
     }
 
-    /// Flush and mark file content as verified on the database.
-    async fn mark_verified(&mut self) -> Result<bool, StorageError> {
-        self.update_db().await?;
-
-        self.info.verified = true;
-        let pathid = self.info.pathid;
-        let db = self.db.clone();
-        let hash = self.info.hash.clone();
-        tokio::task::spawn_blocking(move || {
-            let txn = db.begin_write()?;
-            {
-                let mut blobs = txn.write_blobs()?;
-                if !blobs.mark_verified(
-                    &mut txn.read_tree()?,
-                    &mut txn.write_dirty()?,
-                    pathid,
-                    &hash,
-                )? {
-                    return Ok(false);
-                }
-            };
-            txn.commit()?;
-            Ok::<bool, StorageError>(true)
-        })
-        .await?
-    }
-
-    /// Make sure any updated content is stored on disk before
-    /// continuing.
-    pub async fn flush_and_sync(&mut self) -> std::io::Result<()> {
-        self.file.flush().await?;
-        self.file.sync_all().await?;
-
-        Ok(())
-    }
-
     /// Flush data and report any ranges written to to the database.
-    pub async fn update_db(&mut self) -> Result<bool, StorageError> {
-        if self.pending_ranges.is_empty() {
-            return Ok(false);
-        }
-        self.flush_and_sync().await?;
-
-        let pathid = self.info.pathid;
-        let ranges = self.pending_ranges.clone();
-        let db = Arc::clone(&self.db);
-        let hash = self.info.hash.clone();
-
-        let (res, ranges) = tokio::task::spawn_blocking(move || {
-            fn extend(
-                db: Arc<ArenaDatabase>,
-                pathid: PathId,
-                hash: &Hash,
-                ranges: &ByteRanges,
-            ) -> Result<bool, StorageError> {
-                let txn = db.begin_write()?;
-                {
-                    let mut blobs = txn.write_blobs()?;
-                    if !blobs.extend_cache_status(&mut txn.read_tree()?, pathid, &hash, &ranges)? {
-                        // The blob has changed in the database
-                        return Ok(false);
-                    }
-                }
-                txn.commit()?;
-                Ok(true)
-            }
-
-            (extend(db, pathid, &hash, &ranges), ranges)
-        })
-        .await?;
-        if matches!(res, Ok(true)) {
-            // Keep the range as pending again, since updating failed.
-            self.pending_ranges = self.pending_ranges.subtraction(&ranges);
-        }
-
-        res
+    pub async fn update_db(&mut self) -> Result<(), StorageError> {
+        self.shared.update_db().await
     }
 
     /// Returns how much data, out of `requested_len` can be read at `offset`.
@@ -1390,27 +1310,37 @@ impl Blob {
     pub fn readable_length(&self, offset: u64, requested_len: usize) -> Option<usize> {
         // It's always possible to read nothing, and nothing is what you'll get.
         // A file can always be read past its end, but yields no data.
-        if requested_len == 0 || offset >= self.size() {
+        if requested_len == 0 {
             return Some(0);
         }
-        // Read what's left in a range containing offset
-        self.info
-            .available_ranges
-            .containing_range(offset)
-            .map(|r| min(requested_len, (r.end - offset) as usize))
+        match &*self.range_rx.borrow() {
+            file::ReadableRange::Direct => Some(requested_len),
+            file::ReadableRange::Limited(r) => {
+                if offset >= self.size() {
+                    return Some(0);
+                }
+
+                r.containing_range(offset)
+                    .map(|r| min(requested_len, (r.end - offset) as usize))
+            }
+        }
     }
 
     /// Realize the blob, that is, move the file into the data
     /// directory, and return the file handle so that the file content
     /// can be modified.
-    pub async fn realize(mut self) -> Result<(std::path::PathBuf, tokio::fs::File), StorageError> {
-        let _guard = self.db.cache().inhibit_watcher();
-        let pathid = self.info.pathid;
-        let db = Arc::clone(&self.db);
-        self.file.flush().await?;
-        self.file.sync_all().await?;
+    pub async fn realize(self) -> Result<tokio::fs::File, StorageError> {
+        let Self { db, info, file, .. } = self;
+        let _guard = db.cache().inhibit_watcher();
+        let pathid = info.pathid;
 
-        let dest = tokio::task::spawn_blocking(move || {
+        if self.shared.cache_status().await.is_none() {
+            // Blob has already been realized, there's nothing to do
+            return Ok(file);
+        }
+
+        // Realize the blob in the database, then move the file.
+        tokio::task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             let source: PathBuf;
             let dest: PathBuf;
@@ -1440,26 +1370,11 @@ impl Blob {
                 return Err(err);
             }
 
-            // Since Blob implements Drop, we can't just take file out.
-            // Cloning works in this case, as the first file gets dropped
-            // right after.
-            Ok(dest)
+            Ok(())
         })
         .await??;
 
-        Ok((dest, self.file.try_clone().await?))
-    }
-}
-
-impl Drop for Blob {
-    fn drop(&mut self) {
-        let blobs = self.db.blobs();
-        if blobs.open_blobs.decrement(self.info.pathid) {
-            // poke disk usage without modifying it so the cleaner
-            // attempts to evict files it couldn't previously evict
-            // because they were open.
-            blobs.disk_usage_tx.send_modify(|_| {});
-        }
+        Ok(file)
     }
 }
 
@@ -1519,57 +1434,6 @@ impl AsyncSeek for Blob {
     }
 }
 
-struct OpenBlobRefCounter {
-    tag: Tag,
-    counts: Mutex<HashMap<PathId, u32>>,
-}
-impl OpenBlobRefCounter {
-    fn new(tag: Tag) -> Self {
-        Self {
-            counts: Mutex::new(HashMap::new()),
-            tag,
-        }
-    }
-
-    fn increment(&self, pathid: PathId) {
-        let mut guard = self.counts.lock().unwrap();
-        *guard.entry(pathid).or_insert(0) += 1;
-        log::trace!(
-            "[{}] Blob {} opened, ref count: {}",
-            self.tag,
-            pathid,
-            guard[&pathid]
-        );
-    }
-
-    /// Decrement refcount for the given pathid.
-    ///
-    /// Returns true once all counters have reached 0.
-    fn decrement(&self, pathid: PathId) -> bool {
-        let mut guard = self.counts.lock().unwrap();
-        if let Some(count) = guard.get_mut(&pathid) {
-            *count = count.saturating_sub(1);
-            log::trace!(
-                "[{}] Blob {} closed, ref count: {}",
-                self.tag,
-                pathid,
-                *count
-            );
-            if *count == 0 {
-                guard.remove(&pathid);
-                log::trace!("[{}] Blob {} removed from open blobs", self.tag, pathid);
-                return guard.is_empty();
-            }
-        }
-
-        false
-    }
-    fn is_open(&self, id: PathId) -> bool {
-        let guard = self.counts.lock().unwrap();
-        guard.contains_key(&id)
-    }
-}
-
 fn get_read_op(
     blob_table: &impl ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
     pathid: PathId,
@@ -1612,7 +1476,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
-    use realize_types::{Arena, Path, Peer, UnixTime};
+    use realize_types::{Arena, ByteRange, Path, Peer, UnixTime};
     use std::io::SeekFrom;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
@@ -1749,21 +1613,34 @@ mod tests {
     #[tokio::test]
     async fn recreate_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let txn = fixture.begin_write()?;
-        let mut blobs = txn.write_blobs()?;
-        let marks = txn.write_marks()?;
-        let mut tree = txn.write_tree()?;
         let path = Path::parse("blob/test1.txt")?;
 
-        let old_info = blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?;
+        let txn = fixture.begin_write()?;
+        let old_info = {
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("old"), 3)?
+        };
+        txn.commit()?;
+
         {
             let mut blob = Blob::open_with_info(&fixture.db, old_info)?;
             blob.update(0, b"old").await?;
-            blob.file.flush().await?;
+            blob.update_db().await?;
         }
 
-        let new_info = blobs.create(&mut tree, &marks, &path, &hash::digest("new!"), 4)?;
+        let txn = fixture.begin_write()?;
+        let new_info = {
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.write_marks()?;
+            let mut tree = txn.write_tree()?;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("new!"), 4)?
+        };
+        txn.commit()?;
 
+        let txn = fixture.begin_read()?;
+        let blobs = txn.read_blobs()?;
         let actual_info = blobs.get_with_pathid(new_info.pathid)?.unwrap();
         assert_eq!(actual_info, new_info);
 
@@ -1959,20 +1836,15 @@ mod tests {
         let mut blob = Blob::open(&fixture.db, &path)?;
 
         blob.update(0, b"Baa, baa").await?;
-        assert_eq!(ByteRanges::single(0, 8), *blob.available_range());
-
-        // At this point, local availability is only in the blob, not
-        // yet stored on the database.
-        assert_eq!(
-            ByteRanges::new(),
-            fixture.blob_info(&path).unwrap().unwrap().available_ranges
-        );
-
-        blob.update(8, b", black sheep").await?;
-        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
+        // File hasn't been flushed and database hasn't been updated
+        // yet.
+        assert_eq!(true, blob.available_range().is_empty());
 
         let watch = fixture.db.blobs().watch_disk_usage();
-        blob.update_db().await?;
+        blob.update(8, b", black sheep").await?;
+        // Database was updated, since the blob is complete
+        assert_eq!(ByteRanges::single(0, 21), blob.available_range());
+
         drop(blob);
         assert!(watch.has_changed()?);
 
@@ -2045,7 +1917,7 @@ mod tests {
         let mut blob = Blob::open(&fixture.db, &path)?;
 
         blob.update(0, b"Baa, baa").await?;
-        assert_eq!(true, blob.update_db().await?);
+        blob.update_db().await?;
         assert_eq!(
             ByteRanges::single(0, 8),
             fixture.blob_info(&path)?.unwrap().available_ranges
@@ -2062,15 +1934,16 @@ mod tests {
         txn.commit()?;
 
         blob.update(8, b", black sheep").await?;
-        assert_eq!(false, blob.update_db().await?);
-        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
+        blob.update_db().await?;
+        assert_eq!(ByteRanges::single(0, 21), blob.available_range());
         assert_eq!(
             ByteRanges::new(),
             fixture.blob_info(&path)?.unwrap().available_ranges
         );
 
-        assert_eq!(false, blob.mark_verified().await?);
-        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
+        assert_eq!(true, blob.verify().await?);
+        assert_eq!(false, fixture.blob_info(&path)?.unwrap().verified);
+        assert_eq!(ByteRanges::single(0, 21), blob.available_range());
         assert_eq!(
             ByteRanges::new(),
             fixture.blob_info(&path)?.unwrap().available_ranges
@@ -2087,8 +1960,8 @@ mod tests {
 
         assert_eq!(false, fixture.blob_info(&path)?.unwrap().verified);
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(ByteRanges::single(0, 21), *blob.available_range());
-        assert_eq!(true, blob.mark_verified().await?);
+        assert_eq!(ByteRanges::single(0, 21), blob.available_range());
+        assert_eq!(true, blob.verify().await?);
         assert_eq!(true, fixture.blob_info(&path)?.unwrap().verified);
         drop(blob);
 
@@ -2121,7 +1994,7 @@ mod tests {
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
         let BlobInfo { pathid, .. } = fixture.blob_info(&path)?.unwrap();
 
-        assert_eq!(true, Blob::open(&fixture.db, &path)?.mark_verified().await?);
+        assert_eq!(true, Blob::open(&fixture.db, &path)?.verify().await?);
 
         // export to dest
         let dest = fixture.tempdir.path().join("moved_blob");
@@ -2129,7 +2002,7 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            let source = blobs.prepare_export(&mut tree, &path)?.unwrap();
+            let source = blobs.realize(&mut tree, &path)?.unwrap();
             std::fs::rename(source, &dest)?;
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2157,7 +2030,7 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            assert_eq!(None, blobs.prepare_export(&mut tree, &path)?);
+            assert_eq!(None, blobs.realize(&mut tree, &path)?);
         }
 
         Ok(())
@@ -2195,7 +2068,7 @@ mod tests {
         assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
-            *blob.available_range()
+            blob.available_range()
         );
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
@@ -2248,7 +2121,7 @@ mod tests {
         assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
-            *blob.available_range()
+            blob.available_range()
         );
         let mut buf = String::new();
         blob.read_to_string(&mut buf).await?;
@@ -2597,18 +2470,23 @@ mod tests {
         blob.update(0, &vec![1u8; 4096]).await?;
         blob.update_db().await?;
 
-        let txn = fixture.begin_write()?;
-        {
-            let mut tree = txn.write_tree()?;
-            let mut blobs = txn.write_blobs()?;
+        tokio::task::spawn_blocking(move || {
+            let txn = fixture.begin_write()?;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut blobs = txn.write_blobs()?;
 
-            assert!(blobs.disk_usage()?.total > 0);
+                assert!(blobs.disk_usage()?.total > 0);
 
-            blobs.delete(&mut tree, &path)?;
+                blobs.delete(&mut tree, &path)?;
 
-            assert_eq!(0, blobs.disk_usage()?.total);
-        }
-        txn.commit()?;
+                assert_eq!(0, blobs.disk_usage()?.total);
+            }
+            txn.commit()?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
 
         Ok(())
     }
@@ -2703,74 +2581,6 @@ mod tests {
         // This does nothing; it just shouldn't fail
         blobs.cleanup(&mut tree, 0)?;
         blobs.cleanup(&mut tree, 8 * 4096)?;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn cleanup_skips_open_blobs() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-
-        let mut pathids = vec![PathId::ZERO; 4];
-        let txn = fixture.begin_write()?;
-        {
-            let mut tree = txn.write_tree()?;
-            let mut blobs = txn.write_blobs()?;
-            let marks = txn.read_marks()?;
-            for i in 0..4 {
-                pathids[i] = blobs
-                    .create(
-                        &mut tree,
-                        &marks,
-                        Path::parse(format!("{i}").as_str())?,
-                        &test_hash(),
-                        4096,
-                    )?
-                    .pathid;
-            }
-        }
-        txn.commit()?;
-
-        for i in 0..4 {
-            let mut blob = Blob::open(&fixture.db, pathids[i])?;
-            blob.update(0, &vec![1u8; 4096]).await?;
-            blob.update_db().await?;
-        }
-
-        let open1 = Blob::open(&fixture.db, pathids[1])?;
-        let open1_again = Blob::open(&fixture.db, pathids[1])?;
-        let open2 = Blob::open(&fixture.db, pathids[2])?;
-
-        let txn = fixture.begin_write()?;
-        let mut tree = txn.write_tree()?;
-        let mut blobs = txn.write_blobs()?;
-        blobs.cleanup(&mut tree, 0)?;
-
-        // blobs 1 and 2 could not be cleaned up, because they were open
-        assert!(blobs.get(&tree, pathids[0])?.is_none());
-        assert!(blobs.get(&tree, pathids[1])?.is_some());
-        assert!(blobs.get(&tree, pathids[2])?.is_some());
-        assert!(blobs.get(&tree, pathids[3])?.is_none());
-
-        assert_eq!(
-            2 * DiskUsage::INODE + 2 * 4096,
-            blobs.disk_usage()?.evictable
-        );
-
-        // dropping open2 allows it to be deleted, but dropping open1 isn't enough
-        drop(open1);
-        drop(open2);
-
-        blobs.cleanup(&mut tree, 0)?;
-
-        assert!(blobs.get(&tree, pathids[1])?.is_some());
-        assert!(blobs.get(&tree, pathids[2])?.is_none());
-
-        // dropping open1_again allows 1 to be deleted
-        drop(open1_again);
-        blobs.cleanup(&mut tree, 0)?;
-
-        assert!(blobs.get(&tree, pathids[1])?.is_none());
 
         Ok(())
     }
@@ -3327,7 +3137,7 @@ mod tests {
         blob.update_db().await?;
 
         // Realize the blob
-        let (realized_path, mut file) = blob.realize().await?;
+        let mut file = blob.realize().await?;
 
         // Verify the file contains the downloaded content
         let mut buf = String::new();
@@ -3335,20 +3145,264 @@ mod tests {
         file.read_to_string(&mut buf).await?;
         assert_eq!(test_data, buf);
 
-        // Make sure the path point to the file.
-        let m_from_file = file.metadata().await?;
-        let m_from_path = tokio::fs::metadata(&realized_path).await?;
-        assert_eq!(
-            (m_from_file.rdev(), m_from_file.ino()),
-            (m_from_path.rdev(), m_from_path.ino())
-        );
-
         // An entry was added to the index with the old hash as base
         let txn = fixture.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
         let indexed = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(Version::Modified(Some(hash)), indexed.version);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn realize_blob_with_open_blobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("test/file.txt")?;
+        let test_data = "Hello, blob world!";
+        let hash = hash::digest(test_data);
+
+        update::apply(
+            &fixture.db,
+            Peer::from("peer"),
+            Notification::Add {
+                arena: fixture.arena,
+                index: 0,
+                path: path.clone(),
+                mtime: UnixTime::from_secs(1234567890),
+                size: test_data.len() as u64,
+                hash: hash.clone(),
+            },
+        )?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut cache = txn.write_cache()?;
+            cache.create_blob(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &txn.read_marks()?,
+                &path,
+            )?;
+        }
+        txn.commit()?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        blob.update(0, test_data.as_bytes()).await?;
+
+        let mut blobs = vec![];
+        for _ in 0..4 {
+            blobs.push(Blob::open(&fixture.db, &path)?);
+        }
+        for i in 0..4 {
+            let mut buf = String::new();
+            blobs[i].read_to_string(&mut buf).await?;
+            assert_eq!(test_data, buf, "blobs[{i}]")
+        }
+
+        let mut file = blob.realize().await?;
+        file.seek(SeekFrom::Start(1)).await?;
+        file.write_all(&[b'u']).await?;
+        file.flush().await?;
+
+        // File is in the index, so no new blob can be opened.
+        assert!(matches!(
+            Blob::open(&fixture.db, &path).err(),
+            Some(StorageError::NotFound)
+        ));
+
+        // Other handles are in the detached state.
+        for i in 0..4 {
+            assert_eq!(
+                ByteRanges::single(0, test_data.len() as u64),
+                blobs[i].available_range()
+            );
+            assert_eq!(None, blobs[i].cache_status().await);
+        }
+
+        // update_db can be called on other handles, but this has no effect.
+        for i in 0..4 {
+            blobs[i].update_db().await.unwrap();
+        }
+
+        // Other handles cannot be updated, verified or repaired
+        for i in 0..4 {
+            let ret = blobs[i].verify().await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+
+            let ret = blobs[i].update(0, b"abc").await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+
+            let ret = blobs[i].repair(0, b"abc").await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+        }
+
+        // Other handles are still readable; they'll return the data
+        // from the now local file.
+        for i in 0..4 {
+            let mut buf = String::new();
+            blobs[i].seek(SeekFrom::Start(0)).await?;
+            blobs[i].read_to_string(&mut buf).await?;
+            assert_eq!("Hullo, blob world!", buf, "blobs[{i}]")
+        }
+
+        // Other handles can be used to write to the same file
+        for (i, blob) in blobs.into_iter().enumerate() {
+            let mut file = blob.realize().await?;
+            file.seek(SeekFrom::Start(7)).await?;
+            file.write_all(format!("blob {i} now").as_bytes()).await?;
+            file.flush().await?;
+
+            let mut buf = String::new();
+            file.seek(SeekFrom::Start(0)).await?;
+            file.read_to_string(&mut buf).await?;
+            assert_eq!(format!("Hullo, blob {i} now!"), buf)
+        }
+        let mut buf = String::new();
+        file.seek(SeekFrom::Start(0)).await?;
+        file.read_to_string(&mut buf).await?;
+        assert_eq!(format!("Hullo, blob 3 now!"), buf);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blobs_enforce_updatable_complete_verified_states() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foobar")?;
+        let hash = hash::digest("foobar");
+
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            blobs.create(&mut tree, &marks, &path, &hash, 6)?;
+        }
+        txn.commit()?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        let mut otherblob = Blob::open(&fixture.db, &path)?;
+        blob.update(0, b"foo").await.unwrap();
+
+        // The blob is still incomplete, so verify and repair fail
+        for blob in [&mut blob, &mut otherblob] {
+            let ret = blob.verify().await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+
+            let ret = blob.repair(0, b"roo").await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+        }
+
+        // Complete the blob
+        blob.update(3, b"bar").await.unwrap();
+        for blob in [&blob, &otherblob] {
+            assert_eq!(Some(CacheStatus::Complete), blob.cache_status().await);
+        }
+
+        // Now that the  blob is complete, updating it again fails.
+        for blob in [&mut blob, &mut otherblob] {
+            let ret = blob.update(0, b"baa").await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+        }
+
+        // update_db still succeeds, but does noting
+        for blob in [&mut blob, &mut otherblob] {
+            blob.update_db().await.unwrap();
+        }
+
+        // verify and repair works now that the blob is complete
+        blob.repair(0, b"roo").await.unwrap();
+        assert_eq!(false, blob.verify().await.unwrap());
+
+        blob.repair(0, b"foo").await.unwrap();
+        assert_eq!(true, blob.verify().await.unwrap());
+        for blob in [&blob, &otherblob] {
+            assert_eq!(Some(CacheStatus::Verified), blob.cache_status().await);
+        }
+
+        // verify and repair don't work anymore once the blob has been verified
+        for blob in [&mut blob, &mut otherblob] {
+            let ret = blob.verify().await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+            let ret = blob.repair(0, b"roo").await;
+            assert!(
+                matches!(ret, Err(StorageError::InvalidBlobState)),
+                "{ret:?}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_open_blob() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foobar")?;
+
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("foobar"), 6)?;
+        }
+        txn.commit()?;
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        blob.update(0, b"foo").await?;
+
+        tokio::task::spawn_blocking(move || {
+            let txn = fixture.begin_write()?;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut blobs = txn.write_blobs()?;
+
+                blobs.delete(&mut tree, &path)?;
+            }
+            txn.commit()?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        // Open blob file has been taken out of the cache
+        assert_eq!(None, blob.cache_status().await);
+
+        // It is still readable.
+        let mut buf = String::new();
+        blob.seek(SeekFrom::Start(0)).await?;
+        blob.read_to_string(&mut buf).await?;
+        assert_eq!("foo\0\0\0", buf);
+
+        // It can even be realized and written to.
+        let mut file = blob.realize().await?;
+        file.seek(SeekFrom::Start(3)).await?;
+        file.write_all(b"BAR").await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).await?;
+        assert_eq!("fooBAR", buf);
 
         Ok(())
     }

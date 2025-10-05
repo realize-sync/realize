@@ -1135,9 +1135,7 @@ impl<'a> WritableOpenCache<'a> {
         // incorrect in a branched entry.
 
         let entry = default_file_entry_or_err(&self.table, pathid)?;
-        let source = blobs
-            .prepare_export(tree, pathid)?
-            .ok_or(StorageError::NotFound)?;
+        let source = blobs.realize(tree, pathid)?.ok_or(StorageError::NotFound)?;
         let dest = path.within(self.datadir());
 
         self.write_default_file_entry(

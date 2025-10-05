@@ -994,7 +994,7 @@ impl InnerRealizeFs {
             }
             FileContent::Remote(mut blob) => {
                 self.downloader.complete_blob(&mut blob).await?;
-                let (_, mut file) = blob.realize().await?;
+                let mut file = blob.realize().await?;
                 file.set_len(size).await?;
                 file.flush().await?;
                 return Ok(());
@@ -1119,8 +1119,7 @@ impl InnerRealizeFs {
                 } else {
                     log::debug!("Opening {ino}; realizing it first...");
                     self.downloader.complete_blob(&mut blob).await?;
-                    let (path, file) = blob.realize().await?;
-                    log::debug!("Map Inode({ino}) to {path:?}");
+                    let file = blob.realize().await?;
                     log::debug!("File at Inode({ino}) realized successfully");
                     if (flags & libc::O_TRUNC) != 0 {
                         // TODO: don't bother downloading in this case and when
@@ -1130,7 +1129,14 @@ impl InnerRealizeFs {
                     }
                     if (flags & libc::O_APPEND) != 0 {
                         drop(file);
-
+                        // The file handle is not usable in this case.
+                        // Reopen the file as a local file.
+                        let path = self
+                            .fs
+                            .file_content(ino)
+                            .await?
+                            .path()
+                            .ok_or(StorageError::NotFound)?;
                         FileHandle::Real(
                             openoptions_from_flags(flags).open(path).await?,
                             FHMode::from_flags(flags),

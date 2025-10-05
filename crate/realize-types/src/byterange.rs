@@ -498,6 +498,10 @@ impl ByteRanges {
 
     /// Checks whether `range` is fully contained within this [ByteRanges].
     pub fn contains_range(&self, range: &ByteRange) -> bool {
+        if range.bytecount() == 0 {
+            // Everything contains the empty range
+            return true;
+        }
         if let Some((start, Point::Start)) = self.btree.range(..=range.start).next_back() {
             if let Some((end, Point::End)) = self.btree.range(*start + 1..).next() {
                 return *end >= range.end;
@@ -972,6 +976,15 @@ mod byteranges_tests {
             ])
             .contains_range(&ByteRange::new(15, 26))
         );
+    }
+
+    #[test]
+    fn test_contains_empty_range() {
+        assert_eq!(
+            true,
+            ByteRanges::single(10, 20).contains_range(&ByteRange::empty())
+        );
+        assert_eq!(true, ByteRanges::new().contains_range(&ByteRange::empty()));
     }
 
     #[test]

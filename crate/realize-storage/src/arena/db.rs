@@ -255,7 +255,7 @@ impl ArenaDatabase {
             history = History::setup(&history_table)?;
             uuid = load_or_assign_uuid(&mut settings_table)?;
             tag = Tag::new(uuid, arena);
-            blobs = Blobs::setup(tag, blob_dir.as_ref(), &blob_lru_queue_table)?;
+            blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
             cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref())?;
         }
         txn.commit()?;
@@ -548,6 +548,7 @@ impl<'db> ArenaWriteTransaction<'db> {
     pub(crate) fn write_blobs(&self) -> Result<WritableOpenBlob<'_>, StorageError> {
         Ok(WritableOpenBlob::new(
             self.tag,
+            &self.subsystems.blobs,
             &self.before_commit,
             self.inner
                 .open_table(BLOB_TABLE)

@@ -20,10 +20,6 @@ const MIN_CHUNK_SIZE: u64 = 8 * 1024;
 /// This should be a multiple of MIN_CHUNK_SIZE.
 const MAX_CHUNK_SIZE: u64 = 4 * MIN_CHUNK_SIZE;
 
-/// Interval at which to update the database during downloads, in
-/// bytes.
-const UPDATE_DB_INTERVAL_BYTES: u64 = 4 * 1024 * 1024; // 4M
-
 #[derive(Clone)]
 pub struct Downloader {
     household: Arc<Household>,
@@ -38,20 +34,19 @@ impl Downloader {
     // return it.
     pub async fn complete_blob(&self, blob: &mut Blob) -> Result<(), HouseholdOperationError> {
         if matches!(
-            blob.cache_status(),
-            CacheStatus::Complete | CacheStatus::Verified,
+            blob.cache_status().await,
+            Some(CacheStatus::Complete) | Some(CacheStatus::Verified),
         ) {
             // Nothing to do
             return Ok(());
         }
-        let missing = ByteRanges::single(0, blob.size()).subtraction(blob.available_range());
+        let missing = ByteRanges::single(0, blob.size()).subtraction(&blob.available_range());
         log::debug!("Blob incomplete; downloading {missing}");
         let avail = blob
             .remote_availability()
             .await?
             .ok_or(HouseholdOperationError::NoPeers)?;
 
-        let mut bytes_since_last_update = 0;
         for range in missing {
             let mut stream = self.household.read(
                 avail.peers.clone(),
@@ -65,13 +60,6 @@ impl Downloader {
             while let Some(chunk) = stream.next().await {
                 let (chunk_offset, chunk) = chunk?;
                 blob.update(chunk_offset, &chunk).await?;
-
-                // TODO: have Blob::update do that
-                bytes_since_last_update += chunk.len() as u64;
-                if bytes_since_last_update >= UPDATE_DB_INTERVAL_BYTES {
-                    let _ = blob.update_db().await;
-                    bytes_since_last_update = 0;
-                }
             }
         }
         blob.update_db().await?;
@@ -153,7 +141,7 @@ impl Download {
     /// - includes ranges that have been written to the file, but
     ///   haven't been flushed yet.
     /// - does not include ranges written through other file handles
-    pub fn cache_status(&self) -> &ByteRanges {
+    pub fn available_range(&self) -> ByteRanges {
         self.blob.available_range()
     }
 
@@ -441,8 +429,8 @@ mod tests {
         ) -> anyhow::Result<()> {
             assert!(
                 matches!(
-                    blob.cache_status(),
-                    CacheStatus::Complete | CacheStatus::Verified
+                    blob.cache_status().await,
+                    Some(CacheStatus::Complete) | Some(CacheStatus::Verified)
                 ),
                 "{} should have Complete or Verified availability",
                 test_name
@@ -678,12 +666,13 @@ mod tests {
                 testing::disconnect(&household_a, b).await?;
 
                 let block = MIN_CHUNK_SIZE;
+                reader.update_db().await?;
                 assert_eq!(
                     ByteRanges::from_ranges(vec![
                         ByteRange::new(0, block),
                         ByteRange::new(2 * block, 3 * block)
                     ]),
-                    *reader.cache_status()
+                    reader.available_range()
                 );
 
                 // Read from first block succeeds.
