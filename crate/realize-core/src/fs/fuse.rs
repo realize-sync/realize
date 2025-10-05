@@ -348,7 +348,7 @@ impl fuser::Filesystem for RealizeFs {
                     let val = val.as_bytes();
                     if size == 0 {
                         reply.size(val.len() as u32);
-                    } else if size <= (val.len() as u32) {
+                    } else if size >= (val.len() as u32) {
                         reply.data(val);
                     } else {
                         reply.error(libc::ERANGE);
@@ -418,7 +418,7 @@ impl fuser::Filesystem for RealizeFs {
                     if size == 0 {
                         log::debug!("listxattr returns size");
                         reply.size(bytes.len() as u32);
-                    } else if size <= (bytes.len() as u32) {
+                    } else if size >= (bytes.len() as u32) {
                         log::debug!("listxattr returns data: {bytes:?}");
                         reply.data(bytes.as_slice());
                     } else {
