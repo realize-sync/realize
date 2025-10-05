@@ -3205,16 +3205,22 @@ mod tests {
                 );
                 tokio::fs::write(&file_realpath, "overwrite").await?;
 
-                // Depending on how fast this is executed, the local
-                // file may or may not have been re-hashed yet.
-                let got = getxattr(&file_realpath, "realize.version")
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(
-                    got == "modified" || got == hash::digest("overwrite").to_string(),
-                    "version: '{got}'"
-                );
+                let old_hash = hash::digest("test").to_string();
+                let new_hash = hash::digest("overwrite").to_string();
+
+                // Depending on how fast this is executed, we might see
+                // the old hash, then "modified", before seeing the new hash.
+                async fn get_version(path: &std::path::Path) -> String {
+                    getxattr(&path, "realize.version").await.unwrap().unwrap()
+                }
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while get_version(&file_realpath).await == old_hash && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                while get_version(&file_realpath).await == "modified" && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(new_hash, get_version(&file_realpath).await);
 
                 assert_eq!(
                     Some(libc::EISDIR),
