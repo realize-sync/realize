@@ -34,7 +34,7 @@ jobs:
     - name: Build
       run: "cargo build"
     - name: Run tests
-      run: "RUST_LOG=realize_=debug cargo nextest run --profile ci"
+      run: "RUST_LOG=realize_=debug,fuser=debug cargo nextest run --profile ci"
     - name: Run doctests
       run: "cargo test --doc"
 
