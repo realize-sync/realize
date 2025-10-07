@@ -2,7 +2,7 @@ use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
-use crate::arena::types::{DirMetadata, FileRealm};
+use crate::arena::types::{DirMetadata, FileAlternative, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
@@ -639,6 +639,21 @@ impl Filesystem {
             let (fs, loc) = this.resolve_arena_loc(loc)?;
 
             fs.clear_mark(loc)
+        })
+        .await?
+    }
+
+    pub async fn list_alternatives<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<Vec<FileAlternative>, StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.list_alternatives(loc)
         })
         .await?
     }

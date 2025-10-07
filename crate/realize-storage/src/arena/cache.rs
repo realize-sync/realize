@@ -15,7 +15,7 @@ use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
 use crate::utils::inhibit::{self, Inhibit};
-use crate::{PathId, StorageError};
+use crate::{FileAlternative, PathId, StorageError};
 use realize_types::{Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::collections::HashSet;
@@ -45,6 +45,16 @@ pub(crate) trait CacheReadOperations {
         loc: L,
         hash: &Hash,
     ) -> Result<Option<RemoteAvailability>, StorageError>;
+
+    /// List available alternative versions for a specific file.
+    ///
+    /// Return an empty vector if `loc` is a directory or doesn't
+    /// exist.
+    fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Vec<FileAlternative>, StorageError>;
 
     /// Read directory contents for the given pathid.
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -146,6 +156,14 @@ where
         remote_availability(&self.table, tree, loc, hash)
     }
 
+    fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Vec<FileAlternative>, StorageError> {
+        list_alternatives(&self.table, tree, loc)
+    }
+
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
@@ -214,6 +232,14 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         hash: &Hash,
     ) -> Result<Option<RemoteAvailability>, StorageError> {
         remote_availability(&self.table, tree, loc, hash)
+    }
+
+    fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Vec<FileAlternative>, StorageError> {
+        list_alternatives(&self.table, tree, loc)
     }
 
     fn readdir<'b, L: Into<TreeLoc<'b>>>(
@@ -1429,6 +1455,56 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
     Ok(avail)
 }
 
+fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    loc: L,
+) -> Result<Vec<FileAlternative>, StorageError> {
+    let mut alternatives = vec![];
+    if let Some(pathid) = tree.resolve(loc)? {
+        for entry in
+            cache_table.range((pathid, Layer::Default)..(pathid.plus(1), Layer::Default))?
+        {
+            let (k, v) = entry?;
+            let (_, layer) = k.value();
+            let entry = v.value().parse()?;
+            log::debug!("{pathid:?} entry {entry:?}");
+            if let CacheTableEntry::File(entry) = entry {
+                match layer {
+                    Layer::Default => {
+                        match entry.kind {
+                            FileEntryKind::Local => {
+                                alternatives.push(FileAlternative::Local(entry.version.clone()));
+                            }
+                            FileEntryKind::Cached => {
+                                // will be reported from the peer layer
+                            }
+                            FileEntryKind::Branched(path_id) => {
+                                if let Some(path) = tree.backtrack(path_id)? {
+                                    alternatives.push(FileAlternative::Branched(
+                                        path,
+                                        entry.version.expect_indexed()?.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Layer::Remote(peer) => {
+                        alternatives.push(FileAlternative::Remote(
+                            peer,
+                            entry.version.expect_indexed()?.clone(),
+                            entry.size,
+                            entry.mtime,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(alternatives)
+}
+
 fn find_peer_entry(
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     pathid: PathId,
@@ -1944,6 +2020,40 @@ mod tests {
                 .into_iter()
                 .filter_map(|i| tree.backtrack(i).ok().flatten())
                 .collect())
+        }
+
+        fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
+            &self,
+            loc: L,
+        ) -> Result<Vec<FileAlternative>, StorageError> {
+            let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+
+            cache.list_alternatives(&tree, loc)
+        }
+
+        fn add_file_from_peer(
+            &self,
+            peer: Peer,
+            path: &Path,
+            size: u64,
+            mtime: UnixTime,
+            hash: Hash,
+        ) -> anyhow::Result<()> {
+            update::apply(
+                &self.db,
+                peer,
+                Notification::Add {
+                    arena: self.arena,
+                    index: 1,
+                    path: path.clone(),
+                    mtime,
+                    size,
+                    hash,
+                },
+            )?;
+            Ok(())
         }
     }
 
@@ -5728,6 +5838,162 @@ mod tests {
         assert_eq!(
             vec![HistoryTableEntry::Remove(path, initial_hash.clone())],
             collect_history_entries(&history, history_start)?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_not_found() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let missing_path = Path::parse("does_not_exist.txt")?;
+
+        let alternatives = fixture.list_alternatives(&missing_path)?;
+        assert!(alternatives.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_directory() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let dir_path = Path::parse("test_directory")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        cache.mkdir(&mut tree, &dir_path)?;
+        assert!(cache.list_alternatives(&tree, &dir_path)?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_local_indexed() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("local_file.txt")?;
+        let file_content = "test content for local file";
+        let childpath = fixture.datadir.child("local_file.txt");
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Create and index a local file
+        let (size, mtime, hash) = create_test_file(&childpath, file_content)?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            size,
+            mtime,
+            hash.clone(),
+        )?;
+
+        assert_eq!(
+            cache.list_alternatives(&tree, &file_path)?,
+            vec![FileAlternative::Local(Version::Indexed(hash))]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_local_modified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("modified_file.txt")?;
+        let childpath = fixture.datadir.child("modified_file.txt");
+
+        let (size, mtime, hash) = create_test_file(&childpath, "original content")?;
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            size,
+            mtime,
+            hash.clone(),
+        )?;
+
+        // Modify the file and preindex it (to mark as modified)
+        childpath.write_str("modified content")?;
+        cache.preindex(&mut tree, &mut blobs, &mut dirty, &file_path)?;
+
+        assert_eq!(
+            cache.list_alternatives(&tree, &file_path)?,
+            vec![FileAlternative::Local(Version::Modified(Some(hash)))]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_remote() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("remote_file.txt")?;
+        let peer1 = Peer::from("peer1");
+        let peer2 = Peer::from("peer2");
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+        let mtime1 = test_time();
+        let mtime2 = later_time();
+
+        // Add the same file from two different peers with different hashes
+        fixture.add_file_from_peer(peer1, &file_path, 100, mtime1, hash1.clone())?;
+        fixture.add_file_from_peer(peer2, &file_path, 200, mtime2, hash2.clone())?;
+
+        assert_unordered::assert_eq_unordered!(
+            fixture.list_alternatives(&file_path)?,
+            vec![
+                FileAlternative::Remote(peer1, hash1.clone(), 100, mtime1),
+                FileAlternative::Remote(peer2, hash2.clone(), 200, mtime2)
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_alternatives_branched() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let source_path = Path::parse("source.txt")?;
+        let branch_path = Path::parse("branch.txt")?;
+        let hash = Hash([42u8; 32]);
+        let peer = Peer::from("remote_peer");
+
+        // Add a remote file first (not local)
+        fixture.add_file_from_peer(peer, &source_path, 100, test_time(), hash.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        cache.branch(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &source_path,
+            &branch_path,
+        )?;
+        assert_eq!(
+            cache.list_alternatives(&tree, &branch_path)?,
+            vec![FileAlternative::Branched(source_path.clone(), hash.clone())]
         );
 
         Ok(())

@@ -11,7 +11,7 @@ use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
 use crate::global::fs::FileContent;
 use crate::types::Inode;
-use crate::{Blob, FileRealm, Mark};
+use crate::{Blob, FileAlternative, FileRealm, Mark};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::sync::Arc;
@@ -416,6 +416,18 @@ impl ArenaFilesystem {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn list_alternatives(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+    ) -> Result<Vec<FileAlternative>, StorageError> {
+        let txn = self.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let loc = loc.into().into_tree_loc(&cache)?;
+
+        cache.list_alternatives(&tree, loc)
     }
 }
 

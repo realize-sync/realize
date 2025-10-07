@@ -676,6 +676,16 @@ pub struct RemoteAvailability {
     pub peers: Vec<Peer>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum FileAlternative {
+    /// Reports a local file version, either indexed or a file with local modifications.
+    Local(Version),
+    /// Reports a file moved or linked from a remote file
+    Branched(Path, Hash),
+    /// Reports a file version available from a remote peer.
+    Remote(Peer, Hash, u64, UnixTime),
+}
+
 /// Specifies the type of file entry (local, cached, or branched from another path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileEntryKind {

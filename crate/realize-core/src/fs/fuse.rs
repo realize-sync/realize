@@ -3533,7 +3533,7 @@ mod tests {
                             let mut file = open_with_flags(&file_path, flags)?;
                             file.write_all(b" appended text")?;
                             file.flush()?;
-                            drop(file);
+                            file.sync_all()?;
                             Ok::<(), anyhow::Error>(())
                         }
                     })
