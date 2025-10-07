@@ -21,10 +21,13 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::bytes::BufMut;
 
+mod format;
+
 const TTL: Duration = Duration::ZERO;
 const XATTR_MARK: &str = "realize.mark";
 const XATTR_STATUS: &str = "realize.status";
 const XATTR_VERSION: &str = "realize.version";
+const XATTR_VERSIONS: &str = "realize.versions";
 
 /// Mount the cache as FUSE filesystem at the given mountpoint.
 pub fn export(
@@ -785,7 +788,12 @@ impl InnerRealizeFs {
 
     async fn listxattr(&self, ino: u64) -> Result<Vec<&'static str>, FuseError> {
         if let Metadata::File(_) = self.fs.metadata(Inode(ino)).await? {
-            return Ok(vec![XATTR_MARK, XATTR_STATUS, XATTR_VERSION]);
+            return Ok(vec![
+                XATTR_MARK,
+                XATTR_STATUS,
+                XATTR_VERSION,
+                XATTR_VERSIONS,
+            ]);
         }
 
         Ok(vec![XATTR_MARK])
@@ -821,6 +829,11 @@ impl InnerRealizeFs {
                 Version::Modified(_) => "modified".to_string(),
                 Version::Indexed(hash) => hash.to_string(),
             });
+        }
+
+        if name == XATTR_VERSIONS {
+            let alternatives = self.fs.list_alternatives(Inode(ino)).await?;
+            return Ok(format::format_versions(&alternatives));
         }
 
         Err(FuseError::Errno(libc::ENODATA))
@@ -1464,6 +1477,7 @@ mod tests {
     use nix::fcntl::AT_FDCWD;
     use realize_storage::Mark;
     use realize_storage::utils::hash;
+    use realize_types::UnixTime;
     use std::io::{Read, Seek, Write};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
@@ -3004,7 +3018,8 @@ mod tests {
                     vec![
                         "realize.mark".to_string(),
                         "realize.status".to_string(),
-                        "realize.version".to_string()
+                        "realize.version".to_string(),
+                        "realize.versions".to_string()
                     ],
                     listxattr(&file_path).await.unwrap()
                 );
@@ -3272,6 +3287,54 @@ mod tests {
                         .await
                         .err()
                         .map(|e| e.errno())
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn get_versions_xattr() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+
+                let (file_path, _) = fixture
+                    .inner
+                    .write_file_and_wait(b, a, "foo/versions_test", "test content")
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(HouseholdFixture::test_arena().as_str());
+                let file_realpath = file_path.within(&datadir);
+
+                let ts = UnixTime::mtime(
+                    &fixture
+                        .inner
+                        .arena_root(b)
+                        .join("foo/versions_test")
+                        .metadata()?,
+                )
+                .display();
+                assert_eq!(
+                    format!("b jTvZv9AF9BeWmbkhInMoTG3oUa6RDu4v0bsNlu3mWj0 12 {ts}\n"),
+                    getxattr(&file_realpath, "realize.versions")
+                        .await
+                        .unwrap()
+                        .unwrap()
                 );
 
                 Ok::<(), anyhow::Error>(())

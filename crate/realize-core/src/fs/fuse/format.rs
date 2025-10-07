@@ -43,7 +43,7 @@ mod tests {
     use realize_types::{Hash, Path, Peer, UnixTime};
 
     #[test]
-    fn test_format_local_indexed() {
+    fn format_local_indexed() {
         let hash = Hash([1; 32]);
         let alt = FileAlternative::Local(Version::Indexed(hash));
         assert_eq!(
@@ -53,7 +53,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_local_modified_with_hash() {
+    fn format_local_modified_with_hash() {
         let hash = Hash([2; 32]);
         let alt = FileAlternative::Local(Version::Modified(Some(hash)));
         assert_eq!(
@@ -63,13 +63,13 @@ mod tests {
     }
 
     #[test]
-    fn test_format_local_modified_no_hash() {
+    fn format_local_modified_no_hash() {
         let alt = FileAlternative::Local(Version::Modified(None));
         assert_eq!(format_alternative(&alt), "local modified");
     }
 
     #[test]
-    fn test_format_branched() {
+    fn format_branched() {
         let path = Path::parse("some/path").unwrap();
         let hash = Hash([3; 32]);
         let alt = FileAlternative::Branched(path, hash);
@@ -80,7 +80,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_remote() {
+    fn format_remote() {
         let peer = Peer::from("peer1");
         let hash = Hash([4; 32]);
         let size = 100;
@@ -91,12 +91,12 @@ mod tests {
     }
 
     #[test]
-    fn test_format_versions_empty() {
+    fn format_versions_empty() {
         assert_eq!(format_versions(&[]), "");
     }
 
     #[test]
-    fn test_format_versions_single() {
+    fn format_versions_single() {
         let hash = Hash([1; 32]);
         let alt = FileAlternative::Local(Version::Indexed(hash));
         assert_eq!(
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_versions_multiple() {
+    fn format_versions_multiple() {
         let local_alt = FileAlternative::Local(Version::Indexed(Hash([1; 32])));
         let remote_alt = FileAlternative::Remote(
             Peer::from("peer1"),

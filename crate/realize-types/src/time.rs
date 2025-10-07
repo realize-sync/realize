@@ -83,6 +83,30 @@ impl UnixTime {
     pub fn plus(self, duration: Duration) -> UnixTime {
         UnixTime(self.0 + duration)
     }
+
+    /// Format the timestamp for display as a ISO 8601 without
+    /// timezone information.
+    pub fn display(&self) -> String {
+        let ts = if let (Some(s), Some(m)) = (
+            i64::try_from(self.as_secs()).ok(),
+            u16::try_from(self.as_duration().subsec_millis()).ok(),
+        ) {
+            Some(TimeStampMs::new(s, m))
+        } else {
+            None
+        };
+
+        ts.map(|ts_ms| time_format::format_iso8601_ms_utc(ts_ms).ok())
+            .flatten()
+            .map(|time_string| {
+                // Remove the trailing 'Z' if present
+                time_string
+                    .strip_suffix("Z")
+                    .unwrap_or(&time_string)
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!("{:?}", self.as_duration()))
+    }
 }
 
 impl AsRef<UnixTime> for UnixTime {
@@ -104,20 +128,7 @@ impl From<&Duration> for UnixTime {
 
 impl std::fmt::Debug for UnixTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let ts = if let (Some(s), Some(m)) = (
-            i64::try_from(self.as_secs()).ok(),
-            u16::try_from(self.0.subsec_millis()).ok(),
-        ) {
-            Some(TimeStampMs::new(s, m))
-        } else {
-            None
-        };
-        let time_string = ts
-            .map(|ts_ms| time_format::format_iso8601_ms_utc(ts_ms).ok())
-            .flatten()
-            .unwrap_or_else(|| format!("{:?}", self.0));
-
-        f.write_str(time_string.strip_suffix("Z").unwrap_or(&time_string))
+        f.write_str(&self.display())
     }
 }
 
@@ -130,6 +141,16 @@ mod tests {
         assert_eq!(
             "2009-02-13T23:31:30.333",
             format!("{:?}", UnixTime::new(1234567890, 333999111))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn format() -> anyhow::Result<()> {
+        assert_eq!(
+            "2009-02-13T23:31:30.333",
+            UnixTime::new(1234567890, 333999111).display()
         );
 
         Ok(())
