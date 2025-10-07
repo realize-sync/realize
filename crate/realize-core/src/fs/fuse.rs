@@ -3919,12 +3919,24 @@ mod tests {
                             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
                         let value = [0xFFu8, 0xFEu8]; // Invalid UTF-8 sequence
 
+                        #[cfg(target_os = "linux")]
                         let result = unsafe {
                             libc::setxattr(
                                 path_cstr.as_ptr(),
                                 name_cstr.as_ptr(),
                                 value.as_ptr() as *const libc::c_void,
                                 value.len(),
+                                0,
+                            )
+                        };
+                        #[cfg(target_os = "macos")]
+                        let result = unsafe {
+                            libc::setxattr(
+                                path_cstr.as_ptr(),
+                                name_cstr.as_ptr(),
+                                value.as_ptr() as *const libc::c_void,
+                                value.len(),
+                                0,
                                 0,
                             )
                         };
