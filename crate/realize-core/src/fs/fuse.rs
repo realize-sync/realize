@@ -3822,18 +3822,24 @@ mod tests {
                 let b = HouseholdFixture::b();
                 let arena = HouseholdFixture::test_arena();
 
+                fixture
+                    .inner
+                    .storage(b)?
+                    .set_arena_mark(arena, Mark::Own)
+                    .await?;
+
                 // Create a remote file from peer B first
                 let remote_content = "remote version from peer b";
                 let (file_path, remote_hash) = fixture
                     .inner
                     .write_file_and_wait(b, a, "versioned_file.txt", remote_content)
                     .await?;
-
-                // Wait for it to be synced to peer A's cache
-                fixture
-                    .inner
-                    .wait_for_file_in_cache(a, "versioned_file.txt", &remote_hash)
-                    .await?;
+                let remote_mtime = UnixTime::mtime(
+                    &file_path
+                        .within(fixture.inner.arena_root(b))
+                        .metadata()
+                        .unwrap(),
+                );
 
                 fixture.mount(household_a).await?;
 
@@ -3850,30 +3856,26 @@ mod tests {
 
                 // Create a local version by writing to the file
                 let local_content = "local version from peer a";
+                let local_hash = hash::digest(local_content);
                 tokio::fs::write(&file_realpath, local_content).await?;
 
                 // Wait for the file to be indexed locally
                 let deadline = Instant::now() + Duration::from_secs(10);
-                let mut local_hash = None;
-                while Instant::now() < deadline {
-                    let current_version =
-                        getxattr(&file_realpath, "realize.version").await?.unwrap();
-                    if current_version != "modified" && current_version != remote_hash.to_string() {
-                        local_hash = Some(current_version);
-                        break;
-                    }
+                while getxattr(&file_realpath, "realize.version").await?.unwrap()
+                    != local_hash.to_string()
+                    && Instant::now() < deadline
+                {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                let local_hash = local_hash.expect("Local file should be indexed with a hash");
-
-                // Verify file is now local
-                let local_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
-                assert!(local_status.contains("local"));
-
                 // Verify we have two alternatives available
                 let versions_list = getxattr(&file_realpath, "realize.versions").await?.unwrap();
-                assert!(versions_list.contains(&local_hash));
-                assert!(versions_list.contains(&remote_hash.to_string()));
+                assert_eq!(
+                    format!(
+                        "local {local_hash}\nb {remote_hash} 26 {}\n",
+                        remote_mtime.display()
+                    ),
+                    versions_list
+                );
 
                 // Select the remote version via setxattr
                 setxattr(&file_realpath, "realize.version", &remote_hash.to_string()).await?;
