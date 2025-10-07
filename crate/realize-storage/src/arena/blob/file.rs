@@ -61,16 +61,24 @@ impl BlobFileRegistry {
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-struct BlobFileId {
+pub(crate) struct BlobFileId {
     dev: u64,
     ino: u64,
 }
 
 impl BlobFileId {
-    fn from(m: &std::fs::Metadata) -> Self {
+    pub(crate) fn from(m: &std::fs::Metadata) -> Self {
         Self {
             dev: m.dev(),
             ino: m.ino(),
+        }
+    }
+
+    /// Checks whether the given `path` matches this ID.
+    pub(crate) fn matches(&self, m: Result<std::fs::Metadata, std::io::Error>) -> bool {
+        match m {
+            Ok(m) => *self == BlobFileId::from(&m),
+            Err(_) => false,
         }
     }
 }
@@ -175,6 +183,14 @@ impl SharedBlobFile {
             }),
             tx_readable,
         })
+    }
+
+    pub(crate) fn id(&self) -> &BlobFileId {
+        &self.id
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Watch the [ReadableRange] for this blob file.

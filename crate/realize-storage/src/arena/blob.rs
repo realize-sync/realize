@@ -1337,10 +1337,21 @@ impl Blob {
             // Blob has already been realized, there's nothing to do
             return Ok(file);
         }
+        let file_id = self.shared.id().clone();
+        let file_path = self.shared.path().to_path_buf();
 
         // Realize the blob in the database, then move the file.
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_write()?;
+            if !file_id.matches(file_path.metadata()) {
+                // The file has changed, so it can't be really
+                // realized anymore. Just return the file as direct
+                // access file. We check that late, from within the
+                // write transaction to catch changes that might have
+                // happened while waiting for the transaction to open.
+                return Ok(());
+            }
+
             let source: PathBuf;
             let dest: PathBuf;
             {
@@ -1493,6 +1504,7 @@ mod tests {
         arena: Arena,
         db: Arc<ArenaDatabase>,
         blob_dir: ChildPath,
+        datadir: ChildPath,
         tempdir: TempDir,
     }
     impl Fixture {
@@ -1511,6 +1523,7 @@ mod tests {
                 arena,
                 db,
                 blob_dir,
+                datadir,
                 tempdir,
             })
         }
@@ -3376,17 +3389,22 @@ mod tests {
             blob.cache_status().await
         );
 
-        tokio::task::spawn_blocking(move || {
-            let txn = fixture.begin_write()?;
-            {
-                let mut tree = txn.write_tree()?;
-                let mut blobs = txn.write_blobs()?;
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            let db = Arc::clone(&fixture.db);
 
-                blobs.delete(&mut tree, &path)?;
+            move || {
+                let txn = db.begin_write()?;
+                {
+                    let mut tree = txn.write_tree()?;
+                    let mut blobs = txn.write_blobs()?;
+
+                    blobs.delete(&mut tree, &path)?;
+                }
+                txn.commit()?;
+
+                Ok::<_, anyhow::Error>(())
             }
-            txn.commit()?;
-
-            Ok::<_, anyhow::Error>(())
         })
         .await??;
         // Open handles are still usable
@@ -3406,8 +3424,15 @@ mod tests {
         blob.repair(3, b"bar").await?;
         assert_eq!(true, blob.verify().await?);
 
-        // Realize can't work, since the original file isn't available anymore.
-        assert!(matches!(blob.realize().await, Err(StorageError::NotFound)));
+        // Realize works, but doesn't really realizes; it just returns the
+        // file handle for direct access.
+        let mut file = blob.realize().await?;
+        let mut buf = vec![0u8; 6];
+        file.seek(SeekFrom::Start(0)).await?;
+        assert_eq!(6, file.read(&mut buf).await?);
+        assert_eq!(buf, b"foobar");
+
+        assert_eq!(false, path.within(&fixture.datadir).exists());
 
         Ok(())
     }
@@ -3437,17 +3462,22 @@ mod tests {
         }
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        tokio::task::spawn_blocking(move || {
-            let txn = fixture.begin_write()?;
-            {
-                let mut tree = txn.write_tree()?;
-                let mut blobs = txn.write_blobs()?;
+        tokio::task::spawn_blocking({
+            let path = path.clone();
+            let db = Arc::clone(&fixture.db);
 
-                blobs.delete(&mut tree, &path)?;
+            move || {
+                let txn = db.begin_write()?;
+                {
+                    let mut tree = txn.write_tree()?;
+                    let mut blobs = txn.write_blobs()?;
+
+                    blobs.delete(&mut tree, &path)?;
+                }
+                txn.commit()?;
+
+                Ok::<_, anyhow::Error>(())
             }
-            txn.commit()?;
-
-            Ok::<_, anyhow::Error>(())
         })
         .await??;
 
@@ -3474,8 +3504,15 @@ mod tests {
             blob.cache_status().await
         );
 
-        // Realize can't work, since the original file isn't available anymore.
-        assert!(matches!(blob.realize().await, Err(StorageError::NotFound)));
+        // Realize works, but doesn't really realizes; it just returns the
+        // file handle for direct access.
+        let mut file = blob.realize().await?;
+        let mut buf = vec![0u8; 6];
+        file.seek(SeekFrom::Start(0)).await?;
+        assert_eq!(6, file.read(&mut buf).await?);
+        assert_eq!(buf, b"foo\0\0\0");
+
+        assert_eq!(false, path.within(&fixture.datadir).exists());
 
         Ok(())
     }
