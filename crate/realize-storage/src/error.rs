@@ -72,6 +72,9 @@ pub enum StorageError {
 
     #[error("blob invalid for the operation")]
     InvalidBlobState,
+
+    #[error("specified version is invalid")]
+    UnknownVersion,
 }
 
 impl StorageError {
@@ -118,6 +121,7 @@ impl StorageError {
             StorageError::NotIndexed => InvalidInput,
             StorageError::LocalFileMismatch => NotFound,
             StorageError::InvalidBlobState => InvalidData,
+            StorageError::UnknownVersion => InvalidData,
         }
     }
 

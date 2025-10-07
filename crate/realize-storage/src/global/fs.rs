@@ -657,6 +657,30 @@ impl Filesystem {
         })
         .await?
     }
+
+    /// Select an alternative version of the file, identified by its hash.
+    ///
+    /// The hash passed to this method should be one of the hashes
+    /// reported by [list_alternatives] for the same file.
+    ///
+    /// This is typically used to switch to another peer's version
+    /// when peers don't all agree on the version.
+    pub async fn select_alternative<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+        goal: &realize_types::Hash,
+    ) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let goal = goal.clone();
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || {
+            let (fs, loc) = this.resolve_arena_loc(loc)?;
+
+            fs.select_alternative(loc, &goal)
+        })
+        .await?
+    }
 }
 
 /// A location within the Filesystem.

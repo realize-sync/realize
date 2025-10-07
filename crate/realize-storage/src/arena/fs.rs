@@ -429,6 +429,34 @@ impl ArenaFilesystem {
 
         cache.list_alternatives(&tree, loc)
     }
+
+    /// Select an alternative version of the file, identified by its hash.
+    ///
+    /// The hash passed to this method should be one of the hashes
+    /// reported by [list_alternatives] for the same file.
+    ///
+    /// This is typically used to switch to another peer's version
+    /// when peers don't all agree on the version.
+    pub(crate) fn select_alternative(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+        goal: &realize_types::Hash,
+    ) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut history = txn.write_history()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut cache = txn.write_cache()?;
+            let loc = loc.into().into_tree_loc(&cache)?;
+
+            cache.select_alternative(&mut tree, &mut blobs, &mut history, &mut dirty, loc, goal)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
 }
 
 pub(crate) enum ArenaFsLoc {

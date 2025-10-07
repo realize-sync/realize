@@ -10,6 +10,7 @@ use realize_storage::{
     CacheStatus, DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Mark,
     Metadata, StorageError, Version,
 };
+use realize_types::Hash;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::SeekFrom;
@@ -855,6 +856,23 @@ impl InnerRealizeFs {
                 self.fs.set_mark(Inode(ino), mark).await?;
             }
             return Ok(());
+        }
+
+        if name == XATTR_VERSION {
+            let value_str = std::str::from_utf8(&value)
+                .map_err(|_| FuseError::Errno(libc::EINVAL))?
+                .trim();
+
+            let hash = match Hash::from_base64(value_str) {
+                Some(hash) => hash,
+                None => return Err(FuseError::Errno(libc::EINVAL)),
+            };
+
+            match self.fs.select_alternative(Inode(ino), &hash).await {
+                Ok(()) => return Ok(()),
+                Err(StorageError::UnknownVersion) => return Err(FuseError::Errno(libc::ENOENT)),
+                Err(err) => return Err(FuseError::Cache(err)),
+            }
         }
 
         // Other attributes are not supported for setting
@@ -3787,6 +3805,153 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "linux"), ignore)]
+    async fn set_version_xattr() -> anyhow::Result<()> {
+        let mut fixture = FuseFixture::setup().await?;
+        fixture
+            .inner
+            .with_two_peers()
+            .await?
+            .interconnected()
+            .run(async |household_a, _household_b| {
+                let a = HouseholdFixture::a();
+                let b = HouseholdFixture::b();
+                let arena = HouseholdFixture::test_arena();
+
+                // Create a remote file from peer B first
+                let remote_content = "remote version from peer b";
+                let (file_path, remote_hash) = fixture
+                    .inner
+                    .write_file_and_wait(b, a, "versioned_file.txt", remote_content)
+                    .await?;
+
+                // Wait for it to be synced to peer A's cache
+                fixture
+                    .inner
+                    .wait_for_file_in_cache(a, "versioned_file.txt", &remote_hash)
+                    .await?;
+
+                fixture.mount(household_a).await?;
+
+                let mountpoint = fixture.mount_path();
+                let datadir = mountpoint.join(arena.as_str());
+                let file_realpath = file_path.within(&datadir);
+
+                // Initially, the file should be remote (from peer b)
+                let initial_version = getxattr(&file_realpath, "realize.version").await?.unwrap();
+                assert_eq!(remote_hash.to_string(), initial_version);
+
+                let initial_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
+                assert!(initial_status.contains("remote"));
+
+                // Create a local version by writing to the file
+                let local_content = "local version from peer a";
+                tokio::fs::write(&file_realpath, local_content).await?;
+
+                // Wait for the file to be indexed locally
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut local_hash = None;
+                while Instant::now() < deadline {
+                    let current_version =
+                        getxattr(&file_realpath, "realize.version").await?.unwrap();
+                    if current_version != "modified" && current_version != remote_hash.to_string() {
+                        local_hash = Some(current_version);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let local_hash = local_hash.expect("Local file should be indexed with a hash");
+
+                // Verify file is now local
+                let local_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
+                assert!(local_status.contains("local"));
+
+                // Verify we have two alternatives available
+                let versions_list = getxattr(&file_realpath, "realize.versions").await?.unwrap();
+                assert!(versions_list.contains(&local_hash));
+                assert!(versions_list.contains(&remote_hash.to_string()));
+
+                // Select the remote version via setxattr
+                setxattr(&file_realpath, "realize.version", &remote_hash.to_string()).await?;
+
+                // Verify the version changed back to remote
+                let new_version = getxattr(&file_realpath, "realize.version").await?.unwrap();
+                assert_eq!(remote_hash.to_string(), new_version);
+
+                // Verify the status changed back to remote
+                let new_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
+                assert!(new_status.contains("remote"));
+
+                // Test error cases
+                // 1. Invalid hash format should return EINVAL
+                let invalid_hash_result =
+                    setxattr(&file_realpath, "realize.version", "invalid_hash").await;
+                assert!(invalid_hash_result.is_err());
+                if let Err(e) = invalid_hash_result {
+                    assert_eq!(libc::EINVAL, e.errno());
+                }
+
+                // 2. Unknown hash should return ENOENT
+                let unknown_hash = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+                let unknown_hash_result =
+                    setxattr(&file_realpath, "realize.version", unknown_hash).await;
+                assert!(unknown_hash_result.is_err());
+                if let Err(e) = unknown_hash_result {
+                    assert_eq!(libc::ENOENT, e.errno());
+                }
+
+                // 3. Non-UTF8 bytes should return EINVAL
+                let non_utf8_result = tokio::task::spawn_blocking({
+                    let file_realpath = file_realpath.clone();
+                    move || -> Result<(), std::io::Error> {
+                        use std::ffi::CString;
+                        use std::os::unix::ffi::OsStrExt;
+
+                        let path_cstr = CString::new(file_realpath.as_os_str().as_bytes())
+                            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                        let name_cstr = CString::new("realize.version")
+                            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+                        let value = [0xFFu8, 0xFEu8]; // Invalid UTF-8 sequence
+
+                        let result = unsafe {
+                            libc::setxattr(
+                                path_cstr.as_ptr(),
+                                name_cstr.as_ptr(),
+                                value.as_ptr() as *const libc::c_void,
+                                value.len(),
+                                0,
+                            )
+                        };
+
+                        if result == -1 {
+                            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                            if errno == libc::EINVAL {
+                                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                            }
+                        }
+                        Ok(())
+                    }
+                })
+                .await?;
+
+                assert!(non_utf8_result.is_err());
+                if let Err(e) = non_utf8_result {
+                    assert_eq!(Some(libc::EINVAL), e.raw_os_error());
+                }
+
+                // Verify the file is still at the remote version after error attempts
+                let final_version = getxattr(&file_realpath, "realize.version").await?.unwrap();
+                assert_eq!(remote_hash.to_string(), final_version);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+        fixture.unmount().await?;
+
         Ok(())
     }
 }

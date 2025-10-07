@@ -1293,6 +1293,64 @@ impl<'a> WritableOpenCache<'a> {
         }
         Ok(())
     }
+
+    /// Select an alternative version of the file, identified by its hash.
+    ///
+    /// The hash passed to this method should be one of the hashes
+    /// reported by [CacheReadOperations::list_alternatives] for the
+    /// same file.
+    ///
+    /// This is typically used to switch to another peer's version
+    /// when peers don't all agree on the version.
+    ///
+    /// When called on a local file, this deletes the local file in
+    /// favor of a remote one. This can't be undone.
+    ///
+    /// The hash should be the hash of one of the [FileAlternative]s
+    /// for the path or the operation fails with error
+    /// [StorageError::UnknownVersion].
+    pub(crate) fn select_alternative<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+        goal: &Hash,
+    ) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let pathid = tree.expect(loc.borrow())?;
+        let original = default_file_entry_or_err(&self.table, pathid)?;
+        if original.version.indexed_hash().is_some_and(|h| *h == *goal) {
+            // Nothing to do
+            return Ok(());
+        }
+        let peer_entry = match find_peer_entry(&self.table, pathid, goal)?.next() {
+            None => return Err(StorageError::UnknownVersion),
+            Some(e) => {
+                let (_peer, file_entry) = e?;
+
+                file_entry
+            }
+        };
+        self.write_default_file_entry(tree, blobs, dirty, pathid, &peer_entry)?;
+
+        // Report changes to local, as this is a user's decision that
+        // needs to be propagated to other peers currently tracking
+        // the original version.
+        if original.is_local() {
+            if let Some(path) = tree.backtrack(loc)? {
+                self.cleanup_local_file(tree, &path, &original);
+
+                // Report it added (replaced) so other peers are aware
+                // of the user's decision, and then immediately drop
+                // it, since it's not downloadable from this peer.
+                history.report_added(&path, Some(&original.version))?;
+                history.report_dropped(&path, goal)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct Cache {
@@ -5995,6 +6053,254 @@ mod tests {
             cache.list_alternatives(&tree, &branch_path)?,
             vec![FileAlternative::Branched(source_path.clone(), hash.clone())]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_no_change_when_same_hash() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("test_file.txt")?;
+        let peer = Peer::from("test_peer");
+        let hash = Hash([42u8; 32]);
+        let mtime = test_time();
+        let size = 100;
+
+        // Add file from peer
+        fixture.add_file_from_peer(peer, &file_path, size, mtime, hash.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        let history_start = history_start(&history)?;
+
+        // Selecting the same hash should be a no-op
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &hash,
+        )?;
+
+        // No history entries should be generated
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        // File should still exist with the same version
+        let alternatives = cache.list_alternatives(&tree, &file_path)?;
+        assert_eq!(alternatives.len(), 1);
+        assert!(matches!(
+            alternatives[0],
+            FileAlternative::Remote(ref p, ref h, s, m)
+                if *p == peer && *h == hash && s == size && m == mtime
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_switch_remote_versions() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("versioned_file.txt")?;
+        let peer1 = Peer::from("peer1");
+        let peer2 = Peer::from("peer2");
+        let hash1 = Hash([1u8; 32]);
+        let hash2 = Hash([2u8; 32]);
+        let mtime1 = test_time();
+        let mtime2 = later_time();
+        let size1 = 100;
+        let size2 = 200;
+
+        // Add same file from two different peers
+        fixture.add_file_from_peer(peer1, &file_path, size1, mtime1, hash1.clone())?;
+        fixture.add_file_from_peer(peer2, &file_path, size2, mtime2, hash2.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Verify we have two alternatives initially
+        let alternatives = cache.list_alternatives(&tree, &file_path)?;
+        assert_eq!(alternatives.len(), 2);
+
+        let history_start = history_start(&history)?;
+
+        // Select the alternative version (hash2 from peer2)
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &hash2,
+        )?;
+
+        // Verify the file now points to peer2's version
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert_eq!(entry.version.expect_indexed()?, &hash2);
+        assert_eq!(entry.size, size2);
+        assert_eq!(entry.mtime, mtime2);
+
+        // History should be empty since this wasn't a local file
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_from_local_to_remote() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("local_to_remote.txt")?;
+        let peer = Peer::from("remote_peer");
+        let local_hash = Hash([1u8; 32]);
+        let remote_hash = Hash([2u8; 32]);
+        let mtime = test_time();
+        let local_content = "local content";
+        let childpath = fixture.datadir.child("local_to_remote.txt");
+
+        // Create local file first
+        let (size, actual_mtime, _) = create_test_file(&childpath, local_content)?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Index the local file
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            size,
+            actual_mtime,
+            local_hash.clone(),
+        )?;
+
+        // Verify file is local
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert!(entry.is_local());
+        assert!(childpath.exists());
+
+        // Add remote version from peer
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer,
+            file_path.clone(),
+            mtime,
+            200,
+            remote_hash.clone(),
+        )?;
+
+        let history_start = history_start(&history)?;
+
+        // Select the remote alternative
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &remote_hash,
+        )?;
+
+        // Verify the file now points to the remote version
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert!(!entry.is_local());
+        assert_eq!(entry.version.expect_indexed()?, &remote_hash);
+        assert_eq!(entry.size, 200);
+
+        // Local file should be deleted
+        assert!(!childpath.exists());
+
+        // History should contain both replace and drop entries for the local file
+        let history_entries = collect_history_entries(&history, history_start)?;
+        assert_eq!(
+            history_entries,
+            vec![
+                HistoryTableEntry::Replace(file_path.clone(), local_hash.clone()),
+                HistoryTableEntry::Drop(file_path.clone(), remote_hash.clone())
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_unknown_version_error() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("unknown_hash.txt")?;
+        let peer = Peer::from("test_peer");
+        let known_hash = Hash([1u8; 32]);
+        let unknown_hash = Hash([99u8; 32]);
+        let mtime = test_time();
+
+        // Add file from peer with known hash
+        fixture.add_file_from_peer(peer, &file_path, 100, mtime, known_hash.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Try to select an unknown hash
+        let result = cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &unknown_hash,
+        );
+
+        assert!(matches!(result, Err(StorageError::UnknownVersion)));
+
+        // Original file should remain unchanged
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert_eq!(entry.version.expect_indexed()?, &known_hash);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_nonexistent_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("does_not_exist.txt")?;
+        let hash = Hash([1u8; 32]);
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Try to select an alternative for a nonexistent file
+        let result = cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &hash,
+        );
+
+        assert!(matches!(result, Err(StorageError::NotFound)));
 
         Ok(())
     }
