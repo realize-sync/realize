@@ -103,7 +103,18 @@ struct BlobFileGuarded {
     pending_ranges: ByteRanges,
     bytes_since_last_update: u64,
     state: BlobFileState,
-    fh: Option<File>,
+    fh: UnderlyingFile,
+}
+
+/// A handle of the file use for update and repair.
+enum UnderlyingFile {
+    /// The file hasn't been opened yet.
+    Unset,
+    /// The file handle is available.
+    Open(File),
+    /// No file is available for update and repair anymore; it has
+    /// been deleted or moved.
+    Gone,
 }
 
 #[derive(Copy, Eq, PartialEq, Clone, Debug)]
@@ -160,7 +171,7 @@ impl SharedBlobFile {
                 available_ranges: info.available_ranges.clone(),
                 pending_ranges: ByteRanges::new(),
                 bytes_since_last_update: 0,
-                fh: None,
+                fh: UnderlyingFile::Unset,
             }),
             tx_readable,
         })
@@ -253,12 +264,14 @@ impl SharedBlobFile {
             return Ok(());
         }
 
-        self.update_db_internal(guard).await
+        self.update_db_internal(guard).await?;
+
+        Ok(())
     }
 
     /// Check the file state and prepare it for verification.
     ///
-    /// This should be called before starting the verification process.
+    /// This must be called before starting the verification process.
     pub(crate) async fn prepare_for_verification(&self) -> Result<(), StorageError> {
         let mut guard = self.guarded.lock().await;
         if guard.state != BlobFileState::Complete {
@@ -266,10 +279,7 @@ impl SharedBlobFile {
         }
         // Any updates would have been flushed when reaching the state
         // complete, but repairs might not have been.
-        if let Some(fh) = &mut guard.fh {
-            fh.flush().await?;
-            fh.sync_all().await?;
-        }
+        flush_and_sync(&mut guard).await?;
 
         Ok(())
     }
@@ -286,7 +296,7 @@ impl SharedBlobFile {
                 let pathid = self.pathid;
                 let db = self.db.clone();
                 let hash = self.hash.clone();
-                tokio::task::spawn_blocking(move || {
+                let join_handle = tokio::task::spawn_blocking(move || {
                     let txn = db.begin_write()?;
                     {
                         let mut blobs = txn.write_blobs()?;
@@ -301,10 +311,17 @@ impl SharedBlobFile {
                     }
                     txn.commit()?;
                     Ok::<_, StorageError>(())
-                })
-                .await??;
+                });
                 guard.state = BlobFileState::Verified;
-                guard.fh = None; // Not needed anymore
+                flush_and_sync(&mut guard).await?;
+                guard.fh = UnderlyingFile::Unset; // Not needed anymore
+
+                // It's important not to wait for the block to
+                // return while holding the guard, as that would
+                // create a lock loops between self.guarded and the
+                // write transaction mutex.
+                drop(guard);
+                join_handle.await??;
                 Ok(())
             }
             _ => Err(StorageError::InvalidBlobState),
@@ -352,7 +369,7 @@ impl SharedBlobFile {
             return false;
         }
         guard.state = BlobFileState::Realized;
-        guard.fh = None;
+        guard.fh = UnderlyingFile::Unset;
         let _ = self.tx_readable.send(ReadableRange::Direct);
 
         true
@@ -367,7 +384,7 @@ impl SharedBlobFile {
         &self,
         guard: &'a mut MutexGuard<'_, BlobFileGuarded>,
     ) -> Result<&'a mut tokio::fs::File, StorageError> {
-        if guard.fh.is_none() {
+        if matches!(guard.fh, UnderlyingFile::Unset) {
             match File::options()
                 .write(true)
                 .create(false)
@@ -377,24 +394,28 @@ impl SharedBlobFile {
             {
                 Ok(file) => {
                     if self.id != BlobFileId::from(&file.metadata().await?) {
-                        // File has been deleted or moved; treat it as
-                        // a realized file for this and any future
-                        // calls.
-                        self.realize_internal(guard);
-                        return Err(StorageError::InvalidBlobState);
+                        // File has been deleted or moved. Update or
+                        // repair is impossible, but reading is still
+                        // possible for open handles.
+                        guard.fh = UnderlyingFile::Gone;
+                        return Err(StorageError::NotFound);
                     }
-                    guard.fh = Some(file);
+                    guard.fh = UnderlyingFile::Open(file);
                 }
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::NotFound {
-                        self.realize_internal(guard);
-                        return Err(StorageError::InvalidBlobState);
+                        guard.fh = UnderlyingFile::Gone;
+                        return Err(StorageError::NotFound);
                     }
                     return Err(err.into());
                 }
             }
         }
-        Ok(guard.fh.as_mut().unwrap())
+        if let UnderlyingFile::Open(file) = &mut guard.fh {
+            Ok(file)
+        } else {
+            Err(StorageError::NotFound)
+        }
     }
 
     async fn update_db_internal(
@@ -404,17 +425,14 @@ impl SharedBlobFile {
         if guard.pending_ranges.is_empty() {
             return Ok(());
         }
-        if let Some(file) = &mut guard.fh {
-            file.flush().await?;
-            file.sync_all().await?;
-        }
+        flush_and_sync(&mut guard).await?;
 
         let pathid = self.pathid;
         let ranges = guard.pending_ranges.clone();
         let db = Arc::clone(&self.db);
         let hash = self.hash.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let join_handle = tokio::task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             txn.write_blobs()?.extend_cache_status(
                 &mut txn.read_tree()?,
@@ -425,8 +443,7 @@ impl SharedBlobFile {
             txn.commit()?;
 
             Ok::<_, StorageError>(())
-        })
-        .await??;
+        });
 
         let pending = std::mem::take(&mut guard.pending_ranges);
         guard.available_ranges.extend(pending);
@@ -442,8 +459,42 @@ impl SharedBlobFile {
                 .send(ReadableRange::Limited(guard.available_ranges.clone()));
         }
 
+        // It's important not to wait for the block to
+        // return while holding the guard, as that would
+        // create a lock loops between self.guarded and the
+        // write transaction mutex.
+        drop(guard);
+        join_handle.await??;
+
         Ok(())
     }
+
+    /// Make changes to the database.
+    ///
+    /// It's important *not* to wait for the spawn_blocking to return,
+    /// as that would create a lock loops between self.guarded and the
+    /// write transaction mutex. It does mean that SharedBlobFile
+    /// might have more up-to-date information than what's on the
+    /// database - temporarily unless the database has problems.
+    fn write_to_db(
+        &self,
+        cb: impl FnOnce(&Arc<ArenaDatabase>) -> Result<(), StorageError> + Send + 'static,
+    ) {
+        let db = Arc::clone(&self.db);
+        let pathid = self.pathid;
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = cb(&db) {
+                log::debug!("Updating database for blob {pathid} failed: {err}")
+            }
+        });
+    }
+}
+
+async fn flush_and_sync(guard: &mut MutexGuard<'_, BlobFileGuarded>) -> Result<(), StorageError> {
+    Ok(if let UnderlyingFile::Open(fh) = &mut guard.fh {
+        fh.flush().await?;
+        fh.sync_all().await?;
+    })
 }
 
 impl BlobFileGuarded {

@@ -518,8 +518,7 @@ impl<'a> WritableOpenBlob<'a> {
             return Ok(());
         }
         let blob_path = self.subsystem.blob_dir.join(pathid.hex());
-        if let Ok(m) = blob_path.metadata() {
-            self.registry.realize_blocking(&m);
+        if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
         self.report_disk_usage_changed();
@@ -3356,7 +3355,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_open_blob() -> anyhow::Result<()> {
+    async fn delete_open_blob_with_updates() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("foobar")?;
 
@@ -3371,6 +3370,11 @@ mod tests {
 
         let mut blob = Blob::open(&fixture.db, &path)?;
         blob.update(0, b"foo").await?;
+        blob.update_db().await?;
+        assert_eq!(
+            Some(CacheStatus::Partial(6, ByteRanges::single(0, 3))),
+            blob.cache_status().await
+        );
 
         tokio::task::spawn_blocking(move || {
             let txn = fixture.begin_write()?;
@@ -3385,24 +3389,93 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await??;
+        // Open handles are still usable
+        assert_eq!(
+            Some(CacheStatus::Partial(6, ByteRanges::single(0, 3))),
+            blob.cache_status().await
+        );
+        // Update and verify still work
+        blob.update(3, b"bor").await?;
+        assert_eq!(Some(CacheStatus::Complete), blob.cache_status().await);
 
-        // Open blob file has been taken out of the cache
-        assert_eq!(None, blob.cache_status().await);
+        let mut buf = vec![0u8; 6];
+        assert_eq!(6, blob.read(&mut buf).await?);
+        assert_eq!(buf, b"foobor");
 
-        // It is still readable.
-        let mut buf = String::new();
-        blob.seek(SeekFrom::Start(0)).await?;
-        blob.read_to_string(&mut buf).await?;
-        assert_eq!("foo\0\0\0", buf);
+        assert_eq!(false, blob.verify().await?);
+        blob.repair(3, b"bar").await?;
+        assert_eq!(true, blob.verify().await?);
 
-        // It can even be realized and written to.
-        let mut file = blob.realize().await?;
-        file.seek(SeekFrom::Start(3)).await?;
-        file.write_all(b"BAR").await?;
-        file.seek(SeekFrom::Start(0)).await?;
-        let mut buf = String::new();
-        file.read_to_string(&mut buf).await?;
-        assert_eq!("fooBAR", buf);
+        // Realize can't work, since the original file isn't available anymore.
+        assert!(matches!(blob.realize().await, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_open_blob_without_updates() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foobar")?;
+
+        let txn = fixture.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+            let marks = txn.read_marks()?;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("foobar"), 6)?;
+        }
+        txn.commit()?;
+
+        // An update was made using another blob which was closed
+        // before the new one was opened, so there's no underlying
+        // file.
+        {
+            let mut blob = Blob::open(&fixture.db, &path)?;
+            blob.update(0, b"foo").await?;
+            blob.update_db().await?;
+            drop(blob);
+        }
+
+        let mut blob = Blob::open(&fixture.db, &path)?;
+        tokio::task::spawn_blocking(move || {
+            let txn = fixture.begin_write()?;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut blobs = txn.write_blobs()?;
+
+                blobs.delete(&mut tree, &path)?;
+            }
+            txn.commit()?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+
+        // Open handles are still usable
+        assert_eq!(
+            Some(CacheStatus::Partial(6, ByteRanges::single(0, 3))),
+            blob.cache_status().await
+        );
+
+        // Local data is still readable.
+        let mut buf = vec![0u8; 3];
+        assert_eq!(3, blob.read(&mut buf).await?);
+        assert_eq!(buf, b"foo");
+
+        // Update can't works, because there's no file handle to write
+        // to.
+        assert!(matches!(
+            blob.update(3, b"bar").await,
+            Err(StorageError::NotFound)
+        ));
+        blob.update_db().await?;
+        assert_eq!(
+            Some(CacheStatus::Partial(6, ByteRanges::single(0, 3))),
+            blob.cache_status().await
+        );
+
+        // Realize can't work, since the original file isn't available anymore.
+        assert!(matches!(blob.realize().await, Err(StorageError::NotFound)));
 
         Ok(())
     }
