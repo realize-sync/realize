@@ -493,7 +493,8 @@ mod tests {
             blob_dir.create_dir_all()?;
             let datadir = tempdir.child("data");
             datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
+            let db =
+                ArenaDatabase::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
             Ok(Self {
                 db,
                 current_time: UnixTime::from_secs(1234567890),
@@ -506,9 +507,12 @@ mod tests {
         fn now(&self) -> UnixTime {
             self.current_time.clone()
         }
-        
+
         fn file_mtime(&self, path: &str) -> UnixTime {
-            self.file_mtimes.get(path).cloned().unwrap_or(self.current_time)
+            self.file_mtimes
+                .get(path)
+                .cloned()
+                .unwrap_or(self.current_time)
         }
 
         fn increment_time(&mut self, seconds: u64) {
@@ -556,32 +560,26 @@ mod tests {
 
         async fn add(&mut self, path: &str, content: &str) -> anyhow::Result<Path> {
             let path = Path::parse(path)?;
-            
+
             // Create the actual file on disk
             let file_path = self.datadir.child(path.as_str());
             if let Some(parent) = file_path.path().parent() {
                 std::fs::create_dir_all(parent)?;
             }
             file_path.write_str(content)?;
-            
+
             // Get the actual file metadata
             let metadata = file_path.metadata()?;
             let actual_size = metadata.len();
             let actual_mtime = UnixTime::mtime(&metadata);
             let actual_hash = hash::digest(content);
-            
+
             // Store the actual mtime for this file
-            self.file_mtimes.insert(path.as_str().to_string(), actual_mtime);
-            
+            self.file_mtimes
+                .insert(path.as_str().to_string(), actual_mtime);
+
             let last = index::last_history_index_async(&self.db).await?;
-            index::add_file_async(
-                &self.db,
-                &path,
-                actual_size,
-                actual_mtime,
-                actual_hash,
-            )
-            .await?;
+            index::add_file_async(&self.db, &path, actual_size, actual_mtime, actual_hash).await?;
             self.db.history().watch().wait_for(|v| *v > last).await?;
 
             Ok(path)
