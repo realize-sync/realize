@@ -403,6 +403,9 @@ impl<T: TreeReadOperations> TreeExt for T {
                     }
                     current = parent;
                 }
+                if current != self.root() {
+                    return Err(StorageError::NotFound);
+                }
                 if components.is_empty() {
                     return Ok(None);
                 }
@@ -1252,12 +1255,14 @@ mod tests {
         assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?.unwrap());
         assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?.unwrap());
 
-        // Roots cannot be turned into a path, as empty paths are invalid.
+        // Root cannot be turned into a path, as empty paths are invalid.
         assert!(tree.backtrack(tree.root())?.is_none());
-        assert!(tree.backtrack(PathId(1))?.is_none());
 
-        // Invalid pathids are reported as None, not NotFound
-        assert!(tree.backtrack(PathId(999))?.is_none());
+        // Invalid pathids are reported as NotFound
+        assert!(matches!(
+            tree.backtrack(PathId(999)),
+            Err(StorageError::NotFound),
+        ));
 
         Ok(())
     }
