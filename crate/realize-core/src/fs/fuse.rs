@@ -137,7 +137,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.getattr(ino, fh).await {
+            match inner.getattr(Inode(ino), fh).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(attr) => reply.attr(&TTL, &attr),
             }
@@ -169,7 +169,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
             match inner
-                .setattr(ino, mode, uid, gid, size, atime, mtime, fh)
+                .setattr(Inode(ino), mode, uid, gid, size, atime, mtime, fh)
                 .await
             {
                 Err(err) => reply.error(err.log_and_convert()),
@@ -187,7 +187,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.open(ino, flags).await {
+            match inner.open(Inode(ino), flags).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok((fh, flags)) => reply.opened(fh, flags),
             }
@@ -217,7 +217,7 @@ impl fuser::Filesystem for RealizeFs {
     fn read(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         size: u32,
@@ -228,7 +228,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.read(fh, offset, size).await {
+            match inner.read(fh, Inode(ino), offset, size).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(data) => reply.data(&data),
             }
@@ -238,7 +238,7 @@ impl fuser::Filesystem for RealizeFs {
     fn write(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -250,7 +250,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
         let data = data.to_vec();
         self.handle.spawn(async move {
-            match inner.write(fh, offset, &data).await {
+            match inner.write(fh, Inode(ino), offset, &data).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(nbytes) => reply.written(nbytes),
             }
@@ -260,7 +260,7 @@ impl fuser::Filesystem for RealizeFs {
     fn flush(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
@@ -268,7 +268,7 @@ impl fuser::Filesystem for RealizeFs {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.flush(fh).await {
+            match inner.flush(fh, Inode(ino)).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
@@ -278,25 +278,32 @@ impl fuser::Filesystem for RealizeFs {
     fn opendir(
         &mut self,
         _req: &fuser::Request<'_>,
-        _ino: u64,
+        ino: u64,
         _flags: i32,
         reply: fuser::ReplyOpen,
     ) {
-        reply.opened(0, 0);
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            match inner.opendir(Inode(ino)).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(fh) => reply.opened(fh, 0),
+            }
+        });
     }
 
     fn readdir(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
         let inner = Arc::clone(&self.inner);
 
         self.handle.spawn(async move {
-            match inner.readdir(ino, offset, &mut reply).await {
+            match inner.readdir(fh, Inode(ino), offset, &mut reply).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
@@ -323,11 +330,18 @@ impl fuser::Filesystem for RealizeFs {
         &mut self,
         _req: &fuser::Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.ok();
+        let inner = Arc::clone(&self.inner);
+
+        self.handle.spawn(async move {
+            match inner.releasedir(fh).await {
+                Err(err) => reply.error(err.log_and_convert()),
+                Ok(()) => reply.ok(),
+            }
+        });
     }
 
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
@@ -346,7 +360,7 @@ impl fuser::Filesystem for RealizeFs {
         let name = name.to_owned();
 
         self.handle.spawn(async move {
-            match inner.getxattr(ino, name).await {
+            match inner.getxattr(Inode(ino), name).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(val) => {
                     let val = val.as_bytes();
@@ -378,7 +392,7 @@ impl fuser::Filesystem for RealizeFs {
         let value = value.to_vec();
 
         self.handle.spawn(async move {
-            match inner.setxattr(ino, name, value).await {
+            match inner.setxattr(Inode(ino), name, value).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
@@ -396,7 +410,7 @@ impl fuser::Filesystem for RealizeFs {
         let name = name.to_owned();
 
         self.handle.spawn(async move {
-            match inner.setxattr(ino, name, vec![]).await {
+            match inner.setxattr(Inode(ino), name, vec![]).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(()) => reply.ok(),
             }
@@ -412,7 +426,7 @@ impl fuser::Filesystem for RealizeFs {
     ) {
         let inner = Arc::clone(&self.inner);
         self.handle.spawn(async move {
-            match inner.listxattr(ino).await {
+            match inner.listxattr(Inode(ino)).await {
                 Err(err) => reply.error(err.log_and_convert()),
                 Ok(names) => {
                     let mut bytes = names.join("\0").into_bytes();
@@ -623,6 +637,9 @@ enum FileHandle {
 
     /// Handle to a local file.
     Local(tokio::fs::File, FHMode),
+
+    /// Directory handle
+    Dir(Vec<(String, Inode, realize_storage::Metadata)>),
 }
 
 /// Keeps track of open file handles.
@@ -657,17 +674,25 @@ impl FHRegistry {
     }
 
     /// Gets a specific file handle.
-    async fn get(&self, fh: u64) -> Option<Arc<Mutex<FileHandle>>> {
+    async fn get(&self, fh: u64) -> Option<(Inode, Arc<Mutex<FileHandle>>)> {
         self.state
             .lock()
             .await
             .by_fh
             .get(&fh)
-            .map(|(_, h)| Arc::clone(h))
+            .map(|(ino, h)| (*ino, Arc::clone(h)))
     }
 
-    async fn get_or_err(&self, fh: u64) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
-        self.get(fh).await.ok_or(FuseError::Errno(libc::EBADF))
+    async fn get_or_err(
+        &self,
+        fh: u64,
+        expected_inode: Inode,
+    ) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
+        let (ino, handle) = self.get(fh).await.ok_or(FuseError::Errno(libc::EBADF))?;
+        if ino != expected_inode {
+            return Err(FuseError::Errno(libc::EBADF));
+        }
+        return Ok(handle);
     }
 
     /// Gets all file handles for the given inode.
@@ -773,22 +798,22 @@ impl InnerRealizeFs {
         }
     }
 
-    async fn getattr(&self, ino: u64, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
+    async fn getattr(&self, ino: Inode, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
         if let Some(fh) = fh {
-            let handle = self.handles.get_or_err(fh).await?;
+            let handle = self.handles.get_or_err(fh, ino).await?;
             if let FileHandle::Local(file, _) = &*handle.lock().await {
                 return Ok(metadata_to_attr(&file.metadata().await?, ino));
             }
         }
-        let metadata = self.fs.metadata(Inode(ino)).await?;
+        let metadata = self.fs.metadata(ino).await?;
         match metadata {
-            Metadata::File(file_metadata) => Ok(self.build_file_attr(Inode(ino), &file_metadata)),
-            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(Inode(ino), dir_metadata)),
+            Metadata::File(file_metadata) => Ok(self.build_file_attr(ino, &file_metadata)),
+            Metadata::Dir(dir_metadata) => Ok(self.build_dir_attr(ino, dir_metadata)),
         }
     }
 
-    async fn listxattr(&self, ino: u64) -> Result<Vec<&'static str>, FuseError> {
-        if let Metadata::File(_) = self.fs.metadata(Inode(ino)).await? {
+    async fn listxattr(&self, ino: Inode) -> Result<Vec<&'static str>, FuseError> {
+        if let Metadata::File(_) = self.fs.metadata(ino).await? {
             return Ok(vec![
                 XATTR_MARK,
                 XATTR_STATUS,
@@ -800,9 +825,9 @@ impl InnerRealizeFs {
         Ok(vec![XATTR_MARK])
     }
 
-    async fn getxattr(&self, ino: u64, name: OsString) -> Result<String, FuseError> {
+    async fn getxattr(&self, ino: Inode, name: OsString) -> Result<String, FuseError> {
         if name == XATTR_MARK {
-            let (mark, direct) = self.fs.get_mark(Inode(ino)).await?;
+            let (mark, direct) = self.fs.get_mark(ino).await?;
             if direct {
                 return Ok(mark.to_string());
             }
@@ -810,7 +835,7 @@ impl InnerRealizeFs {
         }
 
         if name == XATTR_STATUS {
-            return Ok(match self.fs.file_realm(Inode(ino)).await? {
+            return Ok(match self.fs.file_realm(ino).await? {
                 FileRealm::Local(_) => "local 100%".to_string(),
                 FileRealm::Remote(CacheStatus::Missing) => "remote 0%".to_string(),
                 FileRealm::Remote(CacheStatus::Complete) => "remote 100%".to_string(),
@@ -825,7 +850,7 @@ impl InnerRealizeFs {
         }
 
         if name == XATTR_VERSION {
-            let m = self.fs.file_metadata(Inode(ino)).await?;
+            let m = self.fs.file_metadata(ino).await?;
             return Ok(match m.version {
                 Version::Modified(_) => "modified".to_string(),
                 Version::Indexed(hash) => hash.to_string(),
@@ -833,14 +858,14 @@ impl InnerRealizeFs {
         }
 
         if name == XATTR_VERSIONS {
-            let alternatives = self.fs.list_alternatives(Inode(ino)).await?;
+            let alternatives = self.fs.list_alternatives(ino).await?;
             return Ok(format::format_versions(&alternatives));
         }
 
         Err(FuseError::Errno(libc::ENODATA))
     }
 
-    async fn setxattr(&self, ino: u64, name: OsString, value: Vec<u8>) -> Result<(), FuseError> {
+    async fn setxattr(&self, ino: Inode, name: OsString, value: Vec<u8>) -> Result<(), FuseError> {
         if name == XATTR_MARK {
             // Parse the mark value from the byte slice
             let value_str = std::str::from_utf8(&value)
@@ -849,11 +874,11 @@ impl InnerRealizeFs {
 
             if value_str.is_empty() {
                 // Clear the mark
-                self.fs.clear_mark(Inode(ino)).await?;
+                self.fs.clear_mark(ino).await?;
             } else {
                 // Parse and set the mark
                 let mark = Mark::parse(value_str).ok_or(FuseError::Errno(libc::EINVAL))?;
-                self.fs.set_mark(Inode(ino), mark).await?;
+                self.fs.set_mark(ino, mark).await?;
             }
             return Ok(());
         }
@@ -868,7 +893,7 @@ impl InnerRealizeFs {
                 None => return Err(FuseError::Errno(libc::EINVAL)),
             };
 
-            match self.fs.select_alternative(Inode(ino), &hash).await {
+            match self.fs.select_alternative(ino, &hash).await {
                 Ok(()) => return Ok(()),
                 Err(StorageError::UnknownVersion) => return Err(FuseError::Errno(libc::ENOENT)),
                 Err(err) => return Err(FuseError::Cache(err)),
@@ -879,8 +904,14 @@ impl InnerRealizeFs {
         Err(FuseError::Errno(libc::ENOTSUP))
     }
 
-    async fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, FuseError> {
-        let handle = self.handles.get_or_err(fh).await?;
+    async fn read(
+        &self,
+        fh: u64,
+        ino: Inode,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, FuseError> {
+        let handle = self.handles.get_or_err(fh, ino).await?;
         let size = size as usize;
 
         // TODO: clarify type situation for offset. offset is i64 in
@@ -888,6 +919,7 @@ impl InnerRealizeFs {
         let offset = offset as u64;
         let mut buffer = Vec::with_capacity(size).limit(size);
         match &mut *handle.lock().await {
+            FileHandle::Dir(_) => return Err(FuseError::Errno(libc::EBADF)),
             FileHandle::Remote(reader, mode) => {
                 mode.check_allow_read()?;
                 reader.read_all_at(offset, &mut buffer).await?;
@@ -908,8 +940,8 @@ impl InnerRealizeFs {
         Ok(buffer.into_inner())
     }
 
-    async fn write(&self, fh: u64, offset: i64, data: &[u8]) -> Result<u32, FuseError> {
-        let handle = self.handles.get_or_err(fh).await?;
+    async fn write(&self, fh: u64, ino: Inode, offset: i64, data: &[u8]) -> Result<u32, FuseError> {
+        let handle = self.handles.get_or_err(fh, ino).await?;
         let offset = offset as u64; // TODO: clarify type situation for offset.
         let mut guard = handle.lock().await;
         let file = self.prepare_for_write(fh, &mut guard, None).await?;
@@ -921,7 +953,7 @@ impl InnerRealizeFs {
 
     async fn setattr(
         &self,
-        ino: u64,
+        ino: Inode,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -936,7 +968,7 @@ impl InnerRealizeFs {
             // allows other attributes to be set.
             self.truncate(ino, fh, size).await?;
         }
-        match self.fs.file_realm(Inode(ino)).await? {
+        match self.fs.file_realm(ino).await? {
             FileRealm::Remote(_) => {
                 if uid.is_some_and(|uid| uid != nix::unistd::getuid().as_raw())
                     || gid.is_some_and(|gid| gid != nix::unistd::getgid().as_raw())
@@ -1003,9 +1035,9 @@ impl InnerRealizeFs {
         self.getattr(ino, fh).await
     }
 
-    async fn truncate(&self, ino: u64, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
+    async fn truncate(&self, ino: Inode, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
         if let Some(fh) = fh {
-            let handle = self.handles.get_or_err(fh).await?;
+            let handle = self.handles.get_or_err(fh, ino).await?;
             let mut guard = handle.lock().await;
             let file = self.prepare_for_write(fh, &mut guard, Some(size)).await?;
             file.set_len(size).await?;
@@ -1013,7 +1045,6 @@ impl InnerRealizeFs {
 
             return Ok(());
         }
-        let ino = Inode(ino);
         match self.fs.file_content(ino).await? {
             FileContent::Local(realpath) => {
                 log::debug!("SETATTR {ino}: Truncate file, mapped to {realpath:?} to {size}");
@@ -1037,40 +1068,54 @@ impl InnerRealizeFs {
         }
     }
 
+    async fn opendir(&self, ino: Inode) -> Result<u64, FuseError> {
+        let mut entries = self.fs.readdir(ino).await.map_err(FuseError::Cache)?;
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let fh = self.handles.add(ino, FileHandle::Dir(entries)).await;
+
+        Ok(fh)
+    }
+
+    async fn releasedir(&self, fh: u64) -> Result<(), FuseError> {
+        self.handles.remove(fh).await;
+
+        Ok(())
+    }
+
     async fn readdir(
         &self,
-        ino: u64,
+        fh: u64,
+        ino: Inode,
         offset: i64,
         reply: &mut fuser::ReplyDirectory,
     ) -> Result<(), FuseError> {
-        let mut entries = self
-            .fs
-            .readdir(Inode(ino))
-            .await
-            .map_err(FuseError::Cache)?;
-        entries.sort_by(|a, b| a.1.cmp(&b.1));
+        let handle = self.handles.get_or_err(fh, ino).await?;
+        match &mut *handle.lock().await {
+            FileHandle::Dir(entries) => {
+                let pivot = Inode(offset as u64); // offset is actually a u64 in fuse
+                let start = match entries.binary_search_by(|(_, pathid, _)| pathid.cmp(&pivot)) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                };
+                for (name, pathid, metadata) in entries.iter().skip(start) {
+                    if reply.add(
+                        pathid.as_u64(),
+                        pathid.as_u64() as i64,
+                        match metadata {
+                            Metadata::Dir(_) => fuser::FileType::Directory,
+                            Metadata::File(_) => fuser::FileType::RegularFile,
+                        },
+                        name,
+                    ) {
+                        // buffer full
+                        break;
+                    }
+                }
 
-        let pivot = Inode(offset as u64); // offset is actually a u64 in fuse
-        let start = match entries.binary_search_by(|(_, pathid, _)| pathid.cmp(&pivot)) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        };
-        for (name, pathid, metadata) in entries.into_iter().skip(start) {
-            if reply.add(
-                pathid.as_u64(),
-                pathid.as_u64() as i64,
-                match metadata {
-                    Metadata::Dir(_) => fuser::FileType::Directory,
-                    Metadata::File(_) => fuser::FileType::RegularFile,
-                },
-                name,
-            ) {
-                // buffer full
-                break;
+                Ok(())
             }
+            _ => return Err(FuseError::Errno(libc::EBADF)),
         }
-
-        Ok(())
     }
 
     async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
@@ -1137,8 +1182,7 @@ impl InnerRealizeFs {
         Ok(())
     }
 
-    async fn open(&self, ino: u64, flags: i32) -> Result<(u64, u32), FuseError> {
-        let ino = Inode(ino);
+    async fn open(&self, ino: Inode, flags: i32) -> Result<(u64, u32), FuseError> {
         let handle = match self.fs.file_content(ino).await? {
             FileContent::Local(path) => FileHandle::Local(
                 openoptions_from_flags(flags).open(path).await?,
@@ -1204,7 +1248,7 @@ impl InnerRealizeFs {
 
         let options = openoptions_from_flags(flags);
         let (ino, file) = self.fs.create(options, (Inode(parent), name)).await?;
-        let attr = metadata_to_attr(&file.metadata().await?, ino.as_u64());
+        let attr = metadata_to_attr(&file.metadata().await?, ino);
         let fh = self
             .handles
             .add(ino, FileHandle::Local(file, FHMode::from_flags(flags)))
@@ -1214,9 +1258,10 @@ impl InnerRealizeFs {
         Ok((attr, fh))
     }
 
-    async fn flush(&self, fh: u64) -> Result<(), FuseError> {
-        let handle = self.handles.get_or_err(fh).await?;
+    async fn flush(&self, fh: u64, ino: Inode) -> Result<(), FuseError> {
+        let handle = self.handles.get_or_err(fh, ino).await?;
         match &mut *handle.lock().await {
+            FileHandle::Dir(_) => return Err(FuseError::Errno(libc::EBADF)),
             FileHandle::Remote(blob, _) => {
                 blob.update_db().await?;
             }
@@ -1234,6 +1279,7 @@ impl InnerRealizeFs {
     async fn release(&self, fh: u64) -> Result<(), FuseError> {
         if let Some(handle) = self.handles.remove(fh).await {
             match &mut *handle.lock().await {
+                FileHandle::Dir(_) => {}
                 FileHandle::Remote(_, _) => {}
                 FileHandle::Local(file, mode) => {
                     if mode.allow_write() {
@@ -1459,9 +1505,9 @@ fn io_errno(kind: std::io::ErrorKind) -> c_int {
 }
 
 // Build a FileAttr from a real file metadata and map it to `ino`.
-fn metadata_to_attr(m: &std::fs::Metadata, ino: u64) -> fuser::FileAttr {
+fn metadata_to_attr(m: &std::fs::Metadata, ino: Inode) -> fuser::FileAttr {
     fuser::FileAttr {
-        ino,
+        ino: ino.as_u64(),
         size: m.len(),
         blocks: m.blocks(),
         atime: m.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
