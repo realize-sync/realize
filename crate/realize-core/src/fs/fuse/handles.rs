@@ -4,7 +4,6 @@
 //! It tracks file handles by both file handle ID and inode for efficient lookup.
 
 use crate::fs::downloader::Download;
-use multimap::MultiMap;
 use nix::libc;
 use realize_storage::Inode;
 use std::collections::BTreeMap;
@@ -34,7 +33,6 @@ pub(crate) struct FHRegistry {
 
 struct FHRegistryState {
     by_fh: BTreeMap<u64, (Inode, Arc<Mutex<FileHandle>>)>,
-    by_inode: MultiMap<Inode, u64>,
 }
 
 impl FHRegistry {
@@ -42,7 +40,6 @@ impl FHRegistry {
         Self {
             state: Arc::new(Mutex::new(FHRegistryState {
                 by_fh: BTreeMap::new(),
-                by_inode: MultiMap::new(),
             })),
         }
     }
@@ -55,7 +52,6 @@ impl FHRegistry {
             .map(|(k, _)| *k + 1)
             .unwrap_or(1);
         this.by_fh.insert(fh, (ino, Arc::new(Mutex::new(handle))));
-        this.by_inode.insert(ino, fh);
 
         fh
     }
@@ -82,31 +78,10 @@ impl FHRegistry {
         return Ok(handle);
     }
 
-    /// Gets all file handles for the given inode.
-    pub(crate) async fn iter_by_inode(&self, ino: Inode) -> Vec<Arc<Mutex<FileHandle>>> {
-        let this = self.state.lock().await;
-
-        this.by_inode
-            .get_vec(&ino)
-            .cloned()
-            .unwrap_or_else(|| vec![])
-            .into_iter()
-            .flat_map(|fh| this.by_fh.get(&fh).map(|(_, h)| Arc::clone(h)))
-            .collect()
-    }
-
     /// Removes a file handle from the registry.
     pub(crate) async fn remove(&self, fh: u64) -> Option<Arc<Mutex<FileHandle>>> {
-        let mut this = self.state.lock().await;
-        if let Some((ino, handle)) = this.by_fh.remove(&fh) {
-            if let Some(vec) = this.by_inode.get_vec_mut(&ino) {
-                vec.retain(|e| *e != fh);
-            }
-
-            return Some(handle);
-        }
-
-        None
+        let mut state = self.state.lock().await;
+        state.by_fh.remove(&fh).map(|(_, h)| h)
     }
 }
 
