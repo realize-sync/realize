@@ -62,7 +62,7 @@ impl FuseHandle {
     }
 
     /// Unmount the filesystem and wait for the fuse run loop to stop.
-    pub(crate) fn join_blocking(self) {
+    pub fn join_blocking(self) {
         self.inner.join();
     }
 }
