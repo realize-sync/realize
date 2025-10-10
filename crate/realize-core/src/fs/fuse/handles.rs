@@ -24,7 +24,7 @@ pub(crate) enum FileHandle {
     Local(tokio::fs::File, FHMode),
 
     /// Directory handle
-    Dir(Vec<(String, Inode, realize_storage::Metadata)>),
+    Dir(ReadDirData),
 }
 
 /// Keeps track of open file handles.
@@ -149,5 +149,36 @@ impl FHMode {
         }
 
         Ok(())
+    }
+}
+
+/// Data kept for iterating over a directory.
+pub(crate) struct ReadDirData {
+    entries: Vec<(String, Inode, realize_storage::Metadata)>,
+}
+
+impl ReadDirData {
+    pub(crate) fn new(mut entries: Vec<(String, Inode, realize_storage::Metadata)>) -> Self {
+        entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+        Self { entries }
+    }
+
+    /// Return an iterator that starts after the given [Inode].
+    ///
+    /// To get all entries, pass in [Inode::ZERO].
+    pub(crate) fn after(
+        &self,
+        after: Inode,
+    ) -> impl Iterator<Item = &(String, Inode, realize_storage::Metadata)> {
+        let start = match self
+            .entries
+            .binary_search_by(|(_, inode, _)| inode.cmp(&after))
+        {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+
+        self.entries.iter().skip(start)
     }
 }

@@ -7,6 +7,7 @@ use super::error::FuseError;
 use super::format;
 use super::handles::{FHMode, FHRegistry, FileHandle};
 use crate::fs::downloader::Downloader;
+use crate::fs::fuse::handles::ReadDirData;
 use fuser::FileType;
 use nix::errno::Errno;
 use nix::libc;
@@ -354,9 +355,13 @@ impl InnerRealizeFs {
     }
 
     pub(crate) async fn opendir(&self, ino: Inode) -> Result<u64, FuseError> {
-        let mut entries = self.fs.readdir(ino).await?;
-        entries.sort_by(|a, b| a.1.cmp(&b.1));
-        let fh = self.handles.add(ino, FileHandle::Dir(entries)).await;
+        let fh = self
+            .handles
+            .add(
+                ino,
+                FileHandle::Dir(ReadDirData::new(self.fs.readdir(ino).await?)),
+            )
+            .await;
 
         Ok(fh)
     }
@@ -378,11 +383,7 @@ impl InnerRealizeFs {
         match &mut *handle.lock().await {
             FileHandle::Dir(entries) => {
                 let pivot = Inode(offset as u64); // offset is actually a u64 in fuse
-                let start = match entries.binary_search_by(|(_, pathid, _)| pathid.cmp(&pivot)) {
-                    Ok(i) => i + 1,
-                    Err(i) => i,
-                };
-                for (name, pathid, metadata) in entries.iter().skip(start) {
+                for (name, pathid, metadata) in entries.after(pivot) {
                     if reply.add(
                         pathid.as_u64(),
                         pathid.as_u64() as i64,
