@@ -4,63 +4,96 @@
 //! and utility functions for handling errors in the FUSE interface.
 
 use crate::rpc::HouseholdOperationError;
-use nix::libc::{self, c_int};
+use nix::libc;
 use realize_storage::StorageError;
 
 /// Intermediate error type to catch and convert to libc errno to
 /// report errors to fuser.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum FuseError {
-    #[error(transparent)]
-    Cache(#[from] StorageError),
+#[derive(Debug, Clone)]
+pub(crate) struct FuseError {
+    errno: libc::c_int,
+    message: Option<String>,
+}
 
-    #[error(transparent)]
-    Rpc(#[from] HouseholdOperationError),
-
-    #[error("invalid UTF-8 string")]
-    Utf8,
-
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
-
-    #[error("errno {0}")]
-    Errno(c_int),
-
-    #[error("tokio runtime error {0}")]
-    Join(#[from] tokio::task::JoinError),
+impl std::error::Error for FuseError {}
+impl std::fmt::Display for FuseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(msg) = &self.message {
+            write!(f, "errno {}: {}", self.errno, msg)
+        } else {
+            write!(f, "errno {}", self.errno)
+        }
+    }
 }
 
 impl FuseError {
-    /// Return a libc error code to represent this error, fuse-side.
-    pub(crate) fn errno(&self) -> c_int {
-        match &self {
-            FuseError::Cache(err) => io_errno(err.io_kind()),
-            FuseError::Utf8 => libc::EINVAL,
-            FuseError::Io(ioerr) => io_errno(ioerr.kind()),
-            FuseError::Errno(errno) => *errno,
-            FuseError::Rpc(err) => io_errno(err.io_kind()),
-            FuseError::Join(_) => libc::EIO,
+    pub(crate) fn utf8() -> FuseError {
+        FuseError {
+            errno: libc::EINVAL,
+            message: Some("invalid UTF-8 string".to_string()),
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn errno(&self) -> libc::c_int {
+        self.errno
+    }
+
     /// Convert into a libc error code.
-    pub(crate) fn log_and_convert(self) -> c_int {
-        let errno = self.errno();
+    pub(crate) fn log_and_convert(self) -> libc::c_int {
+        log::debug!("FUSE operation error: {self}");
 
-        log::debug!("FUSE operation error: {self:?} -> {errno}");
+        self.errno
+    }
+}
 
-        errno
+impl From<StorageError> for FuseError {
+    fn from(err: StorageError) -> Self {
+        FuseError {
+            errno: io_errno(err.io_kind()),
+            message: Some(err.to_string()),
+        }
+    }
+}
+
+impl From<HouseholdOperationError> for FuseError {
+    fn from(err: HouseholdOperationError) -> Self {
+        FuseError {
+            errno: io_errno(err.io_kind()),
+            message: Some(err.to_string()),
+        }
+    }
+}
+
+impl From<std::io::Error> for FuseError {
+    fn from(ioerr: std::io::Error) -> Self {
+        FuseError {
+            errno: io_errno(ioerr.kind()),
+            message: Some(ioerr.to_string()),
+        }
+    }
+}
+
+impl From<tokio::task::JoinError> for FuseError {
+    fn from(err: tokio::task::JoinError) -> Self {
+        FuseError {
+            errno: libc::EIO,
+            message: Some(format!("tokio runtime error {}", err)),
+        }
     }
 }
 
 impl From<nix::errno::Errno> for FuseError {
     fn from(value: nix::errno::Errno) -> Self {
-        FuseError::Errno(value as c_int)
+        FuseError {
+            errno: value as libc::c_int,
+            message: None,
+        }
     }
 }
 
 /// Convert a Rust [std::io::ErrorKind] into a libc error code.
-fn io_errno(kind: std::io::ErrorKind) -> c_int {
+fn io_errno(kind: std::io::ErrorKind) -> libc::c_int {
     match kind {
         std::io::ErrorKind::NotFound => libc::ENOENT,
         std::io::ErrorKind::PermissionDenied => libc::EACCES,
@@ -100,5 +133,36 @@ fn io_errno(kind: std::io::ErrorKind) -> c_int {
         std::io::ErrorKind::Unsupported => libc::ENOSYS,
         std::io::ErrorKind::OutOfMemory => libc::ENOMEM,
         _ => libc::EIO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nix::errno::Errno;
+
+    use super::*;
+
+    #[test]
+    fn test_fuse_error_is_clonable() {
+        let error1 = FuseError::utf8();
+        let error2 = error1.clone(); // This should compile without issues
+        assert_eq!(error1.errno(), error2.errno());
+        assert_eq!(error1.to_string(), error2.to_string());
+
+        let error3 = FuseError::from(Errno::EINVAL);
+        let error4 = error3.clone();
+        assert_eq!(error3.errno(), error4.errno());
+        assert_eq!(error3.to_string(), error4.to_string());
+    }
+
+    #[test]
+    fn test_fuse_error_preserves_errno_and_message() {
+        let error = FuseError::from(Errno::ENOENT);
+        assert_eq!(error.errno(), libc::ENOENT);
+        assert_eq!(error.to_string(), "errno 2");
+
+        let utf8_error = FuseError::utf8();
+        assert_eq!(utf8_error.errno(), libc::EINVAL);
+        assert_eq!(utf8_error.to_string(), "errno 22: invalid UTF-8 string");
     }
 }

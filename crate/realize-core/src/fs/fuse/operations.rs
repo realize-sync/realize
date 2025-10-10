@@ -8,6 +8,7 @@ use super::format;
 use super::handles::{FHMode, FHRegistry, FileHandle};
 use crate::fs::downloader::Downloader;
 use fuser::FileType;
+use nix::errno::Errno;
 use nix::libc;
 use nix::sys::stat;
 use nix::sys::time::TimeSpec;
@@ -47,8 +48,12 @@ impl InnerRealizeFs {
         }
     }
 
-    pub(crate) async fn lookup(&self, parent: u64, name: OsString) -> Result<fuser::FileAttr, FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+    pub(crate) async fn lookup(
+        &self,
+        parent: u64,
+        name: OsString,
+    ) -> Result<fuser::FileAttr, FuseError> {
+        let name = name.to_str().ok_or(FuseError::utf8())?;
         let (inode, metadata) = self.fs.lookup((Inode(parent), name)).await?;
         match metadata {
             Metadata::File(file_metadata) => Ok(self.build_file_attr(inode, &file_metadata)),
@@ -56,7 +61,11 @@ impl InnerRealizeFs {
         }
     }
 
-    pub(crate) async fn getattr(&self, ino: Inode, fh: Option<u64>) -> Result<fuser::FileAttr, FuseError> {
+    pub(crate) async fn getattr(
+        &self,
+        ino: Inode,
+        fh: Option<u64>,
+    ) -> Result<fuser::FileAttr, FuseError> {
         if let Some(fh) = fh {
             let handle = self.handles.get_or_err(fh, ino).await?;
             if let FileHandle::Local(file, _) = &*handle.lock().await {
@@ -120,7 +129,7 @@ impl InnerRealizeFs {
             return Ok(format::format_versions(&alternatives));
         }
 
-        Err(FuseError::Errno(libc::ENODATA))
+        Err(Errno::ENODATA.into())
     }
 
     pub(crate) async fn setxattr(
@@ -132,7 +141,7 @@ impl InnerRealizeFs {
         if name == XATTR_MARK {
             // Parse the mark value from the byte slice
             let value_str = std::str::from_utf8(&value)
-                .map_err(|_| FuseError::Errno(libc::EINVAL))?
+                .map_err(|_| FuseError::utf8())?
                 .trim();
 
             if value_str.is_empty() {
@@ -140,7 +149,7 @@ impl InnerRealizeFs {
                 self.fs.clear_mark(ino).await?;
             } else {
                 // Parse and set the mark
-                let mark = Mark::parse(value_str).ok_or(FuseError::Errno(libc::EINVAL))?;
+                let mark = Mark::parse(value_str).ok_or(FuseError::from(Errno::EINVAL))?;
                 self.fs.set_mark(ino, mark).await?;
             }
             return Ok(());
@@ -148,23 +157,25 @@ impl InnerRealizeFs {
 
         if name == XATTR_VERSION {
             let value_str = std::str::from_utf8(&value)
-                .map_err(|_| FuseError::Errno(libc::EINVAL))?
+                .map_err(|_| FuseError::from(Errno::EINVAL))?
                 .trim();
 
             let hash = match Hash::from_base64(value_str) {
                 Some(hash) => hash,
-                None => return Err(FuseError::Errno(libc::EINVAL)),
+                None => return Err(FuseError::from(Errno::EINVAL)),
             };
 
             match self.fs.select_alternative(ino, &hash).await {
                 Ok(()) => return Ok(()),
-                Err(StorageError::UnknownVersion) => return Err(FuseError::Errno(libc::ENOENT)),
-                Err(err) => return Err(FuseError::Cache(err)),
+                Err(StorageError::UnknownVersion) => {
+                    return Err(FuseError::from(Errno::ENOENT));
+                }
+                Err(err) => return Err(err.into()),
             }
         }
 
         // Other attributes are not supported for setting
-        Err(FuseError::Errno(libc::ENOTSUP))
+        Err(Errno::ENOTSUP.into())
     }
 
     pub(crate) async fn read(
@@ -182,7 +193,7 @@ impl InnerRealizeFs {
         let offset = offset as u64;
         let mut buffer = Vec::with_capacity(size).limit(size);
         match &mut *handle.lock().await {
-            FileHandle::Dir(_) => return Err(FuseError::Errno(libc::EBADF)),
+            FileHandle::Dir(_) => return Err(Errno::EBADF.into()),
             FileHandle::Remote(reader, mode) => {
                 mode.check_allow_read()?;
                 reader.read_all_at(offset, &mut buffer).await?;
@@ -245,7 +256,7 @@ impl InnerRealizeFs {
                     log::debug!(
                         "SETATTR Inode({ino})@remote: cannot change uid or gid of remote file"
                     );
-                    return Err(FuseError::Errno(libc::EPERM));
+                    return Err(Errno::EPERM.into());
                 }
 
                 // Ignore the rest
@@ -304,7 +315,12 @@ impl InnerRealizeFs {
         self.getattr(ino, fh).await
     }
 
-    pub(crate) async fn truncate(&self, ino: Inode, fh: Option<u64>, size: u64) -> Result<(), FuseError> {
+    pub(crate) async fn truncate(
+        &self,
+        ino: Inode,
+        fh: Option<u64>,
+        size: u64,
+    ) -> Result<(), FuseError> {
         if let Some(fh) = fh {
             let handle = self.handles.get_or_err(fh, ino).await?;
             let mut guard = handle.lock().await;
@@ -338,7 +354,7 @@ impl InnerRealizeFs {
     }
 
     pub(crate) async fn opendir(&self, ino: Inode) -> Result<u64, FuseError> {
-        let mut entries = self.fs.readdir(ino).await.map_err(FuseError::Cache)?;
+        let mut entries = self.fs.readdir(ino).await?;
         entries.sort_by(|a, b| a.1.cmp(&b.1));
         let fh = self.handles.add(ino, FileHandle::Dir(entries)).await;
 
@@ -383,12 +399,12 @@ impl InnerRealizeFs {
 
                 Ok(())
             }
-            _ => return Err(FuseError::Errno(libc::EBADF)),
+            _ => return Err(Errno::EBADF.into()),
         }
     }
 
     pub(crate) async fn unlink(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::utf8())?;
         let (inode, _) = self.fs.lookup((Inode(parent), name)).await?;
         self.fs.unlink(inode).await?;
 
@@ -401,7 +417,7 @@ impl InnerRealizeFs {
         parent: u64,
         name: OsString,
     ) -> Result<fuser::FileAttr, FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::utf8())?;
 
         let (dest, metadata) = self.fs.branch(Inode(source), (Inode(parent), name)).await?;
 
@@ -415,7 +431,7 @@ impl InnerRealizeFs {
         _mode: u32,
         _umask: u32,
     ) -> Result<fuser::FileAttr, FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::utf8())?;
 
         let (dest, metadata) = self.fs.mkdir((Inode(parent), name)).await?;
 
@@ -423,7 +439,7 @@ impl InnerRealizeFs {
     }
 
     pub(crate) async fn rmdir(&self, parent: u64, name: OsString) -> Result<(), FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::utf8())?;
 
         self.fs.rmdir((Inode(parent), name)).await?;
 
@@ -438,8 +454,8 @@ impl InnerRealizeFs {
         new_name: OsString,
         noreplace: bool,
     ) -> Result<(), FuseError> {
-        let old_name = old_name.to_str().ok_or(FuseError::Utf8)?;
-        let new_name = new_name.to_str().ok_or(FuseError::Utf8)?;
+        let old_name = old_name.to_str().ok_or(FuseError::utf8())?;
+        let new_name = new_name.to_str().ok_or(FuseError::utf8())?;
         self.fs
             .rename(
                 (Inode(old_parent), old_name),
@@ -512,7 +528,7 @@ impl InnerRealizeFs {
         _umask: u32,
         flags: i32,
     ) -> Result<(fuser::FileAttr, u64), FuseError> {
-        let name = name.to_str().ok_or(FuseError::Utf8)?;
+        let name = name.to_str().ok_or(FuseError::utf8())?;
         log::debug!("CREATE parent={parent} name={name} mode={mode:o} flags={flags:#x}");
 
         let options = openoptions_from_flags(flags);
@@ -530,7 +546,7 @@ impl InnerRealizeFs {
     pub(crate) async fn flush(&self, fh: u64, ino: Inode) -> Result<(), FuseError> {
         let handle = self.handles.get_or_err(fh, ino).await?;
         match &mut *handle.lock().await {
-            FileHandle::Dir(_) => return Err(FuseError::Errno(libc::EBADF)),
+            FileHandle::Dir(_) => return Err(Errno::EBADF.into()),
             FileHandle::Remote(blob, _) => {
                 blob.update_db().await?;
             }
@@ -589,7 +605,7 @@ impl InnerRealizeFs {
 
                 Ok(file)
             }
-            _ => Err(FuseError::Errno(libc::EPERM)),
+            _ => Err(Errno::EPERM.into()),
         }
     }
 

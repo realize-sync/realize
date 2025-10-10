@@ -4,6 +4,7 @@
 //! It tracks file handles by both file handle ID and inode for efficient lookup.
 
 use crate::fs::downloader::Download;
+use nix::errno::Errno;
 use nix::libc;
 use realize_storage::Inode;
 use std::collections::BTreeMap;
@@ -71,9 +72,9 @@ impl FHRegistry {
         fh: u64,
         expected_inode: Inode,
     ) -> Result<Arc<Mutex<FileHandle>>, FuseError> {
-        let (ino, handle) = self.get(fh).await.ok_or(FuseError::Errno(libc::EBADF))?;
+        let (ino, handle) = self.get(fh).await.ok_or(FuseError::from(Errno::EBADF))?;
         if ino != expected_inode {
-            return Err(FuseError::Errno(libc::EBADF));
+            return Err(FuseError::from(Errno::EBADF));
         }
         return Ok(handle);
     }
@@ -136,7 +137,7 @@ impl FHMode {
 
     pub(crate) fn check_allow_read(&self) -> Result<(), FuseError> {
         if !self.allow_read() {
-            return Err(FuseError::Errno(libc::EPERM));
+            return Err(Errno::EPERM.into());
         }
 
         Ok(())
@@ -144,7 +145,7 @@ impl FHMode {
 
     pub(crate) fn check_allow_write(&self) -> Result<(), FuseError> {
         if !self.allow_write() {
-            return Err(FuseError::Errno(libc::EPERM));
+            return Err(Errno::EPERM.into());
         }
 
         Ok(())
