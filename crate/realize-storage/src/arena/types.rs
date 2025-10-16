@@ -1036,19 +1036,15 @@ pub struct FileMetadata {
 
 impl FileMetadata {
     pub(crate) fn merged(e: &FileTableEntry, m: &std::fs::Metadata) -> Self {
-        FileMetadata {
-            size: m.len(),
-            mtime: UnixTime::mtime(&m),
-            version: e.version.clone(),
-            ctime: Some(
-                UnixTime::from_system_time(m.created().unwrap_or(SystemTime::UNIX_EPOCH))
-                    .unwrap_or(UnixTime::ZERO),
-            ),
-            mode: m.mode(),
-            uid: Some(m.uid()),
-            gid: Some(m.gid()),
-            blocks: (m.len() / 512) + if (m.len() % 512) == 0 { 0 } else { 1 },
+        let mut file_metadata = FileMetadata::from(m);
+        if e.is_local() {
+            file_metadata.version = e.version.clone();
+        } else {
+            // A new local modification of a cached file
+            file_metadata.version = Version::modification_of(Some(e.version.clone()));
         }
+
+        file_metadata
     }
 }
 
@@ -1070,6 +1066,29 @@ impl From<&FileTableEntry> for FileMetadata {
 impl From<FileTableEntry> for FileMetadata {
     fn from(value: FileTableEntry) -> Self {
         FileMetadata::from(&value)
+    }
+}
+
+impl From<&std::fs::Metadata> for FileMetadata {
+    fn from(m: &std::fs::Metadata) -> Self {
+        FileMetadata {
+            size: m.len(),
+            mtime: UnixTime::mtime(&m),
+            version: Version::Modified(None),
+            ctime: Some(
+                UnixTime::from_system_time(m.created().unwrap_or(SystemTime::UNIX_EPOCH))
+                    .unwrap_or(UnixTime::ZERO),
+            ),
+            mode: m.mode(),
+            uid: Some(m.uid()),
+            gid: Some(m.gid()),
+            blocks: (m.len() / 512) + if (m.len() % 512) == 0 { 0 } else { 1 },
+        }
+    }
+}
+impl From<std::fs::Metadata> for FileMetadata {
+    fn from(m: std::fs::Metadata) -> Self {
+        FileMetadata::from(&m)
     }
 }
 
@@ -1117,6 +1136,21 @@ impl From<&DirtableEntry> for DirMetadata {
 impl From<DirtableEntry> for DirMetadata {
     fn from(e: DirtableEntry) -> Self {
         DirMetadata::from(&e)
+    }
+}
+impl From<&std::fs::Metadata> for DirMetadata {
+    fn from(m: &std::fs::Metadata) -> Self {
+        DirMetadata {
+            mtime: UnixTime::mtime(m),
+            mode: m.mode(),
+            uid: Some(m.uid()),
+            gid: Some(m.gid()),
+        }
+    }
+}
+impl From<std::fs::Metadata> for DirMetadata {
+    fn from(m: std::fs::Metadata) -> Self {
+        DirMetadata::from(&m)
     }
 }
 
