@@ -61,7 +61,9 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>;
+    ) -> impl Iterator<
+        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
+    >;
 
     /// Get the default file entry for the given pathid.
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
@@ -175,8 +177,9 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
-    {
+    ) -> impl Iterator<
+        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
+    > {
         let loc = loc.into();
         ReadDirIterator::new(
             &self.table,
@@ -268,8 +271,9 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>>
-    {
+    ) -> impl Iterator<
+        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
+    > {
         let loc = loc.into();
 
         ReadDirIterator::new(
@@ -1463,6 +1467,14 @@ fn metadata<'b, L: Into<TreeLoc<'b>>>(
                     return Ok(Some(crate::arena::types::Metadata::File(file_entry.into())));
                 }
                 CacheTableEntry::Dir(dir_entry) => {
+                    if let Some(path) = tree.backtrack(loc)? {
+                        if let Ok(m) = path.within(datadir).metadata() {
+                            return Ok(Some(crate::arena::types::Metadata::Dir(
+                                DirMetadata::from(m),
+                            )));
+                        }
+                    }
+
                     return Ok(Some(crate::arena::types::Metadata::Dir(dir_entry.into())));
                 }
             }
@@ -1662,7 +1674,7 @@ impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
 {
-    type Item = Result<(String, PathId, crate::arena::types::Metadata), StorageError>;
+    type Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
@@ -1684,7 +1696,7 @@ where
                 // if real is not a file, what's in the cache doesn't matter
                 return Some(Ok((
                     name,
-                    pathid,
+                    Some(pathid),
                     crate::arena::types::Metadata::Dir(real.into()),
                 )));
             }
@@ -1702,7 +1714,7 @@ where
                     if !cached.is_local() {
                         return Some(Ok((
                             name,
-                            pathid,
+                            Some(pathid),
                             crate::arena::types::Metadata::File(cached.into()),
                         )));
                     }
@@ -1710,32 +1722,35 @@ where
                 (None, Some(CacheTableEntry::Dir(cached))) => {
                     return Some(Ok((
                         name,
-                        pathid,
+                        Some(pathid),
                         crate::arena::types::Metadata::Dir(cached.into()),
                     )));
                 }
                 (Some(real), Some(CacheTableEntry::File(cached))) => {
                     return Some(Ok((
                         name,
-                        pathid,
+                        Some(pathid),
                         crate::arena::types::Metadata::File(FileMetadata::merged(&cached, &real)),
                     )));
                 }
                 (Some(real), _) => {
                     return Some(Ok((
                         name,
-                        pathid,
+                        Some(pathid),
                         crate::arena::types::Metadata::File(FileMetadata::from(real)),
                     )));
                 }
             };
         }
 
-        // TODO: Return what's left in realentries. This requires assigning new pathids.
-        if let Some((realpath, entries)) = &self.realentries
-            && !entries.is_empty()
-        {
-            log::debug!("Not returned: {realpath:?} / {entries:?}");
+        if let Some((realpath, entries)) = &mut self.realentries {
+            let name = entries.iter().next().cloned();
+            if let Some(name) = name {
+                entries.remove(&name);
+                if let Some(m) = realpath.join(&name).metadata().ok() {
+                    return Some(Ok((name, None, m.into())));
+                }
+            }
         }
 
         None
@@ -2108,7 +2123,8 @@ mod tests {
         fn readdir<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<Vec<(String, PathId, crate::arena::types::Metadata)>, StorageError> {
+        ) -> Result<Vec<(String, Option<PathId>, crate::arena::types::Metadata)>, StorageError>
+        {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2981,7 +2997,7 @@ mod tests {
         assert_eq!(1, entries.len());
         let (name, pathid, m) = entries.into_iter().next().unwrap();
         assert_eq!("file", name);
-        assert_eq!(file_pathid, pathid);
+        assert_eq!(Some(file_pathid), pathid);
         let m = m.expect_file().unwrap();
         assert_eq!(4, m.size);
         assert_eq!(UnixTime::mtime(&file_child.metadata().unwrap()), m.mtime);
@@ -2998,7 +3014,7 @@ mod tests {
         assert_eq!(1, entries.len());
         let (name, pathid, m) = entries.into_iter().next().unwrap();
         assert_eq!("file", name);
-        assert_eq!(file_pathid, pathid);
+        assert_eq!(Some(file_pathid), pathid);
         let m = m.expect_file().unwrap();
         assert_eq!(8, m.size);
         assert_eq!(UnixTime::mtime(&file_child.metadata().unwrap()), m.mtime);
@@ -3059,7 +3075,7 @@ mod tests {
         assert_eq!(1, entries.len());
         let (name, pathid, m) = entries.into_iter().next().unwrap();
         assert_eq!("file", name);
-        assert_eq!(file_pathid, pathid);
+        assert_eq!(Some(file_pathid), pathid);
         let m = m.expect_file().unwrap();
         assert_eq!(5, m.size);
         assert_eq!(UnixTime::mtime(&file_child.metadata().unwrap()), m.mtime);

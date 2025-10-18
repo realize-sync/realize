@@ -1187,6 +1187,37 @@ impl Metadata {
             Metadata::Dir(dir_metadata) => dir_metadata.mtime,
         }
     }
+
+    pub fn is_file(&self) -> bool {
+        match self {
+            Metadata::File(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_dir(&self) -> bool {
+        match self {
+            Metadata::Dir(_) => true,
+            _ => false,
+        }
+    }
+}
+
+impl From<&std::fs::Metadata> for Metadata {
+    fn from(m: &std::fs::Metadata) -> Self {
+        if m.is_file() {
+            Metadata::File(m.into())
+        } else {
+            // TODO: support non-file non-dir
+            Metadata::Dir(m.into())
+        }
+    }
+}
+
+impl From<std::fs::Metadata> for Metadata {
+    fn from(m: std::fs::Metadata) -> Self {
+        Metadata::from(&m)
+    }
 }
 
 /// An entry in the peer table.

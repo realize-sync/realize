@@ -128,16 +128,47 @@ impl ArenaFilesystem {
         &self,
         loc: impl Into<ArenaFsLoc>,
     ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let tree = txn.read_tree()?;
-        let cache = txn.read_cache()?;
-        let mut vec = vec![];
-        for res in cache.readdir(&tree, loc.into().into_tree_loc(&cache)?) {
-            let (name, pathid, metadata) = res?;
-            vec.push((name, cache.map_to_inode(pathid)?, metadata));
+        let mut ret = vec![];
+        let mut no_pathid = vec![];
+        let dir_pathid;
+        {
+            let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+            dir_pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+            for res in cache.readdir(&tree, dir_pathid) {
+                let (name, pathid, metadata) = res?;
+                if let Some(pathid) = pathid {
+                    ret.push((name, cache.map_to_inode(pathid)?, metadata));
+                } else {
+                    no_pathid.push((name, metadata));
+                }
+            }
+        }
+        if !no_pathid.is_empty() {
+            let txn = self.db.begin_write()?;
+            {
+                let mut tree = txn.write_tree()?;
+                let mut cache = txn.write_cache()?;
+                let mut blobs = txn.write_blobs()?;
+                let mut dirty = txn.write_dirty()?;
+                for (name, metadata) in no_pathid {
+                    let pathid = match metadata {
+                        crate::Metadata::File(_) => cache.preindex(
+                            &mut tree,
+                            &mut blobs,
+                            &mut dirty,
+                            (dir_pathid, &name),
+                        )?,
+                        crate::Metadata::Dir(_) => cache.mkdir(&mut tree, (dir_pathid, &name))?.0,
+                    };
+                    ret.push((name, cache.map_to_inode(pathid)?, metadata));
+                }
+            }
+            txn.commit()?;
         }
 
-        Ok(vec)
+        Ok(ret)
     }
 
     pub(crate) fn peer_progress(&self, peer: Peer) -> Result<Option<Progress>, StorageError> {
@@ -545,6 +576,7 @@ impl From<(Inode, String)> for ArenaFsLoc {
 mod tests {
     use super::*;
     use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
     use realize_types::{Hash, Path, Peer, UnixTime};
 
@@ -555,6 +587,7 @@ mod tests {
     struct Fixture {
         fs: Arc<ArenaFilesystem>,
         db: Arc<ArenaDatabase>,
+        datadir: ChildPath,
         _tempdir: TempDir,
     }
     impl Fixture {
@@ -572,6 +605,7 @@ mod tests {
             Ok(Self {
                 fs,
                 db,
+                datadir,
                 _tempdir: tempdir,
             })
         }
@@ -616,6 +650,54 @@ mod tests {
         let nonexistent_path = Path::parse("nonexistent.txt")?;
         let result = fixture.fs.lookup(&nonexistent_path);
         assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[test]
+    fn readdir_detects_new_files_and_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let dir = Path::parse("localdir")?;
+        fixture.fs.mkdir(&dir)?;
+        fixture
+            .datadir
+            .child("localdir/localfile1")
+            .write_str(".")?;
+        fixture
+            .datadir
+            .child("localdir/localfile2")
+            .write_str("..")?;
+        fixture
+            .datadir
+            .child("localdir/localfile3")
+            .write_str("...")?;
+        fixture
+            .datadir
+            .child("localdir/subdir/localfile4")
+            .write_str("....")?;
+
+        let dircontent = fixture.fs.readdir(&dir)?;
+        // the files should be returned, even though they haven't been indexed or assigned
+        // pathids yet.
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                ("localfile1", false),
+                ("localfile2", false),
+                ("localfile3", false),
+                ("subdir", true)
+            ],
+            dircontent
+                .iter()
+                .map(|(name, _, m)| (name.as_str(), m.is_dir()))
+                .collect::<Vec<_>>()
+        );
+        // Make sure readdir and lookup are consistent
+        for (name, inode, metadata) in dircontent {
+            assert_eq!(
+                fixture.fs.lookup(dir.join(&name)?).unwrap(),
+                (inode, metadata)
+            );
+        }
 
         Ok(())
     }
