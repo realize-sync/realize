@@ -16,16 +16,19 @@ impl Path {
     /// If parsing works, the path is guaranteed to be acceptable.
     pub fn parse(str: impl Into<String>) -> Result<Path, PathError> {
         let str = str.into();
-        if str.is_empty()
-            || str.find(':').is_some()
-            || str
-                .split('/')
-                .any(|s| s.is_empty() || s == "." || s == "..")
-        {
-            return Err(PathError::InvalidPath);
-        }
+        check_path(&str)?;
 
         Ok(Path(str))
+    }
+
+    /// Append a path to this one and return the result.
+    pub fn join(&self, str: &str) -> Result<Path, PathError> {
+        check_path(str)?;
+
+        let mut fullpath = self.0.clone();
+        fullpath.push('/');
+        fullpath.push_str(str);
+        Ok(Path(fullpath))
     }
 
     /// Build a path from a real path.
@@ -139,6 +142,18 @@ impl Path {
     pub fn matches_any(&self, paths: &Vec<Path>) -> bool {
         paths.iter().any(|e| self.starts_with(e))
     }
+}
+
+fn check_path(str: &str) -> Result<(), PathError> {
+    if str.is_empty()
+        || str.find(':').is_some()
+        || str
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return Err(PathError::InvalidPath);
+    }
+    Ok(())
 }
 
 impl AsRef<Path> for Path {
@@ -348,6 +363,33 @@ mod tests {
 
         assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("t")?));
         assert!(!Path::parse("test/foobar")?.starts_with(&Path::parse("test/foo")?));
+
+        Ok(())
+    }
+
+    #[test]
+    fn join() -> anyhow::Result<()> {
+        assert_eq!(Path::parse("foo/bar")?, Path::parse("foo")?.join("bar")?);
+        assert_eq!(
+            Path::parse("foo/bar/baz")?,
+            Path::parse("foo")?.join("bar/baz")?
+        );
+        assert_eq!(
+            Path::parse("foo/bar/baz")?,
+            Path::parse("foo/bar")?.join("baz")?
+        );
+        assert!(matches!(
+            Path::parse("foo")?.join("/bar"),
+            Err(PathError::InvalidPath),
+        ));
+        assert!(matches!(
+            Path::parse("foo")?.join("bar//baz"),
+            Err(PathError::InvalidPath),
+        ));
+        assert!(matches!(
+            Path::parse("foo/bar")?.join("../baz"),
+            Err(PathError::InvalidPath),
+        ));
 
         Ok(())
     }
