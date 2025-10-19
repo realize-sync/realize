@@ -2,7 +2,7 @@ use super::blob::{BlobExt, BlobInfo, WritableOpenBlob};
 use super::dirty::WritableOpenDirty;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, DirtableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
+    CacheTableEntry, DirTableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
     IndexedFile, Layer, RemoteAvailability,
 };
 use crate::arena::blob::BlobReadOperations;
@@ -28,7 +28,7 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<Option<crate::arena::types::Metadata>, StorageError>;
+    ) -> Result<Option<crate::Metadata>, StorageError>;
 
     /// Specifies the type of file (local or remote) and its cache status.
     fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -61,9 +61,7 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<
-        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
-    >;
+    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>>;
 
     /// Get the default file entry for the given pathid.
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
@@ -143,7 +141,7 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+    ) -> Result<Option<crate::Metadata>, StorageError> {
         return metadata(&self.table, tree, &self.cache.datadir, loc);
     }
 
@@ -177,9 +175,7 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<
-        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
-    > {
+    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
         let loc = loc.into();
         ReadDirIterator::new(
             &self.table,
@@ -237,7 +233,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+    ) -> Result<Option<crate::Metadata>, StorageError> {
         return metadata(&self.table, tree, &self.cache.datadir, loc);
     }
 
@@ -271,9 +267,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<
-        Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>,
-    > {
+    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
         let loc = loc.into();
 
         ReadDirIterator::new(
@@ -726,13 +720,14 @@ impl<'a> WritableOpenCache<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
+        mtime: Option<UnixTime>,
     ) -> Result<(PathId, DirMetadata), StorageError> {
         let pathid = tree.setup(loc)?;
         if self.table.get((pathid, Layer::Default))?.is_some() {
             return Err(StorageError::AlreadyExists);
         }
         check_parent_is_dir(&self.table, tree, pathid)?;
-        let mtime = UnixTime::now();
+        let mtime = mtime.unwrap_or(UnixTime::now());
         write_dir_mtime(&mut self.table, tree, pathid, mtime)?;
 
         Ok((
@@ -1410,7 +1405,7 @@ impl Cache {
             // tree and are never deleted.
             cache_table.insert(
                 (root_pathid, Layer::Default),
-                Holder::with_content(CacheTableEntry::Dir(DirtableEntry {
+                Holder::with_content(CacheTableEntry::Dir(DirTableEntry {
                     mtime: UnixTime::now(),
                 }))?,
             )?;
@@ -1447,41 +1442,45 @@ fn metadata<'b, L: Into<TreeLoc<'b>>>(
     tree: &impl TreeReadOperations,
     datadir: &std::path::Path,
     loc: L,
-) -> Result<Option<crate::arena::types::Metadata>, StorageError> {
+) -> Result<Option<crate::Metadata>, StorageError> {
     let loc = loc.into();
-    if let Some(pathid) = tree.resolve(loc.borrow())? {
-        if let Some(e) = cache_table.get((pathid, Layer::Default))? {
-            match e.value().parse()? {
-                CacheTableEntry::File(file_entry) => {
-                    if file_entry.is_local() {
-                        if let Some(path) = tree.backtrack(loc)? {
-                            if let Ok(m) = path.within(datadir).metadata() {
-                                return Ok(Some(crate::arena::types::Metadata::File(
-                                    FileMetadata::merged(&file_entry, &m),
-                                )));
-                            } else {
-                                return Ok(None);
-                            }
-                        }
-                    }
-                    return Ok(Some(crate::arena::types::Metadata::File(file_entry.into())));
-                }
-                CacheTableEntry::Dir(dir_entry) => {
-                    if let Some(path) = tree.backtrack(loc)? {
-                        if let Ok(m) = path.within(datadir).metadata() {
-                            return Ok(Some(crate::arena::types::Metadata::Dir(
-                                DirMetadata::from(m),
-                            )));
-                        }
-                    }
+    let m = local_path(datadir, tree, loc.borrow())
+        .ok()
+        .and_then(|p| p.metadata().ok());
+    let pathid = tree.resolve(loc)?;
 
-                    return Ok(Some(crate::arena::types::Metadata::Dir(dir_entry.into())));
-                }
+    expand_metadata(cache_table, pathid, m)
+}
+
+/// Builds a [crate::Metadata], if possible, by merging
+/// [std::fs::Metadata] and with a cache entry, identified by its
+/// [PathId].
+///
+/// Either or both of the filesystem metadata or the cache entry may
+/// not exist.
+fn expand_metadata(
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: Option<PathId>,
+    real: Option<std::fs::Metadata>,
+) -> Result<Option<crate::Metadata>, StorageError> {
+    let cached = if let Some(pathid) = pathid {
+        default_entry(cache_table, pathid)?
+    } else {
+        None
+    };
+    Ok(match (real, cached) {
+        (None, None) => None,
+        (None, Some(CacheTableEntry::File(cached))) => {
+            if cached.is_local() {
+                None
+            } else {
+                Some(crate::Metadata::File(cached.into()))
             }
         }
-    }
-
-    Ok(None)
+        (None, Some(CacheTableEntry::Dir(cached))) => Some(crate::Metadata::Dir(cached.into())),
+        (Some(real), Some(cached)) => Some(crate::Metadata::merged(&cached, &real)),
+        (Some(real), None) => Some(real.into()),
+    })
 }
 
 fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -1679,7 +1678,7 @@ impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
 {
-    type Item = Result<(String, Option<PathId>, crate::arena::types::Metadata), StorageError>;
+    type Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
@@ -1694,58 +1693,11 @@ where
             } else {
                 None
             };
-
-            if let Some(real) = &real
-                && !real.is_file()
-            {
-                // if real is not a file, what's in the cache doesn't matter
-                return Some(Ok((
-                    name,
-                    Some(pathid),
-                    crate::arena::types::Metadata::Dir(real.into()),
-                )));
-            }
-
-            let cached = match default_entry(self.table, pathid) {
+            match expand_metadata(self.table, Some(pathid), real) {
+                Ok(None) => {}
+                Ok(Some(m)) => return Some(Ok((name, Some(pathid), m))),
                 Err(err) => return Some(Err(err)),
-                Ok(cached) => cached,
-            };
-
-            // real is either None or a file, cached can be None, a
-            // dir, a local file or a cached file
-            match (real, cached) {
-                (None, None) => {}
-                (None, Some(CacheTableEntry::File(cached))) => {
-                    if !cached.is_local() {
-                        return Some(Ok((
-                            name,
-                            Some(pathid),
-                            crate::arena::types::Metadata::File(cached.into()),
-                        )));
-                    }
-                }
-                (None, Some(CacheTableEntry::Dir(cached))) => {
-                    return Some(Ok((
-                        name,
-                        Some(pathid),
-                        crate::arena::types::Metadata::Dir(cached.into()),
-                    )));
-                }
-                (Some(real), Some(CacheTableEntry::File(cached))) => {
-                    return Some(Ok((
-                        name,
-                        Some(pathid),
-                        crate::arena::types::Metadata::File(FileMetadata::merged(&cached, &real)),
-                    )));
-                }
-                (Some(real), _) => {
-                    return Some(Ok((
-                        name,
-                        Some(pathid),
-                        crate::arena::types::Metadata::File(FileMetadata::from(real)),
-                    )));
-                }
-            };
+            }
         }
 
         if let Some((realpath, entries)) = &mut self.realentries {
@@ -1882,11 +1834,19 @@ fn write_dir_mtime(
         pathid,
         cache_table,
         (pathid, Layer::Default),
-        Holder::with_content(CacheTableEntry::Dir(DirtableEntry { mtime }))?,
+        Holder::with_content(CacheTableEntry::Dir(DirTableEntry { mtime }))?,
     )? {
         // Update the parent directory mtime since we're adding a directory to it.
         if let Some(parent_pathid) = tree.parent(pathid)? {
-            write_dir_mtime(cache_table, tree, parent_pathid, UnixTime::now())?;
+            let update_parent = match default_entry(cache_table, parent_pathid) {
+                Ok(Some(CacheTableEntry::Dir(DirTableEntry {
+                    mtime: parent_mtime,
+                }))) => parent_mtime < mtime,
+                _ => true,
+            };
+            if update_parent {
+                write_dir_mtime(cache_table, tree, parent_pathid, mtime)?;
+            }
         }
     }
 
@@ -2089,7 +2049,7 @@ mod tests {
         fn metadata<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<crate::arena::types::Metadata, StorageError> {
+        ) -> Result<crate::Metadata, StorageError> {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2111,7 +2071,7 @@ mod tests {
         fn lookup<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<(PathId, crate::arena::types::Metadata), StorageError> {
+        ) -> Result<(PathId, crate::Metadata), StorageError> {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2128,8 +2088,7 @@ mod tests {
         fn readdir<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<Vec<(String, Option<PathId>, crate::arena::types::Metadata)>, StorageError>
-        {
+        ) -> Result<Vec<(String, Option<PathId>, crate::Metadata)>, StorageError> {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2328,16 +2287,10 @@ mod tests {
         fixture.add_to_cache(&file_path, 100, mtime)?;
 
         let (inode, metadata) = fixture.lookup((fixture.db.tree().root(), "a"))?;
-        assert!(
-            matches!(metadata, crate::arena::types::Metadata::Dir(_)),
-            "a"
-        );
+        assert!(matches!(metadata, crate::Metadata::Dir(_)), "a");
 
         let (_, metadata) = fixture.lookup((inode, "b"))?;
-        assert!(
-            matches!(metadata, crate::arena::types::Metadata::Dir(_)),
-            "b"
-        );
+        assert!(matches!(metadata, crate::Metadata::Dir(_)), "b");
 
         Ok(())
     }
@@ -2893,11 +2846,11 @@ mod tests {
 
         // Lookup directory
         let (inode, metadata) = fixture.lookup((fixture.db.tree().root(), "a"))?;
-        assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
+        assert!(matches!(metadata, crate::Metadata::Dir(_)));
 
         // Lookup file
         let (file_inode, metadata) = fixture.lookup((inode, "file.txt"))?;
-        assert!(matches!(metadata, crate::arena::types::Metadata::File(_)));
+        assert!(matches!(metadata, crate::Metadata::File(_)));
 
         let metadata = fixture.file_metadata(file_inode)?;
         assert_eq!(metadata.mtime, mtime);
@@ -2950,7 +2903,7 @@ mod tests {
         let (name, _, metadata) = &entries[0];
         assert_eq!(name, "dir");
         match metadata {
-            crate::arena::types::Metadata::Dir(_) => {}
+            crate::Metadata::Dir(_) => {}
             _ => panic!("Expected directory metadata"),
         }
 
@@ -2965,8 +2918,8 @@ mod tests {
         // Verify metadata types
         for (name, _, metadata) in entries {
             match (name.as_str(), &metadata) {
-                ("file1.txt" | "file2.txt", crate::arena::types::Metadata::File(_)) => {}
-                ("subdir", crate::arena::types::Metadata::Dir(_)) => {}
+                ("file1.txt" | "file2.txt", crate::Metadata::File(_)) => {}
+                ("subdir", crate::Metadata::Dir(_)) => {}
                 _ => panic!("Unexpected entry: {} with metadata {:?}", name, metadata),
             }
         }
@@ -4327,7 +4280,7 @@ mod tests {
 
         clear_dirty(&mut dirty)?;
 
-        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path)?;
+        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path, None)?;
 
         // Verify directory was created
         assert!(tree.pathid_exists(pathid)?);
@@ -4352,6 +4305,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mkdir_creates_directory_with_mtime() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let dir_path = Path::parse("newdir")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mtime = UnixTime::from_secs(1234567890); // some time in feb 2009
+
+        let parent_mtime = cache.dir_mtime(&tree, fixture.db.tree().root())?;
+        assert!(parent_mtime > mtime); // system clock should be > 2009
+        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path, Some(mtime))?;
+
+        assert_eq!(mtime, metadata.mtime);
+        assert_eq!(mtime, cache.dir_mtime(&tree, pathid)?);
+
+        // parent_mtime should not have been updated, since mtime is in the past
+        assert_eq!(
+            parent_mtime,
+            cache.dir_mtime(&tree, fixture.db.tree().root())?
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mkdir_creates_nested_directories() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
 
@@ -4360,11 +4339,11 @@ mod tests {
         let mut cache = txn.write_cache()?;
 
         // The following fails, because a/b doesn't exist
-        assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?).is_err());
+        assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?, None).is_err());
 
-        let (a_pathid, _) = cache.mkdir(&mut tree, Path::parse("a")?)?;
-        let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
-        let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
+        let (a_pathid, _) = cache.mkdir(&mut tree, Path::parse("a")?, None)?;
+        let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?, None)?;
+        let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?, None)?;
 
         assert!(cache.dir_mtime(&tree, a_pathid).is_ok());
         assert!(cache.dir_mtime(&tree, b_pathid).is_ok());
@@ -4386,11 +4365,11 @@ mod tests {
         clear_dirty(&mut dirty)?;
 
         // Create directory first time
-        let (pathid1, _) = cache.mkdir(&mut tree, &dir_path)?;
+        let (pathid1, _) = cache.mkdir(&mut tree, &dir_path, None)?;
         assert!(tree.pathid_exists(pathid1)?);
 
         // Try to create same directory again
-        let result = cache.mkdir(&mut tree, &dir_path);
+        let result = cache.mkdir(&mut tree, &dir_path, None);
         assert!(matches!(result, Err(StorageError::AlreadyExists)));
 
         Ok(())
@@ -4409,7 +4388,7 @@ mod tests {
         clear_dirty(&mut dirty)?;
 
         // Create directory
-        let (pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
+        let (pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
         assert!(tree.pathid_exists(pathid)?);
 
         // Remove directory
@@ -4443,7 +4422,7 @@ mod tests {
         clear_dirty(&mut dirty)?;
 
         // Create directory
-        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
+        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
 
         // Add a file to the directory
         let peer = Peer::from("test_peer");
@@ -4539,8 +4518,8 @@ mod tests {
         clear_dirty(&mut dirty)?;
 
         // Create parent and child directories
-        let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path)?;
-        let (child_pathid, _) = cache.mkdir(&mut tree, &child_path)?;
+        let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path, None)?;
+        let (child_pathid, _) = cache.mkdir(&mut tree, &child_path, None)?;
 
         // Get parent mtime before removal
         let parent_mtime_before = cache.dir_mtime(&tree, parent_pathid)?;
@@ -4583,17 +4562,17 @@ mod tests {
         let file_pathid = tree.expect(&file_path)?;
 
         // Create a directory
-        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
+        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
 
         // Test file metadata
         let file_metadata = cache.metadata(&tree, file_pathid)?;
         match file_metadata {
-            Some(crate::arena::types::Metadata::File(meta)) => {
+            Some(crate::Metadata::File(meta)) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
                 assert_eq!(meta.version, Version::Indexed(test_hash()));
             }
-            Some(crate::arena::types::Metadata::Dir(_)) => {
+            Some(crate::Metadata::Dir(_)) => {
                 panic!("Expected file metadata, got directory metadata");
             }
             None => {
@@ -4604,11 +4583,11 @@ mod tests {
         // Test directory metadata
         let dir_metadata = cache.metadata(&tree, dir_pathid)?;
         match dir_metadata {
-            Some(crate::arena::types::Metadata::Dir(meta)) => {
+            Some(crate::Metadata::Dir(meta)) => {
                 assert_eq!(0o777, meta.mode); // Arena directories are writable
                 assert!(meta.mtime >= test_time());
             }
-            Some(crate::arena::types::Metadata::File(_)) => {
+            Some(crate::Metadata::File(_)) => {
                 panic!("Expected directory metadata, got file metadata");
             }
             None => {
@@ -4619,7 +4598,7 @@ mod tests {
         // Test error cases
         let nonexistent_pathid = PathId(99999);
         let result = cache.metadata(&tree, nonexistent_pathid);
-        assert!(matches!(result, Ok(None)));
+        assert!(matches!(result, Ok(None)), "result.ok:{:?}", result.ok());
 
         Ok(())
     }
@@ -4647,29 +4626,29 @@ mod tests {
                 1024,
                 test_hash(),
             )?;
-            cache.mkdir(&mut tree, &dir_path)?;
+            cache.mkdir(&mut tree, &dir_path, None)?;
         }
         txn.commit()?;
 
         // Test file metadata through ArenaCache
         match fixture.metadata(&file_path)? {
-            crate::arena::types::Metadata::File(meta) => {
+            crate::Metadata::File(meta) => {
                 assert_eq!(meta.size, 1024);
                 assert_eq!(meta.mtime, test_time());
                 assert_eq!(meta.version, Version::Indexed(test_hash()));
             }
-            crate::arena::types::Metadata::Dir(_) => {
+            crate::Metadata::Dir(_) => {
                 panic!("Expected file metadata, got directory metadata");
             }
         }
 
         // Test directory metadata through ArenaCache
         match fixture.metadata(&dir_path)? {
-            crate::arena::types::Metadata::Dir(meta) => {
+            crate::Metadata::Dir(meta) => {
                 assert_eq!(0o777, meta.mode); // Arena directories are writable
                 assert!(meta.mtime >= test_time());
             }
-            crate::arena::types::Metadata::File(_) => {
+            crate::Metadata::File(_) => {
                 panic!("Expected directory metadata, got file metadata");
             }
         }
@@ -5307,7 +5286,7 @@ mod tests {
         );
         let dest_metadata = cache.metadata(&tree, &dest_dir)?;
         assert!(
-            matches!(dest_metadata, Some(crate::arena::types::Metadata::Dir(_))),
+            matches!(dest_metadata, Some(crate::Metadata::Dir(_))),
             "Destination directory should exist after rename"
         );
 
@@ -5426,7 +5405,7 @@ mod tests {
         )?;
 
         // Create empty destination directory
-        cache.mkdir(&mut tree, &dest_dir)?;
+        cache.mkdir(&mut tree, &dest_dir, None)?;
 
         // Test noreplace=true should fail with AlreadyExists
         assert!(matches!(
@@ -5459,7 +5438,7 @@ mod tests {
         );
         let dest_metadata = cache.metadata(&tree, &dest_dir)?;
         assert!(
-            matches!(dest_metadata, Some(crate::arena::types::Metadata::Dir(_))),
+            matches!(dest_metadata, Some(crate::Metadata::Dir(_))),
             "Destination directory should exist after rename"
         );
 
@@ -6226,7 +6205,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        cache.mkdir(&mut tree, &dir_path)?;
+        cache.mkdir(&mut tree, &dir_path, None)?;
         assert!(cache.list_alternatives(&tree, &dir_path)?.is_empty());
 
         Ok(())

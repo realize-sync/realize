@@ -816,7 +816,7 @@ impl FileTableEntry {
 
 /// A simplified directory entry that only contains modification time.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DirtableEntry {
+pub struct DirTableEntry {
     /// The modification time of the directory.
     pub mtime: UnixTime,
 }
@@ -827,7 +827,7 @@ pub enum CacheTableEntry {
     /// A file entry
     File(FileTableEntry),
     /// A directory entry
-    Dir(DirtableEntry),
+    Dir(DirTableEntry),
 }
 
 impl NamedType for FileTableEntry {
@@ -952,7 +952,7 @@ impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
                 let dir_entry = dir_entry?;
                 let mtime = dir_entry.get_mtime()?;
 
-                let dir_table_entry = DirtableEntry {
+                let dir_table_entry = DirTableEntry {
                     mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
                 };
 
@@ -1126,15 +1126,24 @@ impl DirMetadata {
             gid: None,
         }
     }
+
+    pub(crate) fn merged(e: &DirTableEntry, m: &std::fs::Metadata) -> Self {
+        let mut dir_metadata = DirMetadata::from(m);
+        if e.mtime > dir_metadata.mtime {
+            dir_metadata.mtime = e.mtime;
+        }
+
+        dir_metadata
+    }
 }
 
-impl From<&DirtableEntry> for DirMetadata {
-    fn from(e: &DirtableEntry) -> Self {
+impl From<&DirTableEntry> for DirMetadata {
+    fn from(e: &DirTableEntry) -> Self {
         DirMetadata::modifiable(e.mtime)
     }
 }
-impl From<DirtableEntry> for DirMetadata {
-    fn from(e: DirtableEntry) -> Self {
+impl From<DirTableEntry> for DirMetadata {
+    fn from(e: DirTableEntry) -> Self {
         DirMetadata::from(&e)
     }
 }
@@ -1200,6 +1209,23 @@ impl Metadata {
             Metadata::Dir(_) => true,
             _ => false,
         }
+    }
+
+    pub fn merged(e: &CacheTableEntry, m: &std::fs::Metadata) -> Self {
+        match e {
+            CacheTableEntry::Dir(e) => {
+                if m.is_dir() {
+                    return Metadata::Dir(DirMetadata::merged(e, m));
+                }
+            }
+            CacheTableEntry::File(e) => {
+                if m.is_file() {
+                    return Metadata::File(FileMetadata::merged(e, m));
+                }
+            }
+        }
+
+        m.into()
     }
 }
 
@@ -1575,7 +1601,7 @@ mod tests {
 
     #[test]
     fn convert_cache_table_entry_dir() -> anyhow::Result<()> {
-        let dir_entry = DirtableEntry {
+        let dir_entry = DirTableEntry {
             mtime: UnixTime::from_secs(987654321),
         };
 
@@ -1599,7 +1625,7 @@ mod tests {
             kind: FileEntryKind::Cached,
         };
 
-        let dir_entry = DirtableEntry {
+        let dir_entry = DirTableEntry {
             mtime: UnixTime::from_secs(987654321),
         };
 

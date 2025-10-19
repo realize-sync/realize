@@ -160,7 +160,11 @@ impl ArenaFilesystem {
                             &mut dirty,
                             (dir_pathid, &name),
                         )?,
-                        crate::Metadata::Dir(_) => cache.mkdir(&mut tree, (dir_pathid, &name))?.0,
+                        crate::Metadata::Dir(_) => {
+                            cache
+                                .mkdir(&mut tree, (dir_pathid, &name), Some(metadata.mtime()))?
+                                .0
+                        }
                     };
                     ret.push((name, cache.map_to_inode(pathid)?, metadata));
                 }
@@ -380,7 +384,7 @@ impl ArenaFilesystem {
             let mut tree = txn.write_tree()?;
             let mut cache = txn.write_cache()?;
 
-            let (pathid, m) = cache.mkdir(&mut tree, loc.into().into_tree_loc(&cache)?)?;
+            let (pathid, m) = cache.mkdir(&mut tree, loc.into().into_tree_loc(&cache)?, None)?;
 
             (cache.map_to_inode(pathid)?, m)
         };
