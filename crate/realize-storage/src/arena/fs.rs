@@ -82,11 +82,39 @@ impl ArenaFilesystem {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
-        let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+        let loc = loc.into().into_tree_loc(&cache)?;
         let metadata = cache
-            .metadata(&tree, pathid)?
+            .metadata(&tree, loc.borrow())?
             .ok_or(StorageError::NotFound)?;
-        let inode = cache.map_to_inode(pathid)?;
+        let inode = match tree.resolve(loc.borrow())? {
+            Some(pathid) => cache.map_to_inode(pathid)?,
+            None => {
+                // We have a metadata, but no pathid to return. This
+                // is possible if the file or dir exists on the fs,
+                // but not in the cache. Add it to the cache and
+                // assign it an ipath that can be returned.
+                let txn = self.db.begin_write()?;
+                let inode = {
+                    let mut tree = txn.write_tree()?;
+                    let mut cache = txn.write_cache()?;
+                    let mut blobs = txn.write_blobs()?;
+                    let mut dirty = txn.write_dirty()?;
+                    let pathid = match metadata {
+                        crate::Metadata::File(_) => {
+                            cache.preindex(&mut tree, &mut blobs, &mut dirty, loc)?
+                        }
+                        crate::Metadata::Dir(_) => {
+                            cache.mkdir(&mut tree, loc, Some(metadata.mtime()))?.0
+                        }
+                    };
+                    cache.map_to_inode(pathid)?
+                };
+                txn.commit()?;
+
+                inode
+            }
+        };
+
         Ok((inode, metadata))
     }
 
@@ -702,6 +730,30 @@ mod tests {
                 (inode, metadata)
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_detects_new_files_and_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        fixture.datadir.child("localdir/localfile").write_str(".")?;
+
+        let (localdir_inode, localdir_m) = fixture.fs.lookup(Path::parse("localdir")?)?;
+        assert!(localdir_inode != Inode::ZERO);
+        assert!(localdir_m.is_dir());
+        assert_eq!(
+            localdir_m.mtime(),
+            UnixTime::mtime(&fixture.datadir.child("localdir").metadata()?)
+        );
+
+        let (inode, localfile_m) = fixture.fs.lookup((localdir_inode, "localfile"))?;
+        assert!(inode != Inode::ZERO);
+        assert!(localfile_m.is_file());
+        assert_eq!(
+            localfile_m.mtime(),
+            UnixTime::mtime(&fixture.datadir.child("localdir/localfile").metadata()?)
+        );
 
         Ok(())
     }
