@@ -1637,17 +1637,22 @@ where
         realpath: Option<PathBuf>,
         loc: L,
     ) -> Self {
-        let iter;
-        let mut realentries = None;
-        match tree.expect(loc) {
-            Err(err) => {
-                iter = tree::ReadDirIterator::failed(err);
+        let realentries = realpath.and_then(|p| {
+            let res = build_realentries(p);
+            res.ok()
+        });
+        let iter = match tree.expect(loc) {
+            Ok(pathid) => tree.readdir_pathid(pathid),
+            Err(StorageError::NotFound) => {
+                if realentries.is_none() {
+                    tree::ReadDirIterator::failed(StorageError::NotFound)
+                } else {
+                    // Return local entries
+                    tree::ReadDirIterator::empty()
+                }
             }
-            Ok(pathid) => {
-                realentries = realpath.and_then(|p| build_realentries(p).ok());
-                iter = tree.readdir_pathid(pathid);
-            }
-        }
+            Err(err) => tree::ReadDirIterator::failed(err),
+        };
         ReadDirIterator {
             table,
             iter,
@@ -3037,6 +3042,66 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
 
         assert_eq!(0, entries.len());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_lists_unindexed_local_dir() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        fixture.datadir.child("dir/file1").write_str("test")?;
+        fixture.datadir.child("dir/file2").write_str("test")?;
+        fixture.datadir.child("dir/file3").write_str("test")?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let entries = cache
+            .readdir(&tree, Path::parse("dir")?)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_unordered::assert_eq_unordered!(
+            vec!["file1", "file2", "file3"],
+            entries
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_lists_empty_unindexed_local_dir() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        fixture.datadir.child("dir").create_dir_all()?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let entries = cache
+            .readdir(&tree, Path::parse("dir")?)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(entries.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_dir_not_found() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let ret = cache
+            .readdir(&tree, Path::parse("doesnotexist")?)
+            .collect::<Result<Vec<_>, _>>();
+        assert!(matches!(ret, Err(StorageError::NotFound)));
 
         Ok(())
     }

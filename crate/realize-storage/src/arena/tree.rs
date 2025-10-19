@@ -939,6 +939,9 @@ pub(crate) struct ReadDirIterator<'a> {
 }
 
 impl<'a> ReadDirIterator<'a> {
+    pub(crate) fn empty() -> Self {
+        Self { iter: None }
+    }
     /// Builds an iterator that will only return that error.
     pub(crate) fn failed(err: StorageError) -> Self {
         Self {
