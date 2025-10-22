@@ -673,12 +673,12 @@ impl RealWatcherWorker {
                     let mut dirty = txn.write_dirty()?;
                     let mut blobs = txn.write_blobs()?;
                     let tag = db.tag();
-                    match cache.indexed(&tree, &path)? {
-                        Some(indexed) => {
-                            let v = &indexed.version;
+                    match cache.file_entry(&tree, &path)? {
+                        Some(entry) => {
+                            let v = &entry.version;
                             match v {
                                 Version::Indexed(_) => {
-                                    if indexed.matches(size, mtime) {
+                                    if entry.size == size && entry.mtime == mtime {
                                         log::info!("[{tag}] No changes: \"{path}\" {v:?}",);
                                         return Ok((false, size, mtime));
                                     }
@@ -769,7 +769,7 @@ async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::types::{IndexedFile, Version};
+    use crate::arena::types::IndexedFile;
     use crate::realize_types::Arena;
     use crate::utils::hash;
     use assert_fs::TempDir;
@@ -876,7 +876,7 @@ mod tests {
             Some(IndexedFile {
                 size: 4,
                 mtime,
-                version: Version::Indexed(hash::digest(b"test")),
+                hash: hash::digest(b"test"),
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -899,7 +899,7 @@ mod tests {
             Some(IndexedFile {
                 size: 0,
                 mtime,
-                version: Version::Indexed(hash::digest([])),
+                hash: hash::digest([]),
             }),
             index::get_file_async(&fixture.db, &path).await?
         );
@@ -1303,7 +1303,7 @@ mod tests {
             Some(IndexedFile {
                 size: 3,
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
-                version: Version::Indexed(hash::digest("foo".as_bytes())),
+                hash: hash::digest("foo".as_bytes()),
             }),
             index::get_file_async(&fixture.db, &foo).await?
         );
@@ -1313,7 +1313,7 @@ mod tests {
             Some(IndexedFile {
                 size: 6,
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
-                version: Version::Indexed(hash::digest(b"barbar")),
+                hash: hash::digest(b"barbar"),
             }),
             index::get_file_async(&fixture.db, &bar).await?
         );
@@ -1592,7 +1592,7 @@ mod tests {
             Some(IndexedFile {
                 size: 4,
                 mtime,
-                version: Version::Indexed(hash::digest("test".as_bytes())),
+                hash: hash::digest("test".as_bytes()),
             }),
             index::get_file_async(db, &realize_types::Path::parse("bar")?).await?
         );

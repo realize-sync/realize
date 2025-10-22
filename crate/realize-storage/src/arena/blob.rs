@@ -3161,8 +3161,11 @@ mod tests {
         let txn = fixture.begin_read()?;
         let cache = txn.read_cache()?;
         let tree = txn.read_tree()?;
-        let indexed = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(Version::Modified(Some(hash)), indexed.version);
+        assert!(cache.indexed(&tree, &path)?.is_none());
+        assert_eq!(
+            Version::Modified(Some(hash)),
+            cache.file_entry(&tree, &path)?.unwrap().version
+        );
 
         Ok(())
     }

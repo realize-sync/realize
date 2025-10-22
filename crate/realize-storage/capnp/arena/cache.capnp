@@ -24,6 +24,7 @@ struct FileTableEntry {
   branchedFrom @3: UInt64; # 0 for None
   local @4: Bool;
   modified @5: Bool;
+  special @6: Bool;
 }
 
 struct PeerTableEntry {

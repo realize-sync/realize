@@ -105,10 +105,10 @@ impl StorageJobProcessor {
             let mut cache = txn.write_cache()?;
             let indexed = match cache.index_entry_at_pathid(pathid)? {
                 Some(v) => v,
-                None => return Ok(JobStatus::Abandoned("not_in_index")),
+                None => return Ok(JobStatus::Abandoned("not_indexed")),
             };
-            if !indexed.version.matches_hash(&hash) {
-                return Ok(JobStatus::Abandoned("indexed_version_mismatch"));
+            if indexed.hash != hash {
+                return Ok(JobStatus::Abandoned("indexed_hash_mismatch"));
             }
             let mut blobs = txn.write_blobs()?;
             let mut history = txn.write_history()?;
@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use crate::arena::index;
     use crate::arena::tree::TreeExt;
-    use crate::arena::types::{IndexedFile, Version};
+    use crate::arena::types::IndexedFile;
     use crate::utils::hash;
     use crate::{ArenaFilesystem, Blob, CacheStatus, Mark, Notification, PathId};
     use assert_fs::TempDir;
@@ -473,7 +473,7 @@ mod tests {
         let indexed = cache
             .index_entry_at_pathid(pathid)?
             .expect("must have been indexed");
-        assert_eq!(Version::Indexed(hash), indexed.version);
+        assert_eq!(hash, indexed.hash);
         assert_eq!(test_time(), indexed.mtime);
 
         Ok(())

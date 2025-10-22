@@ -35,7 +35,7 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>>(
         match hash {
             Some(hash) => {
                 if let Some(entry) = entry
-                    && entry.version.matches_hash(hash)
+                    && entry.hash == *hash
                     && entry.matches_file(&file_path)
                 {
                     return Ok(Some(file_path));
@@ -89,7 +89,7 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
     };
     let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source)?
-        && indexed.version.matches_hash(hash)
+        && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
         if let Some(parent) = dest_realpath.parent() {
@@ -154,7 +154,7 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     };
     let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source.borrow())?
-        && indexed.version.matches_hash(hash)
+        && indexed.hash == *hash
         && indexed.matches_file(&source_realpath)
     {
         if let Some(parent) = dest_realpath.parent() {
@@ -516,7 +516,6 @@ pub(crate) async fn last_history_index_async(db: &Arc<ArenaDatabase>) -> Result<
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
-    use crate::arena::types::Version;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -583,7 +582,7 @@ mod tests {
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(hash));
+        assert_eq!(entry.hash, hash);
 
         Ok(())
     }
@@ -699,7 +698,7 @@ mod tests {
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size2);
         assert_eq!(entry.mtime, mtime2);
-        assert_eq!(entry.version, Version::Indexed(hash2));
+        assert_eq!(entry.hash, hash2);
 
         Ok(())
     }
@@ -738,7 +737,7 @@ mod tests {
         let entry = super::get_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(hash));
+        assert_eq!(entry.hash, hash);
 
         Ok(())
     }
@@ -970,7 +969,7 @@ mod tests {
         );
 
         let dest_entry = super::get_file(&fixture.db, &dest_index_path)?.unwrap();
-        assert_eq!(dest_entry.version, Version::Indexed(source_hash));
+        assert_eq!(dest_entry.hash, source_hash);
         assert_eq!(dest_entry.size, source_content.len() as u64);
         assert_eq!(dest_entry.mtime, source_mtime);
 
@@ -1342,7 +1341,7 @@ mod tests {
         assert_eq!(
             Some(IndexedFile {
                 mtime: source_mtime,
-                version: Version::Indexed(source_hash),
+                hash: source_hash,
                 size: "source content".len() as u64
             }),
             cache.indexed(&tree, &dest_path)?

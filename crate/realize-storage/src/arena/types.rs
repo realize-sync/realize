@@ -689,15 +689,39 @@ pub enum FileAlternative {
 /// Specifies the type of file entry (local, cached, or branched from another path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileEntryKind {
-    /// This is a file on the local disk, in datadir
-    Local,
+    /// This is a regular file on the local disk, in datadir. Such
+    /// files are shared remotely.
+    LocalFile,
+    /// This is a special file on the local disk, in datadir. Such
+    /// files are not shared remotely and may hide remote files.
+    SpecialFile,
     /// This is a file from another peer. There might be a blob
     /// associated to it which contains a local copy of the data.
-    Cached,
+    RemoteFile,
     /// This is a file from another peer branched locally from
     /// another. The file may or may not have been branched on the
     /// local peers.
     Branched(PathId),
+}
+
+impl FileEntryKind {
+    pub fn is_local(&self) -> bool {
+        match self {
+            FileEntryKind::LocalFile => true,
+            FileEntryKind::SpecialFile => true,
+            FileEntryKind::RemoteFile => false,
+            FileEntryKind::Branched(_) => false,
+        }
+    }
+
+    pub fn is_cached(&self) -> bool {
+        match self {
+            FileEntryKind::LocalFile => false,
+            FileEntryKind::SpecialFile => false,
+            FileEntryKind::RemoteFile => true,
+            FileEntryKind::Branched(_) => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -801,16 +825,36 @@ impl FileTableEntry {
 
     /// Returns true if this is a local file on disk
     pub fn is_local(&self) -> bool {
-        matches!(self.kind, FileEntryKind::Local)
+        self.kind.is_local()
     }
 
     /// Returns true if this is a cached file (either Cache or Branched)
     #[allow(dead_code)]
     pub fn is_cached(&self) -> bool {
-        matches!(
-            self.kind,
-            FileEntryKind::Cached | FileEntryKind::Branched(_)
-        )
+        self.kind.is_cached()
+    }
+
+    /// Check whether `file_path` matches this entry
+    pub(crate) fn matches_file<P: AsRef<std::path::Path>>(&self, file_path: P) -> bool {
+        match self.kind {
+            FileEntryKind::LocalFile => {
+                if let Ok(m) = file_path.as_ref().symlink_metadata()
+                    && m.is_file()
+                    && self.size == m.len()
+                    && self.mtime == UnixTime::mtime(&m)
+                {
+                    return true;
+                }
+            }
+            FileEntryKind::SpecialFile => {
+                if let Ok(m) = file_path.as_ref().symlink_metadata() {
+                    return !m.is_dir() && !m.is_file();
+                }
+            }
+            _ => {}
+        }
+
+        false
     }
 }
 
@@ -887,16 +931,15 @@ fn fill_file_table_entry(
 
     // Convert the new enum back to the old capnp fields for compatibility
     match entry.kind {
-        FileEntryKind::Local => {
+        FileEntryKind::LocalFile => {
             builder.set_local(true);
-            builder.set_branched_from(0);
         }
-        FileEntryKind::Cached => {
-            builder.set_local(false);
-            builder.set_branched_from(0);
+        FileEntryKind::SpecialFile => {
+            builder.set_local(true);
+            builder.set_special(true);
         }
+        FileEntryKind::RemoteFile => {}
         FileEntryKind::Branched(pathid) => {
-            builder.set_local(false);
             builder.set_branched_from(PathId::from_optional(Some(pathid)));
         }
     }
@@ -907,16 +950,14 @@ fn parse_file_table_entry(
 ) -> Result<FileTableEntry, ByteConversionError> {
     let mtime = msg.get_mtime()?;
 
-    // Convert the old capnp fields to the new enum
-    let local = msg.get_local();
-    let branched_from = PathId::as_optional(msg.get_branched_from());
-
-    let kind = if local {
-        FileEntryKind::Local
-    } else if let Some(pathid) = branched_from {
+    let kind = if msg.get_special() {
+        FileEntryKind::SpecialFile
+    } else if msg.get_local() {
+        FileEntryKind::LocalFile
+    } else if let Some(pathid) = PathId::as_optional(msg.get_branched_from()) {
         FileEntryKind::Branched(pathid)
     } else {
-        FileEntryKind::Cached
+        FileEntryKind::RemoteFile
     };
 
     let version = if msg.get_modified() {
@@ -1020,8 +1061,10 @@ pub struct FileMetadata {
     /// For a local file, ctime reported by the filesystem.
     pub ctime: Option<UnixTime>,
 
-    /// UNIX file mode may include flags not supported by the cache
-    /// for a local type.
+    /// UNIX file mode.
+    ///
+    /// This includes permissions, file types (for special files) - or any UNIX
+    /// flag that is supported locally.
     pub mode: u32,
 
     /// For a local file, UNIX user ID
@@ -1219,7 +1262,7 @@ impl Metadata {
                 }
             }
             CacheTableEntry::File(e) => {
-                if m.is_file() {
+                if !m.is_dir() {
                     return Metadata::File(FileMetadata::merged(e, m));
                 }
             }
@@ -1231,11 +1274,10 @@ impl Metadata {
 
 impl From<&std::fs::Metadata> for Metadata {
     fn from(m: &std::fs::Metadata) -> Self {
-        if m.is_file() {
-            Metadata::File(m.into())
-        } else {
-            // TODO: support non-file non-dir
+        if m.is_dir() {
             Metadata::Dir(m.into())
+        } else {
+            Metadata::File(m.into())
         }
     }
 }
@@ -1288,18 +1330,16 @@ impl ByteConvertible<PeerTableEntry> for PeerTableEntry {
 /// A file entry for the index layer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexedFile {
-    pub version: Version,
+    pub hash: Hash,
     pub mtime: UnixTime,
     pub size: u64,
 }
 
 impl IndexedFile {
-    /// Check whether `file_path` size and mtime match this entry's.
+    /// Check whether `file_path` is a regular file with size and mtime match this entry's.
     pub(crate) fn matches_file<P: AsRef<std::path::Path>>(&self, file_path: P) -> bool {
-        if let Ok(m) = file_path.as_ref().metadata()
-            && self.matches(m.len(), UnixTime::mtime(&m))
-        {
-            return true;
+        if let Ok(m) = file_path.as_ref().symlink_metadata() {
+            return m.is_file() && self.matches(m.len(), UnixTime::mtime(&m));
         }
 
         false
@@ -1307,38 +1347,37 @@ impl IndexedFile {
 
     /// Check whether `file_path` size and mtime match this entry's.
     pub(crate) fn matches(&self, size: u64, mtime: UnixTime) -> bool {
-        match &self.version {
-            Version::Modified(_) => true,
-            Version::Indexed(_) => size == self.size && mtime == self.mtime,
-        }
+        size == self.size && mtime == self.mtime
     }
 
     pub(crate) fn into_file(self) -> FileTableEntry {
         FileTableEntry {
             size: self.size,
             mtime: self.mtime,
-            version: self.version,
-            kind: FileEntryKind::Local,
+            version: Version::Indexed(self.hash),
+            kind: FileEntryKind::LocalFile,
         }
     }
 }
 
-impl From<FileTableEntry> for IndexedFile {
+impl From<FileTableEntry> for Option<IndexedFile> {
     fn from(value: FileTableEntry) -> Self {
-        IndexedFile {
-            version: value.version,
-            mtime: value.mtime,
-            size: value.size,
-        }
+        Option::<IndexedFile>::from(&value)
     }
 }
 
-impl From<&FileTableEntry> for IndexedFile {
+impl From<&FileTableEntry> for Option<IndexedFile> {
     fn from(value: &FileTableEntry) -> Self {
-        IndexedFile {
-            version: value.version.clone(),
-            mtime: value.mtime,
-            size: value.size,
+        if let Version::Indexed(hash) = &value.version
+            && value.kind == FileEntryKind::LocalFile
+        {
+            Some(IndexedFile {
+                hash: hash.clone(),
+                mtime: value.mtime,
+                size: value.size,
+            })
+        } else {
+            None
         }
     }
 }
@@ -1421,19 +1460,31 @@ mod tests {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
             version: Version::Indexed(Hash([1u8; 32])),
-            kind: FileEntryKind::Local,
+            kind: FileEntryKind::LocalFile,
         };
 
         let bytes = local_entry.to_bytes()?;
         let recovered = FileTableEntry::from_bytes(&bytes)?;
         assert_eq!(local_entry, recovered);
 
+        // Test Special variant
+        let special_entry = FileTableEntry {
+            size: 100,
+            mtime: UnixTime::from_secs(1234567890),
+            version: Version::Indexed(Hash([1u8; 32])),
+            kind: FileEntryKind::SpecialFile,
+        };
+
+        let bytes = special_entry.to_bytes()?;
+        let recovered = FileTableEntry::from_bytes(&bytes)?;
+        assert_eq!(special_entry, recovered);
+
         // Test Cache variant
         let cache_entry = FileTableEntry {
             size: 200,
             mtime: UnixTime::from_secs(1234567891),
             version: Version::Indexed(Hash([2u8; 32])),
-            kind: FileEntryKind::Cached,
+            kind: FileEntryKind::RemoteFile,
         };
 
         let bytes = cache_entry.to_bytes()?;
@@ -1462,7 +1513,7 @@ mod tests {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
             version: Version::Indexed(Hash([1u8; 32])),
-            kind: FileEntryKind::Local,
+            kind: FileEntryKind::LocalFile,
         };
         assert!(local_entry.is_local());
         assert!(!local_entry.is_cached());
@@ -1472,7 +1523,7 @@ mod tests {
             size: 200,
             mtime: UnixTime::from_secs(1234567891),
             version: Version::Indexed(Hash([2u8; 32])),
-            kind: FileEntryKind::Cached,
+            kind: FileEntryKind::RemoteFile,
         };
         assert!(!cache_entry.is_local());
         assert!(cache_entry.is_cached());
@@ -1586,7 +1637,7 @@ mod tests {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
             version: Version::Indexed(Hash([0xa1u8; 32])),
-            kind: FileEntryKind::Cached,
+            kind: FileEntryKind::RemoteFile,
         };
 
         let entry = CacheTableEntry::File(file_entry);
@@ -1622,7 +1673,7 @@ mod tests {
             size: 100,
             mtime: UnixTime::from_secs(1234567890),
             version: Version::Indexed(Hash([0x42u8; 32])),
-            kind: FileEntryKind::Cached,
+            kind: FileEntryKind::RemoteFile,
         };
 
         let dir_entry = DirTableEntry {

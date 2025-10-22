@@ -202,10 +202,8 @@ where
     }
 
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
-        if let Some(e) = default_file_entry(&self.table, pathid)?
-            && e.is_local()
-        {
-            return Ok(Some(e.into()));
+        if let Some(e) = default_file_entry(&self.table, pathid)? {
+            return Ok(e.into());
         }
         Ok(None)
     }
@@ -295,10 +293,8 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
     }
 
     fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
-        if let Some(e) = default_file_entry(&self.table, pathid)?
-            && e.is_local()
-        {
-            return Ok(Some(e.into()));
+        if let Some(e) = default_file_entry(&self.table, pathid)? {
+            return Ok(e.into());
         }
         Ok(None)
     }
@@ -426,11 +422,7 @@ impl<T: CacheReadOperations> CacheExt for T {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<bool, StorageError> {
-        if let Some(pathid) = tree.resolve(loc)? {
-            return Ok(self.index_entry_at_pathid(pathid)?.is_some());
-        }
-
-        Ok(false)
+        Ok(self.file_entry(tree, loc)?.is_some_and(|e| e.is_local()))
     }
 }
 
@@ -694,8 +686,7 @@ impl<'a> WritableOpenCache<'a> {
             )?;
 
             // write dest in the database
-            let dest_entry = IndexedFile::from(&source_entry).into_file();
-            self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &dest_entry)?;
+            self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
 
             history.report_added(&dest_path, None)?;
         } else {
@@ -778,7 +769,7 @@ impl<'a> WritableOpenCache<'a> {
             size,
             mtime,
             Version::Indexed(hash.clone()),
-            FileEntryKind::Cached,
+            FileEntryKind::RemoteFile,
         );
         let mut updated_default = false;
         if peer_file_entry(&self.table, file_pathid, None)?.is_none() {
@@ -814,7 +805,7 @@ impl<'a> WritableOpenCache<'a> {
             size,
             mtime,
             Version::Indexed(hash.clone()),
-            FileEntryKind::Cached,
+            FileEntryKind::RemoteFile,
         );
         let mut default_modified = false;
         let prev = peer_file_entry(&self.table, pathid, None)?;
@@ -882,7 +873,7 @@ impl<'a> WritableOpenCache<'a> {
             size,
             mtime,
             Version::Indexed(hash.clone()),
-            FileEntryKind::Cached,
+            FileEntryKind::RemoteFile,
         );
         self.write_file_entry(tree, file_pathid, peer, &entry)?;
         if !peer_file_entry(&self.table, file_pathid, None)?.is_some() {
@@ -990,7 +981,7 @@ impl<'a> WritableOpenCache<'a> {
             return;
         }
         if let Ok(realpath) = self.local_path(tree, loc) {
-            if !IndexedFile::from(entry).matches_file(&realpath) {
+            if !entry.matches_file(&realpath) {
                 return;
             }
             match std::fs::remove_file(&realpath) {
@@ -1059,9 +1050,7 @@ impl<'a> WritableOpenCache<'a> {
                         "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
                         self.tag
                     );
-                    if e.is_local()
-                        && IndexedFile::from(e).matches_file(path.within(self.datadir()))
-                    {
+                    if e.matches_file(path.within(self.datadir())) {
                         let realpath = path.within(self.datadir());
                         log::debug!("[{}]@local delete {realpath:?}", self.tag);
                         std::fs::remove_file(realpath)?;
@@ -1118,28 +1107,37 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<PathId, StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
-        let original = default_file_entry(&self.table, pathid)?.map(|e| e.version);
-        if matches!(original, Some(Version::Modified(_))) {
-            // nothing to do
-            return Ok(pathid);
-        }
         let realpath = self.local_path(tree, loc)?;
-        let m = match realpath.metadata() {
+        let m = match realpath.symlink_metadata() {
             Ok(m) => m,
             Err(_) => return Err(StorageError::LocalFileMismatch),
         };
-        let entry = FileTableEntry::new(
-            m.len(),
-            UnixTime::mtime(&m),
-            Version::modification_of(original),
-            FileEntryKind::Local,
-        );
+        if m.is_dir() {
+            return Err(StorageError::IsADirectory);
+        }
+        let original = default_file_entry(&self.table, pathid)?;
+        let kind = if m.is_file() {
+            FileEntryKind::LocalFile
+        } else {
+            FileEntryKind::SpecialFile
+        };
+        if let Some(e) = &original
+            && e.kind == kind
+            && matches!(e.version, Version::Modified(_))
+        {
+            // Update is not needed
+            return Ok(pathid);
+        }
+        let version = Version::modification_of(original.map(|e| e.version));
+        let entry = FileTableEntry::new(m.len(), UnixTime::mtime(&m), version, kind);
         self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
         log::debug!(
-            "[{}]@local record modified for version {:?} of {realpath:?}",
+            "[{}]@local record modified for version {:?} of {realpath:?} as {:?}",
             self.tag,
-            entry.version
+            entry.version,
+            entry.kind,
         );
+        log::debug!("ook0= {entry:?}");
         Ok(pathid)
     }
 
@@ -1158,11 +1156,7 @@ impl<'a> WritableOpenCache<'a> {
         let pathid = tree.setup(loc.borrow())?;
         if let Some(path) = tree.backtrack(loc.borrow())? {
             let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
-            let entry = IndexedFile {
-                version: Version::Indexed(hash),
-                mtime,
-                size,
-            };
+            let entry = IndexedFile { hash, mtime, size };
             let realpath = path.within(self.datadir());
             if !entry.matches_file(&realpath) {
                 return Err(StorageError::LocalFileMismatch);
@@ -1210,7 +1204,7 @@ impl<'a> WritableOpenCache<'a> {
                 } else {
                     entry.version
                 },
-                FileEntryKind::Local,
+                FileEntryKind::LocalFile,
             ),
         )?;
         if !modified {
@@ -1241,7 +1235,7 @@ impl<'a> WritableOpenCache<'a> {
             .backtrack(loc.borrow())?
             .ok_or(StorageError::IsADirectory)?;
         let source = path.within(self.datadir());
-        let metadata = source.metadata()?;
+        let metadata = source.symlink_metadata()?;
 
         let entry = default_file_entry_or_err(&self.table, pathid)?;
         if !entry.is_local() {
@@ -1446,7 +1440,7 @@ fn metadata<'b, L: Into<TreeLoc<'b>>>(
     let loc = loc.into();
     let m = local_path(datadir, tree, loc.borrow())
         .ok()
-        .and_then(|p| p.metadata().ok());
+        .and_then(|p| p.symlink_metadata().ok());
     let pathid = tree.resolve(loc)?;
 
     expand_metadata(cache_table, pathid, m)
@@ -1563,10 +1557,10 @@ fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
                 match layer {
                     Layer::Default => {
                         match entry.kind {
-                            FileEntryKind::Local => {
+                            FileEntryKind::LocalFile | FileEntryKind::SpecialFile => {
                                 alternatives.push(FileAlternative::Local(entry.version.clone()));
                             }
-                            FileEntryKind::Cached => {
+                            FileEntryKind::RemoteFile => {
                                 // will be reported from the peer layer
                             }
                             FileEntryKind::Branched(path_id) => {
@@ -1689,7 +1683,7 @@ where
             let real = if let Some((realpath, names)) = self.realentries.as_mut() {
                 names
                     .take(&name)
-                    .and_then(|n| realpath.join(n).metadata().ok())
+                    .and_then(|n| realpath.join(n).symlink_metadata().ok())
             } else {
                 None
             };
@@ -1704,7 +1698,7 @@ where
             let name = entries.iter().next().cloned();
             if let Some(name) = name {
                 entries.remove(&name);
-                if let Some(m) = realpath.join(&name).metadata().ok() {
+                if let Some(m) = realpath.join(&name).symlink_metadata().ok() {
                     return Some(Ok((name, None, m.into())));
                 }
             }
@@ -1748,8 +1742,8 @@ impl<'a> Iterator for AllIndexedIterator<'a> {
                                 match value.value().parse() {
                                     Err(err) => return Some(Err(StorageError::from(err))),
                                     Ok(CacheTableEntry::File(e)) => {
-                                        if e.is_local() {
-                                            return Some(Ok((pathid, e.into())));
+                                        if let Some(indexed) = e.into() {
+                                            return Some(Ok((pathid, indexed)));
                                         }
                                         // continue
                                     }
@@ -1960,6 +1954,7 @@ mod tests {
     use assert_fs::prelude::*;
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
     use std::collections::{HashMap, HashSet};
+    use std::os::unix;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::u64;
@@ -3795,19 +3790,19 @@ mod tests {
         let (size3, mtime3, hash3) = create_test_file(&childpath3, contents3)?;
 
         let indexed_file1 = IndexedFile {
-            version: Version::Indexed(hash1.clone()),
+            hash: hash1.clone(),
             mtime: mtime1,
             size: size1,
         };
 
         let indexed_file2 = IndexedFile {
-            version: Version::Indexed(hash2.clone()),
+            hash: hash2.clone(),
             mtime: mtime2,
             size: size2,
         };
 
         let indexed_file3 = IndexedFile {
-            version: Version::Indexed(hash3.clone()),
+            hash: hash3.clone(),
             mtime: mtime3,
             size: size3,
         };
@@ -3836,7 +3831,7 @@ mod tests {
                 path,
                 indexed.size,
                 indexed.mtime,
-                indexed.version.indexed_hash().unwrap().clone(),
+                indexed.hash.clone(),
             )?;
         }
 
@@ -5546,7 +5541,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(hash));
+        assert_eq!(entry.hash, hash);
 
         Ok(())
     }
@@ -5599,7 +5594,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, size2);
         assert_eq!(entry.mtime, mtime2);
-        assert_eq!(entry.version, Version::Indexed(hash2));
+        assert_eq!(entry.hash, hash2);
 
         Ok(())
     }
@@ -5668,7 +5663,7 @@ mod tests {
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
-        assert_eq!(entry.version, Version::Indexed(hash));
+        assert_eq!(entry.hash, hash);
 
         Ok(())
     }
@@ -5874,7 +5869,7 @@ mod tests {
 
         // Verify the file was replaced in the index
         let entry = cache.indexed(&tree, &path)?.unwrap();
-        assert_eq!(entry.version, Version::Indexed(hash2));
+        assert_eq!(entry.hash, hash2);
 
         // Verify the path was marked dirty
         let dirty_paths = dirty_paths(&dirty, &tree)?;
@@ -6032,14 +6027,7 @@ mod tests {
         let history_start = history_start(&history)?;
         cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert!(cache.has_local_file(&tree, &path)?);
-        assert_eq!(
-            IndexedFile {
-                size: 4,
-                mtime,
-                version: Version::Modified(None)
-            },
-            cache.indexed(&tree, &path)?.unwrap()
-        );
+        assert_eq!(None, cache.indexed(&tree, &path)?);
         assert_eq!(0, collect_history_entries(&history, history_start)?.len());
 
         let hash = hash::digest("test");
@@ -6058,7 +6046,7 @@ mod tests {
             IndexedFile {
                 size: 4,
                 mtime: mtime,
-                version: Version::Indexed(hash.clone())
+                hash: hash.clone(),
             },
             cache.indexed(&tree, &path)?.unwrap()
         );
@@ -6103,12 +6091,8 @@ mod tests {
         let preindex_mtime = UnixTime::mtime(&childpath.metadata()?);
         cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
         assert_eq!(
-            IndexedFile {
-                size: 8,
-                mtime: preindex_mtime,
-                version: Version::Modified(Some(initial_hash.clone()))
-            },
-            cache.indexed(&tree, &path)?.unwrap()
+            Some(Version::Modified(Some(initial_hash.clone()))),
+            cache.file_entry(&tree, &path)?.map(|e| e.version)
         );
         assert_eq!(0, collect_history_entries(&history, history_start)?.len());
 
@@ -6125,13 +6109,10 @@ mod tests {
             reindex_hash.clone(),
         )?;
         assert_eq!(
-            IndexedFile {
-                size: 8,
-                mtime: reindex_mtime,
-                version: Version::Indexed(reindex_hash.clone())
-            },
-            cache.indexed(&tree, &path)?.unwrap()
+            Some(Version::Indexed(reindex_hash.clone())),
+            cache.file_entry(&tree, &path)?.map(|e| e.version)
         );
+        assert_eq!(reindex_hash, cache.indexed(&tree, &path)?.unwrap().hash);
 
         assert_eq!(
             vec![HistoryTableEntry::Replace(path, initial_hash.clone())],
@@ -6182,6 +6163,94 @@ mod tests {
             vec![HistoryTableEntry::Remove(path, initial_hash.clone())],
             collect_history_entries(&history, history_start)?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn preindex_special_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foobar")?;
+        let childpath = fixture.datadir.child("foobar");
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        unix::fs::symlink(fixture.datadir.join("doesnotexist"), childpath.path())?;
+        let m = childpath.symlink_metadata()?;
+
+        let history_start = history_start(&history)?;
+        let pathid = cache
+            .preindex(&mut tree, &mut blobs, &mut dirty, &path)
+            .unwrap();
+        assert_eq!(
+            pathid,
+            cache
+                .preindex(&mut tree, &mut blobs, &mut dirty, &path)
+                .unwrap()
+        );
+        assert!(cache.has_local_file(&tree, &path)?);
+        assert_eq!(0, collect_history_entries(&history, history_start)?.len());
+
+        assert_eq!(
+            Some(FileEntryKind::SpecialFile),
+            cache.file_at_pathid(pathid)?.map(|e| e.kind)
+        );
+
+        assert_eq!(
+            Some(crate::Metadata::File(FileMetadata {
+                size: m.len(),
+                mtime: UnixTime::mtime(&m),
+                version: Version::Modified(None),
+                ctime: Some(UnixTime::from_system_time(m.created().unwrap()).unwrap()),
+                mode: m.mode(),
+                uid: Some(m.uid()),
+                gid: Some(m.gid()),
+                blocks: m.len() / 512 + if (m.len() % 512) == 0 { 0 } else { 1 },
+            })),
+            cache.metadata(&tree, pathid)?
+        );
+        assert_eq!(None, cache.indexed(&tree, &path)?);
+
+        // Attempting to index even a preindex special file results in
+        // an error
+        assert!(matches!(
+            cache.index(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &path,
+                m.len(),
+                UnixTime::mtime(&m),
+                hash::digest("doesnotexist"),
+            ),
+            Err(StorageError::LocalFileMismatch)
+        ));
+
+        // Now turn the symlink int a real file, but keep the old
+        // preindexed entry; indexing should not be confused by the
+        // outdated preindexed entry.
+        std::fs::remove_file(childpath.path())?;
+        childpath.write_str("test")?;
+        let m = childpath.symlink_metadata()?;
+        cache
+            .index(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &path,
+                m.len(),
+                UnixTime::mtime(&m),
+                hash::digest("test"),
+            )
+            .unwrap();
+        assert!(cache.indexed(&tree, &path)?.is_some());
 
         Ok(())
     }
