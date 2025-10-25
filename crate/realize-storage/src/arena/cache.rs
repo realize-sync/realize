@@ -585,7 +585,7 @@ impl<'a> WritableOpenCache<'a> {
                         Err(err) => return Err(err),
                     };
                 }
-                write_dir_mtime(&mut self.table, tree, dest_pathid, dir_entry.mtime)?;
+                write_dir(&mut self.table, tree, dest_pathid, &dir_entry)?;
                 tree.remove_and_decref(
                     source_pathid,
                     &mut self.table,
@@ -707,45 +707,60 @@ impl<'a> WritableOpenCache<'a> {
         Ok((dest_pathid, source_entry.into()))
     }
 
+    /// Creates a local directory is the database and on the filesystem.
+    ///
+    /// A directory might already exist in the database, but be only
+    /// as remote directory, in which case this calls marks the entry
+    /// as being local.
+    ///
+    /// This call won't return the error "already exists", even if the
+    /// directory exists on the database as well as on the filesystem
+    /// already.
     pub(crate) fn mkdir<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-        mtime: Option<UnixTime>,
     ) -> Result<(PathId, DirMetadata), StorageError> {
-        let pathid = tree.setup(loc)?;
-        if self.table.get((pathid, Layer::Default))?.is_some() {
-            return Err(StorageError::AlreadyExists);
-        }
+        let loc = loc.into();
+        let pathid = tree.setup(loc.borrow())?;
         check_parent_is_dir(&self.table, tree, pathid)?;
-        let mtime = mtime.unwrap_or(UnixTime::now());
-        write_dir_mtime(&mut self.table, tree, pathid, mtime)?;
+        let cached = write_dir_local(&mut self.table, tree, pathid)?;
 
-        Ok((
-            pathid,
-            DirMetadata {
-                mode: 0o777,
-                mtime,
-                uid: None,
-                gid: None,
-            },
-        ))
+        let realpath = self.local_path(tree, loc)?;
+        std::fs::create_dir_all(&realpath)?;
+
+        let metadata = DirMetadata::merged(&cached, &realpath.symlink_metadata()?);
+        Ok((pathid, metadata))
     }
 
+    /// Removes a local directory on the database and on the filesystem.
+    ///
+    /// The directory must be empty for this call to work, that is,
+    /// there must not be any local nor remote files.
     pub(crate) fn rmdir<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
     ) -> Result<(), StorageError> {
-        let pathid = tree.expect(loc)?;
-        match pathid_assignment(&self.table, pathid)? {
-            Some(PathAssignment::File) => Err(StorageError::NotADirectory),
+        let loc = loc.into();
+        let pathid = tree.expect(loc.borrow())?;
+        match default_entry(&self.table, pathid)? {
             None => Err(StorageError::NotFound),
-            Some(PathAssignment::Directory) => {
+            Some(CacheTableEntry::File(_)) => Err(StorageError::NotADirectory),
+            Some(CacheTableEntry::Dir(existing)) => {
                 if !self.readdir(tree, pathid).next().is_none() {
                     return Err(StorageError::DirectoryNotEmpty);
                 }
                 tree.remove_and_decref(pathid, &mut self.table, (pathid, Layer::Default))?;
+                if existing.is_remote() {
+                    if let Some(parent_pathid) = tree.parent(pathid)? {
+                        write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
+                    }
+                }
+                let realpath = self.local_path(tree, loc)?;
+                if realpath.exists() {
+                    std::fs::remove_dir(realpath)?;
+                }
 
                 Ok(())
             }
@@ -929,9 +944,12 @@ impl<'a> WritableOpenCache<'a> {
             (pathid, Layer::Default),
             Holder::new(&CacheTableEntry::File(new_entry.clone()))?,
         )? {
-            // Update the parent directory mtime since we're adding a file to it
             if let Some(parent_pathid) = tree.parent(pathid)? {
-                write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
+                if new_entry.is_local() {
+                    write_dir_local(&mut self.table, tree, parent_pathid)?;
+                } else {
+                    write_dir_mtime(&mut self.table, tree, parent_pathid, UnixTime::now())?;
+                }
             }
         }
 
@@ -1055,7 +1073,14 @@ impl<'a> WritableOpenCache<'a> {
                         log::debug!("[{}]@local delete {realpath:?}", self.tag);
                         std::fs::remove_file(realpath)?;
                     }
+                    let parent = tree.parent(pathid)?;
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
+                    if let Some(parent) = parent {
+                        // Get rid of unnecessary parent dirs. This only happens when
+                        // files are removed due to remote notifications and when
+                        // dirs have no local equivalent.
+                        delete_empty_remote_dir(&mut self.table, tree, parent)?;
+                    }
                 }
             }
         }
@@ -1090,8 +1115,13 @@ impl<'a> WritableOpenCache<'a> {
                         .is_none()
                 {
                     // If the file has become unavailable because of
-                    // this removal, remove the file itself as well.
+                    // this removal, remove the file itself as well
+                    // and any now empty containing directories.
+                    let parent = tree.parent(pathid)?;
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
+                    if let Some(parent) = parent {
+                        delete_empty_remote_dir(&mut self.table, tree, parent)?;
+                    }
                 }
             }
         }
@@ -1394,13 +1424,14 @@ impl Cache {
         datadir: &std::path::Path,
     ) -> Result<Self, StorageError> {
         if cache_table.get((root_pathid, Layer::Default))?.is_none() {
-            // Exceptionally not using write_dir_mtime and not going
+            // Exceptionally not using write_dir and not going
             // through tree because , arena roots aren't refcounted by
             // tree and are never deleted.
             cache_table.insert(
                 (root_pathid, Layer::Default),
                 Holder::with_content(CacheTableEntry::Dir(DirTableEntry {
-                    mtime: UnixTime::now(),
+                    local: true,
+                    mtime: Some(UnixTime::now()),
                 }))?,
             )?;
         }
@@ -1814,32 +1845,110 @@ fn default_file_entry_or_err(
         .expect_file()
 }
 
-/// Insert or update a directory entry in the cache table.
+/// Update mtime of the current directory and its parents.
 ///
-/// The presence of this entry is what marks a directory as existing,
-/// both in the cache and in the tree.
+/// Does nothing if the given mtime is earlier than the one from the
+/// directory.
+///
+/// If the directory doesn't exist, this calls creates it.
+///
+/// Returns the updated and merged [DirTableEntry].
 fn write_dir_mtime(
     cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     pathid: PathId,
     mtime: UnixTime,
-) -> Result<(), StorageError> {
-    if tree.insert_and_incref(
+) -> Result<DirTableEntry, StorageError> {
+    write_dir(
+        cache_table,
+        tree,
+        pathid,
+        &DirTableEntry {
+            mtime: Some(mtime),
+            ..Default::default()
+        },
+    )
+}
+
+/// Mark dir and its parents as local.
+///
+/// Does nothing if the directories are already local.
+///
+/// If the directory doesn't exist, this calls creates it.
+///
+/// Returns the updated and merged [DirTableEntry].
+fn write_dir_local(
+    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    tree: &mut WritableOpenTree,
+    pathid: PathId,
+) -> Result<DirTableEntry, StorageError> {
+    write_dir(
+        cache_table,
+        tree,
+        pathid,
+        &DirTableEntry {
+            local: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Write or update a directory entry at the given id and its
+/// ancestors.
+///
+/// `update` is merged with any existing entry using
+/// [DirTableEntry::update].
+///
+/// If the directory doesn't exist, this calls creates it.
+///
+/// Returns the updated and merged [DirTableEntry].
+fn write_dir(
+    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    tree: &mut WritableOpenTree,
+    pathid: PathId,
+    update: &DirTableEntry,
+) -> Result<DirTableEntry, StorageError> {
+    let entry = if let Some(existing) = default_entry(cache_table, pathid)? {
+        let mut entry = existing.expect_dir()?;
+        if !entry.update(update) {
+            // No changes; don't bother updating this entry not its ancestors
+            return Ok(entry);
+        }
+
+        entry
+    } else {
+        update.clone()
+    };
+    tree.insert_and_incref(
         pathid,
         cache_table,
         (pathid, Layer::Default),
-        Holder::with_content(CacheTableEntry::Dir(DirTableEntry { mtime }))?,
-    )? {
-        // Update the parent directory mtime since we're adding a directory to it.
-        if let Some(parent_pathid) = tree.parent(pathid)? {
-            let update_parent = match default_entry(cache_table, parent_pathid) {
-                Ok(Some(CacheTableEntry::Dir(DirTableEntry {
-                    mtime: parent_mtime,
-                }))) => parent_mtime < mtime,
-                _ => true,
-            };
-            if update_parent {
-                write_dir_mtime(cache_table, tree, parent_pathid, mtime)?;
+        Holder::with_content(CacheTableEntry::Dir(entry.clone()))?,
+    )?;
+
+    if let Some(parent_pathid) = tree.parent(pathid)? {
+        write_dir(cache_table, tree, parent_pathid, update)?;
+    }
+
+    Ok(entry)
+}
+
+fn delete_empty_remote_dir(
+    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    tree: &mut WritableOpenTree,
+    pathid: PathId,
+) -> Result<(), StorageError> {
+    if let Some(existing) = default_entry(cache_table, pathid)? {
+        let parent = tree.parent(pathid)?;
+        let entry = existing.expect_dir()?;
+        if !entry.local
+            && ReadDirIterator::new(cache_table, tree, None, pathid)
+                .next()
+                .is_none()
+        {
+            tree.remove_and_decref(pathid, cache_table, (pathid, Layer::Default))?;
+            if let Some(parent) = parent {
+                return delete_empty_remote_dir(cache_table, tree, parent);
             }
         }
     }
@@ -2338,12 +2447,9 @@ mod tests {
             assert!(!tree.pathid_exists(c)?);
             assert_eq!(None, tree.lookup_pathid(b, "c.txt")?);
 
-            // The directories were not cleaned up, even though this
-            // was the last file. They need to be rmdir'ed explicitly.
-            assert!(tree.pathid_exists(a)?);
-            assert!(tree.pathid_exists(b)?);
-            assert_eq!(Some(a), tree.lookup_pathid(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup_pathid(a, "b")?);
+            // The directories were cleaned up.
+            assert!(!tree.pathid_exists(a)?);
+            assert!(!tree.pathid_exists(b)?);
         }
         Ok(())
     }
@@ -3674,6 +3780,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_and_delete_peer_dirs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let arena = test_arena();
+        let peer = Peer::from("peer");
+        let dir1 = Path::parse("dir1")?;
+        let dir2 = dir1.join("dir2")?;
+        let file = dir2.join("file")?;
+
+        let mtime = test_time();
+
+        update::apply(
+            &fixture.db,
+            peer,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file.clone(),
+                mtime: mtime.clone(),
+                size: 10,
+                hash: test_hash(),
+            },
+        )?;
+
+        // Catchup reports nothing, so deletes everything
+        update::apply(&fixture.db, peer, Notification::CatchupStart(fixture.arena))?;
+        update::apply(
+            &fixture.db,
+            peer,
+            Notification::CatchupComplete {
+                arena: arena,
+                index: 0,
+            },
+        )?;
+
+        let txn = fixture.db.begin_read()?;
+        let cache = txn.read_cache()?;
+        let tree = txn.read_tree()?;
+
+        // the file and its containing directories should have been deleted
+        assert_eq!(None, cache.metadata(&tree, &file)?);
+        assert_eq!(None, cache.metadata(&tree, &dir2)?);
+        assert_eq!(None, cache.metadata(&tree, &dir1)?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn blob_deleted_on_file_overwrite() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let arena = test_arena();
@@ -4267,66 +4420,53 @@ mod tests {
     async fn mkdir_creates_directory() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("newdir")?;
+        let dir_realpath = dir_path.within(fixture.datadir.path());
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut dirty = txn.write_dirty()?;
 
-        clear_dirty(&mut dirty)?;
+        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path)?;
 
-        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path, None)?;
+        assert_eq!(Some(pathid), tree.resolve(dir_path)?);
 
-        // Verify directory was created
-        assert!(tree.pathid_exists(pathid)?);
+        assert!(dir_realpath.exists());
+
+        // mtime is from the real directory
+        assert_eq!(metadata.mtime, UnixTime::mtime(&dir_realpath.metadata()?));
         assert_eq!(
-            Some(pathid),
-            tree.lookup_pathid(fixture.db.tree().root(), "newdir")?
+            Some(crate::Metadata::Dir(metadata)),
+            cache.metadata(&tree, pathid)?
         );
-
-        // Verify metadata
-        assert_eq!(0o777, metadata.mode);
-        assert!(metadata.mtime > UnixTime::ZERO);
-
-        // Verify directory entry exists in cache by checking dir_mtime
-        let mtime = cache.dir_mtime(&tree, pathid)?;
-        assert!(mtime > UnixTime::ZERO);
-
-        // Verify parent directory mtime was updated
-        let parent_mtime = cache.dir_mtime(&tree, fixture.db.tree().root())?;
-        assert!(parent_mtime > UnixTime::ZERO);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn mkdir_creates_directory_with_mtime() -> anyhow::Result<()> {
+    async fn mkdir_marks_remote_directory_as_local() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("newdir")?;
+        let dir_realpath = dir_path.within(fixture.datadir.path());
+
+        fixture.add_to_cache(&dir_path.join("file")?, 4, test_time())?;
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mtime = UnixTime::from_secs(1234567890); // some time in feb 2009
 
-        let parent_mtime = cache.dir_mtime(&tree, fixture.db.tree().root())?;
-        assert!(parent_mtime > mtime); // system clock should be > 2009
-        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path, Some(mtime))?;
+        // mkdir succeeds and creates a local directory
+        let (pathid, metadata) = cache.mkdir(&mut tree, &dir_path)?;
 
-        assert_eq!(mtime, metadata.mtime);
-        assert_eq!(mtime, cache.dir_mtime(&tree, pathid)?);
-
-        // parent_mtime should not have been updated, since mtime is in the past
+        assert!(dir_realpath.exists());
         assert_eq!(
-            parent_mtime,
-            cache.dir_mtime(&tree, fixture.db.tree().root())?
+            Some(crate::Metadata::Dir(metadata)),
+            cache.metadata(&tree, pathid)?
         );
-
         Ok(())
     }
 
     #[tokio::test]
-    async fn mkdir_creates_nested_directories() -> anyhow::Result<()> {
+    async fn mkdir_does_not_create_nested_directories() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
 
         let txn = fixture.db.begin_write()?;
@@ -4334,11 +4474,11 @@ mod tests {
         let mut cache = txn.write_cache()?;
 
         // The following fails, because a/b doesn't exist
-        assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?, None).is_err());
+        assert!(cache.mkdir(&mut tree, Path::parse("a/b/c")?).is_err());
 
-        let (a_pathid, _) = cache.mkdir(&mut tree, Path::parse("a")?, None)?;
-        let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?, None)?;
-        let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?, None)?;
+        let (a_pathid, _) = cache.mkdir(&mut tree, Path::parse("a")?)?;
+        let (b_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b")?)?;
+        let (c_pathid, _) = cache.mkdir(&mut tree, Path::parse("a/b/c")?)?;
 
         assert!(cache.dir_mtime(&tree, a_pathid).is_ok());
         assert!(cache.dir_mtime(&tree, b_pathid).is_ok());
@@ -4348,96 +4488,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mkdir_fails_if_directory_already_exists() -> anyhow::Result<()> {
-        let fixture = Fixture::setup_with_arena(test_arena())?;
-        let dir_path = Path::parse("existing_dir")?;
-
-        let txn = fixture.db.begin_write()?;
-        let mut tree = txn.write_tree()?;
-        let mut cache = txn.write_cache()?;
-        let mut dirty = txn.write_dirty()?;
-
-        clear_dirty(&mut dirty)?;
-
-        // Create directory first time
-        let (pathid1, _) = cache.mkdir(&mut tree, &dir_path, None)?;
-        assert!(tree.pathid_exists(pathid1)?);
-
-        // Try to create same directory again
-        let result = cache.mkdir(&mut tree, &dir_path, None);
-        assert!(matches!(result, Err(StorageError::AlreadyExists)));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn rmdir_removes_empty_directory() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("empty_dir")?;
+        let dir_realpath = dir_path.within(fixture.datadir.path());
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut dirty = txn.write_dirty()?;
-
-        clear_dirty(&mut dirty)?;
 
         // Create directory
-        let (pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
+        let (pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
         assert!(tree.pathid_exists(pathid)?);
 
         // Remove directory
         cache.rmdir(&mut tree, &dir_path)?;
 
-        // Verify directory is gone
-        assert!(!tree.pathid_exists(pathid)?);
-        assert_eq!(
-            None,
-            tree.lookup_pathid(fixture.db.tree().root(), "empty_dir")?
-        );
-
-        // Verify cache entry is gone
-        assert!(cache.file_at_pathid(pathid)?.is_none());
+        assert_eq!(None, cache.metadata(&tree, &dir_path)?);
+        assert!(!dir_realpath.exists());
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn rmdir_fails_if_directory_not_empty() -> anyhow::Result<()> {
+    async fn rmdir_fails_if_directory_contains_remote_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
         let dir_path = Path::parse("non_empty_dir")?;
+        let dir_realpath = dir_path.within(fixture.datadir.path());
         let file_path = Path::parse("non_empty_dir/file.txt")?;
+
+        fixture.add_to_cache(file_path, 4, test_time())?;
 
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut blobs = txn.write_blobs()?;
-        let mut dirty = txn.write_dirty()?;
 
-        clear_dirty(&mut dirty)?;
-
-        // Create directory
-        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
-
-        // Add a file to the directory
-        let peer = Peer::from("test_peer");
-        cache.notify_added(
-            &mut tree,
-            &mut blobs,
-            &mut dirty,
-            peer,
-            file_path.clone(),
-            test_time(),
-            100,
-            test_hash(),
-        )?;
+        // Create local directory
+        let (_, _) = cache.mkdir(&mut tree, &dir_path)?;
 
         // Try to remove non-empty directory
         let result = cache.rmdir(&mut tree, &dir_path);
         assert!(matches!(result, Err(StorageError::DirectoryNotEmpty)));
 
-        // Verify directory still exists
-        assert!(tree.pathid_exists(dir_pathid)?);
+        // Verify directory still exists in the database and fs
+        assert!(matches!(
+            cache.metadata(&tree, &dir_path)?,
+            Some(crate::Metadata::Dir(_))
+        ));
+        assert!(dir_realpath.exists());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rmdir_fails_if_directory_contains_local_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup_with_arena(test_arena())?;
+        let dir_path = Path::parse("non_empty_dir")?;
+        let dir_realpath = dir_path.within(fixture.datadir.path());
+        let file_path = Path::parse("non_empty_dir/file.txt")?;
+        let file_realpath = file_path.within(fixture.datadir.path());
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+
+        // Create local directory and local file
+        cache.mkdir(&mut tree, &dir_path)?;
+        std::fs::write(file_realpath, "test")?;
+
+        let result = cache.rmdir(&mut tree, &dir_path);
+        assert!(matches!(result, Err(StorageError::DirectoryNotEmpty)));
+
+        // directory still exists in the database and fs
+        assert!(matches!(
+            cache.metadata(&tree, &dir_path)?,
+            Some(crate::Metadata::Dir(_))
+        ));
+        assert!(dir_realpath.exists());
 
         Ok(())
     }
@@ -4450,10 +4577,8 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut blobs = txn.write_blobs()?;
         let mut dirty = txn.write_dirty()?;
-
-        clear_dirty(&mut dirty)?;
+        let mut blobs = txn.write_blobs()?;
 
         // Add a file
         let peer = Peer::from("test_peer");
@@ -4488,9 +4613,6 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut dirty = txn.write_dirty()?;
-
-        clear_dirty(&mut dirty)?;
 
         // Try to remove non-existent directory
         let result = cache.rmdir(&mut tree, &nonexistent_path);
@@ -4508,13 +4630,10 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        let mut dirty = txn.write_dirty()?;
-
-        clear_dirty(&mut dirty)?;
 
         // Create parent and child directories
-        let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path, None)?;
-        let (child_pathid, _) = cache.mkdir(&mut tree, &child_path, None)?;
+        let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path)?;
+        let (child_pathid, _) = cache.mkdir(&mut tree, &child_path)?;
 
         // Get parent mtime before removal
         let parent_mtime_before = cache.dir_mtime(&tree, parent_pathid)?;
@@ -4557,7 +4676,7 @@ mod tests {
         let file_pathid = tree.expect(&file_path)?;
 
         // Create a directory
-        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path, None)?;
+        let (dir_pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
 
         // Test file metadata
         let file_metadata = cache.metadata(&tree, file_pathid)?;
@@ -4578,9 +4697,10 @@ mod tests {
         // Test directory metadata
         let dir_metadata = cache.metadata(&tree, dir_pathid)?;
         match dir_metadata {
-            Some(crate::Metadata::Dir(meta)) => {
-                assert_eq!(0o777, meta.mode); // Arena directories are writable
-                assert!(meta.mtime >= test_time());
+            Some(crate::Metadata::Dir(dirmeta)) => {
+                let m = dir_path.within(cache.datadir()).symlink_metadata()?;
+                assert_eq!(m.mode(), dirmeta.mode);
+                assert_eq!(UnixTime::mtime(&m), dirmeta.mtime);
             }
             Some(crate::Metadata::File(_)) => {
                 panic!("Expected directory metadata, got file metadata");
@@ -4621,7 +4741,7 @@ mod tests {
                 1024,
                 test_hash(),
             )?;
-            cache.mkdir(&mut tree, &dir_path, None)?;
+            cache.mkdir(&mut tree, &dir_path)?;
         }
         txn.commit()?;
 
@@ -4639,9 +4759,12 @@ mod tests {
 
         // Test directory metadata through ArenaCache
         match fixture.metadata(&dir_path)? {
-            crate::Metadata::Dir(meta) => {
-                assert_eq!(0o777, meta.mode); // Arena directories are writable
-                assert!(meta.mtime >= test_time());
+            crate::Metadata::Dir(dirmeta) => {
+                let m = dir_path
+                    .within(fixture.db.cache().datadir())
+                    .symlink_metadata()?;
+                assert_eq!(m.mode(), dirmeta.mode);
+                assert_eq!(UnixTime::mtime(&m), dirmeta.mtime);
             }
             crate::Metadata::File(_) => {
                 panic!("Expected directory metadata, got file metadata");
@@ -5400,7 +5523,7 @@ mod tests {
         )?;
 
         // Create empty destination directory
-        cache.mkdir(&mut tree, &dest_dir, None)?;
+        cache.mkdir(&mut tree, &dest_dir)?;
 
         // Test noreplace=true should fail with AlreadyExists
         assert!(matches!(
@@ -6274,7 +6397,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
         let mut cache = txn.write_cache()?;
-        cache.mkdir(&mut tree, &dir_path, None)?;
+        cache.mkdir(&mut tree, &dir_path)?;
         assert!(cache.list_alternatives(&tree, &dir_path)?.is_empty());
 
         Ok(())
@@ -6655,6 +6778,158 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StorageError::NotFound)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_remote_file_removes_remote_dirs() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let peer1 = Peer::from("peer1");
+        let file_path = Path::parse("a/b/c/file.txt")?;
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 4,
+                hash: hash::digest("test"),
+            },
+        )?;
+
+        assert!(fixture.dir_metadata(Path::parse("a/b/c")?).is_ok());
+
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Remove {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: hash::digest("test"),
+            },
+        )?;
+
+        assert!(matches!(
+            fixture.dir_metadata(Path::parse("a/b/c")?),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            fixture.dir_metadata(Path::parse("a/b")?),
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            fixture.dir_metadata(Path::parse("a")?),
+            Err(StorageError::NotFound)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_remote_file_keeps_dir_created_by_mkdir() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let peer1 = Peer::from("peer1");
+        let file_path = Path::parse("a/b/c/file.txt")?;
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 4,
+                hash: hash::digest("test"),
+            },
+        )?;
+
+        assert!(fixture.dir_metadata(Path::parse("a/b/c")?).is_ok());
+
+        let txn = fixture.db.begin_write()?;
+        txn.write_cache()?
+            .mkdir(&mut txn.write_tree()?, &Path::parse("a/b")?)?;
+        txn.commit()?;
+
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Remove {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: hash::digest("test"),
+            },
+        )?;
+
+        // a/b/c has been removed, but a/b is still there, even though
+        // it's empty, because it was created explicitly by mkdir.
+        assert!(matches!(
+            fixture.dir_metadata(Path::parse("a/b/c")?),
+            Err(StorageError::NotFound)
+        ));
+        assert!(fixture.dir_metadata(Path::parse("a/b")?).is_ok());
+        assert!(fixture.dir_metadata(Path::parse("a")?).is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_remote_file_keeps_dirs_containing_local_files() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let peer1 = Peer::from("peer1");
+        let file_path = Path::parse("a/b/c/file.txt")?;
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Add {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                mtime: test_time(),
+                size: 4,
+                hash: hash::digest("test"),
+            },
+        )?;
+
+        assert!(fixture.dir_metadata(Path::parse("a/b/c")?).is_ok());
+
+        let txn = fixture.db.begin_write()?;
+        let local_file = Path::parse("a/b/local_file")?;
+        fixture.datadir.child("a/b/local_file").write_str("test")?;
+        txn.write_cache()?.preindex(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_dirty()?,
+            &local_file,
+        )?;
+        txn.commit()?;
+
+        update::apply(
+            &fixture.db,
+            peer1,
+            Notification::Remove {
+                arena: arena,
+                index: 0,
+                path: file_path.clone(),
+                old_hash: hash::digest("test"),
+            },
+        )?;
+
+        // a/b/c has been removed, but a/b is still there, even though
+        // it's empty, because it was created explicitly by mkdir.
+        assert!(matches!(
+            fixture.dir_metadata(Path::parse("a/b/c")?),
+            Err(StorageError::NotFound)
+        ));
+        assert!(fixture.dir_metadata(Path::parse("a/b")?).is_ok());
+        assert!(fixture.dir_metadata(Path::parse("a")?).is_ok());
 
         Ok(())
     }

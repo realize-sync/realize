@@ -714,7 +714,7 @@ impl FileEntryKind {
         }
     }
 
-    pub fn is_cached(&self) -> bool {
+    pub fn is_remote(&self) -> bool {
         match self {
             FileEntryKind::LocalFile => false,
             FileEntryKind::SpecialFile => false,
@@ -828,10 +828,9 @@ impl FileTableEntry {
         self.kind.is_local()
     }
 
-    /// Returns true if this is a cached file (either Cache or Branched)
-    #[allow(dead_code)]
-    pub fn is_cached(&self) -> bool {
-        self.kind.is_cached()
+    /// Returns true if this is a remote file (a cached or branched file)
+    pub fn is_remote(&self) -> bool {
+        self.kind.is_remote()
     }
 
     /// Check whether `file_path` matches this entry
@@ -859,12 +858,53 @@ impl FileTableEntry {
 }
 
 /// A simplified directory entry that only contains modification time.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct DirTableEntry {
-    /// The modification time of the directory.
-    pub mtime: UnixTime,
+    /// True for a directory that should have a local equivalent in
+    /// the datadir.
+    pub local: bool,
+
+    /// The modification time of the directory, for remote file
+    /// changes.
+    pub mtime: Option<UnixTime>,
 }
 
+impl DirTableEntry {
+    /// True if this is a local dir.
+    ///
+    /// Note that a dir can be both local and remote.
+    pub fn is_local(&self) -> bool {
+        self.local
+    }
+
+    /// True if this is a remote dir.
+    ///
+    /// Note that a dir can be both local and remote.
+    pub fn is_remote(&self) -> bool {
+        self.mtime.is_some()
+    }
+
+    /// Apply an update to the current entry from `other`.
+    ///
+    /// `other.mtime` is ignored if it is earlier than `self.mtime`.
+    ///
+    /// Returns true if a change was made to the entry.
+    pub fn update(&mut self, other: &DirTableEntry) -> bool {
+        let mut modified = false;
+        if other.local && !self.local {
+            self.local = true;
+            modified = true;
+        }
+        if let Some(mtime) = other.mtime
+            && self.mtime.is_none_or(|t| t <= mtime)
+        {
+            self.mtime = Some(mtime);
+            modified = true;
+        }
+
+        modified
+    }
+}
 /// An entry that can be either a file or directory.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CacheTableEntry {
@@ -872,6 +912,21 @@ pub enum CacheTableEntry {
     File(FileTableEntry),
     /// A directory entry
     Dir(DirTableEntry),
+}
+
+impl CacheTableEntry {
+    pub fn is_local(&self) -> bool {
+        match self {
+            CacheTableEntry::File(e) => e.is_local(),
+            CacheTableEntry::Dir(e) => e.is_local(),
+        }
+    }
+    pub fn is_remote(&self) -> bool {
+        match self {
+            CacheTableEntry::File(e) => e.is_remote(),
+            CacheTableEntry::Dir(e) => e.is_remote(),
+        }
+    }
 }
 
 impl NamedType for FileTableEntry {
@@ -992,9 +1047,13 @@ impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
             cache_capnp::cache_table_entry::Dir(dir_entry) => {
                 let dir_entry = dir_entry?;
                 let mtime = dir_entry.get_mtime()?;
-
                 let dir_table_entry = DirTableEntry {
-                    mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+                    local: dir_entry.get_local(),
+                    mtime: if mtime.get_secs() == 0 && mtime.get_nsecs() == 0 {
+                        None
+                    } else {
+                        Some(UnixTime::new(mtime.get_secs(), mtime.get_nsecs()))
+                    },
                 };
 
                 Ok(CacheTableEntry::Dir(dir_table_entry))
@@ -1012,10 +1071,13 @@ impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
                 fill_file_table_entry(builder.init_file(), file_entry);
             }
             CacheTableEntry::Dir(dir_entry) => {
-                let dir_builder = builder.init_dir();
-                let mut mtime = dir_builder.init_mtime();
-                mtime.set_secs(dir_entry.mtime.as_secs());
-                mtime.set_nsecs(dir_entry.mtime.subsec_nanos());
+                let mut dir_builder = builder.init_dir();
+                dir_builder.set_local(dir_entry.local);
+                if let Some(mtime) = dir_entry.mtime {
+                    let mut mtime_builder = dir_builder.init_mtime();
+                    mtime_builder.set_secs(mtime.as_secs());
+                    mtime_builder.set_nsecs(mtime.subsec_nanos());
+                }
             }
         }
 
@@ -1040,6 +1102,22 @@ impl CacheTableEntry {
         match self {
             CacheTableEntry::File(file_entry) => Some(file_entry),
             CacheTableEntry::Dir(_) => None,
+        }
+    }
+
+    /// Extract the dir entry, returning an error if this is a file entry.
+    pub fn expect_dir(self) -> Result<DirTableEntry, StorageError> {
+        match self {
+            CacheTableEntry::Dir(dir_entry) => Ok(dir_entry),
+            CacheTableEntry::File(_) => Err(StorageError::NotADirectory),
+        }
+    }
+
+    /// Extract the dir entry or return None
+    pub fn dir(self) -> Option<DirTableEntry> {
+        match self {
+            CacheTableEntry::Dir(dir_entry) => Some(dir_entry),
+            CacheTableEntry::File(_) => None,
         }
     }
 }
@@ -1172,8 +1250,10 @@ impl DirMetadata {
 
     pub(crate) fn merged(e: &DirTableEntry, m: &std::fs::Metadata) -> Self {
         let mut dir_metadata = DirMetadata::from(m);
-        if e.mtime > dir_metadata.mtime {
-            dir_metadata.mtime = e.mtime;
+        if let Some(mtime) = e.mtime
+            && mtime > dir_metadata.mtime
+        {
+            dir_metadata.mtime = mtime;
         }
 
         dir_metadata
@@ -1182,7 +1262,7 @@ impl DirMetadata {
 
 impl From<&DirTableEntry> for DirMetadata {
     fn from(e: &DirTableEntry) -> Self {
-        DirMetadata::modifiable(e.mtime)
+        DirMetadata::modifiable(e.mtime.unwrap_or_else(|| UnixTime::ZERO))
     }
 }
 impl From<DirTableEntry> for DirMetadata {
@@ -1516,7 +1596,7 @@ mod tests {
             kind: FileEntryKind::LocalFile,
         };
         assert!(local_entry.is_local());
-        assert!(!local_entry.is_cached());
+        assert!(!local_entry.is_remote());
 
         // Test Cache
         let cache_entry = FileTableEntry {
@@ -1526,7 +1606,7 @@ mod tests {
             kind: FileEntryKind::RemoteFile,
         };
         assert!(!cache_entry.is_local());
-        assert!(cache_entry.is_cached());
+        assert!(cache_entry.is_remote());
 
         // Test Branched
         let branched_entry = FileTableEntry {
@@ -1536,7 +1616,7 @@ mod tests {
             kind: FileEntryKind::Branched(PathId(42)),
         };
         assert!(!branched_entry.is_local());
-        assert!(branched_entry.is_cached());
+        assert!(branched_entry.is_remote());
     }
 
     #[tokio::test]
@@ -1653,9 +1733,23 @@ mod tests {
     #[test]
     fn convert_cache_table_entry_dir() -> anyhow::Result<()> {
         let dir_entry = DirTableEntry {
-            mtime: UnixTime::from_secs(987654321),
+            local: true,
+            mtime: Some(UnixTime::from_secs(987654321)),
         };
 
+        let entry = CacheTableEntry::Dir(dir_entry);
+
+        assert_eq!(
+            entry,
+            CacheTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn convert_cache_table_entry_dir_default() -> anyhow::Result<()> {
+        let dir_entry = DirTableEntry::default();
         let entry = CacheTableEntry::Dir(dir_entry);
 
         assert_eq!(
@@ -1677,7 +1771,8 @@ mod tests {
         };
 
         let dir_entry = DirTableEntry {
-            mtime: UnixTime::from_secs(987654321),
+            mtime: Some(UnixTime::from_secs(987654321)),
+            local: true,
         };
 
         let file_variant = CacheTableEntry::File(file_entry);

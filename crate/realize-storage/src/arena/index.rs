@@ -1160,7 +1160,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
-        cache.mkdir(&mut tree, Path::parse("dir")?, None)?;
+        cache.mkdir(&mut tree, Path::parse("dir")?)?;
 
         let result = super::branch(
             &mut cache,

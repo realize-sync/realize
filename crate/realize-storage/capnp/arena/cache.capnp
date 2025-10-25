@@ -6,6 +6,7 @@ $Rust.parentModule("arena::types");
 # A new simplified DirTableEntry that only contains mtime
 struct DirtableEntry {
   mtime @0: Time;
+  local @1: Bool;
 }
 
 # A union that can be either a FileTableEntry or a DirtableEntry
