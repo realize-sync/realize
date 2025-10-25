@@ -221,7 +221,17 @@ impl<'a> WritableOpenHistory<'a> {
         let entry_index = 1 + last_history_index(&mut self.table)?;
         let tx = self.history.tx.clone();
         self.after_commit.add(move || {
-            let _ = tx.send(entry_index);
+            // Only send the index if it increases the current one.
+            // Without this check it would be possible for after
+            // commits to be run in parallel out of order.
+            tx.send_if_modified(|index| {
+                if entry_index > *index {
+                    *index = entry_index;
+                    return true;
+                }
+
+                false
+            });
         });
 
         Ok(entry_index)
