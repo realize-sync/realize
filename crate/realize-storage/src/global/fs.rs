@@ -818,7 +818,8 @@ fn add_arena_root(
     paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena_path = Path::parse(arena.as_str())?;
-    let mut names = Path::components(Some(&arena_path))
+    let mut names = arena_path
+        .components()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()

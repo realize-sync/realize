@@ -64,11 +64,7 @@ impl ArenaStorage {
         let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
         let exclude = exclude
             .iter()
-            .filter_map(|p| {
-                realize_types::Path::from_real_path_in(p, &datadir)
-                    .ok()
-                    .flatten()
-            })
+            .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir).ok())
             .collect::<Vec<_>>();
         log::info!(
             "[{tag}] Watching {datadir:?}{}",

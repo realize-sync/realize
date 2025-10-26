@@ -16,24 +16,26 @@ pub fn metadata_no_symlink_blocking(
     path: &Path,
 ) -> Result<Metadata, io::Error> {
     let mut current_path = root.to_path_buf();
-    for component in Path::components(path.parent().as_ref()) {
-        current_path = current_path.join(component);
+    if let Some(parent) = path.parent() {
+        for component in parent.components() {
+            current_path = current_path.join(component);
 
-        let m = std::fs::symlink_metadata(&current_path)?;
-        let t = m.file_type();
+            let m = std::fs::symlink_metadata(&current_path)?;
+            let t = m.file_type();
 
-        if t.is_symlink() {
-            return Err(io::Error::new(
-                ErrorKind::NotADirectory,
-                format!("rejected symlink {current_path:?}"),
-            ));
-        }
+            if t.is_symlink() {
+                return Err(io::Error::new(
+                    ErrorKind::NotADirectory,
+                    format!("rejected symlink {current_path:?}"),
+                ));
+            }
 
-        if !t.is_dir() {
-            return Err(io::Error::new(
-                ErrorKind::NotADirectory,
-                current_path.display().to_string(),
-            ));
+            if !t.is_dir() {
+                return Err(io::Error::new(
+                    ErrorKind::NotADirectory,
+                    current_path.display().to_string(),
+                ));
+            }
         }
     }
 
@@ -69,6 +71,8 @@ pub async fn metadata_no_symlink(
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::MetadataExt;
+
     use super::*;
     use assert_fs::TempDir;
     use tokio::fs;
@@ -191,14 +195,12 @@ mod tests {
     #[tokio::test]
     async fn test_find_no_symlink_empty_path() -> anyhow::Result<()> {
         let temp_dir = TempDir::new()?;
-        let _root = temp_dir.path().to_path_buf();
+        let root = temp_dir.path().to_path_buf();
 
-        // Empty paths are invalid in realize_types::Path
-        let path_result = Path::parse("");
-        assert!(path_result.is_err());
+        let root_m = fs::symlink_metadata(&root).await?;
+        let m = metadata_no_symlink(&root, &Path::root()).await?;
+        assert_eq!((root_m.dev(), root_m.ino()), (m.dev(), m.ino()));
 
-        // If we could create an empty path, it should fail in find_no_symlink
-        // But since Path::parse("") fails, we can't test this scenario
         Ok(())
     }
 }

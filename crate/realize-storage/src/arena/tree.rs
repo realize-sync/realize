@@ -597,7 +597,7 @@ impl<'a> WritableOpenTree<'a> {
     fn add_path(&mut self, path: &Path) -> Result<(PathId, bool), StorageError> {
         let path = path.as_ref();
         let mut current = (self.tree.root, false);
-        for component in Path::components(Some(path)) {
+        for component in path.components() {
             current = self.add_name(current.0, component)?;
         }
 
@@ -837,7 +837,7 @@ fn resolve_path(
     path: &Path,
 ) -> Result<Option<PathId>, StorageError> {
     let mut current = tree.root();
-    for component in Path::components(Some(path)) {
+    for component in path.components() {
         if let Some(e) = tree.lookup_pathid(current, component)? {
             current = e
         } else {
@@ -854,7 +854,7 @@ fn resolve_path_partial(
 ) -> Result<PathId, StorageError> {
     let path = path.as_ref();
     let mut current = tree.root();
-    for component in Path::components(Some(path)) {
+    for component in path.components() {
         if let Some(e) = tree.lookup_pathid(current, component)? {
             current = e
         } else {

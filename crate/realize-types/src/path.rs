@@ -8,9 +8,17 @@ use std::path::{self, StripPrefixError};
 #[derive(
     Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
 )]
-pub struct Path(String);
+pub struct Path {
+    str: String,
+}
 
 impl Path {
+    pub fn root() -> Path {
+        Path {
+            str: "".to_string(),
+        }
+    }
+
     /// Build a path from a string.
     ///
     /// If parsing works, the path is guaranteed to be acceptable.
@@ -18,48 +26,42 @@ impl Path {
         let str = str.into();
         check_path(&str)?;
 
-        Ok(Path(str))
+        Ok(Path { str })
     }
 
     /// Append a path to this one and return the result.
     pub fn join(&self, str: &str) -> Result<Path, PathError> {
         check_path(str)?;
 
-        let mut fullpath = self.0.clone();
-        fullpath.push('/');
+        let mut fullpath = self.str.clone();
+        if !fullpath.is_empty() {
+            fullpath.push('/');
+        }
         fullpath.push_str(str);
-        Ok(Path(fullpath))
+        Ok(Path { str: fullpath })
     }
 
     /// Build a path from a real path.
     ///
     /// Not all real paths can be transformed. They must be relative,
     /// non-empty paths containing only valid unicode strings.
-    pub fn from_real_path<T: AsRef<path::Path>>(path: T) -> Result<Option<Path>, PathError> {
+    pub fn from_real_path<T: AsRef<path::Path>>(path: T) -> Result<Path, PathError> {
         let path = path.as_ref();
-        let mut empty = true;
         for component in path.components() {
-            empty = false;
             match component {
                 std::path::Component::Normal(_) => {}
                 _ => {
-                    return Err(PathError::InvalidPath);
+                    return Err(PathError::Invalid);
                 }
             }
         }
-        if empty {
-            Ok(None)
-        } else {
-            Ok(Some(Path::parse(
-                path.to_str().ok_or(PathError::InvalidPath)?,
-            )?))
-        }
+        Ok(Path::parse(path.to_str().ok_or(PathError::BadEncoding)?)?)
     }
 
     /// Build a path from the given path, relative to the given root.
     ///
     /// For this to work, the given path must be inside the given root.
-    pub fn from_real_path_in<T, U>(path: T, root: U) -> Result<Option<Path>, PathError>
+    pub fn from_real_path_in<T, U>(path: T, root: U) -> Result<Path, PathError>
     where
         T: AsRef<path::Path>,
         U: AsRef<path::Path>,
@@ -69,10 +71,12 @@ impl Path {
 
     /// The name part of the path, without any parent element.
     ///
+    /// The name might be empty for the root path.
+    ///
     /// This is the last and possibly only element of a
     /// slash-separated path.
     pub fn name(&self) -> &str {
-        self.0.rsplit('/').next().unwrap_or(&self.0)
+        self.str.rsplit('/').next().unwrap_or(&self.str)
     }
 
     /// The final extension, with a dot, or the empty string.
@@ -86,29 +90,34 @@ impl Path {
 
     /// The parent of the path.
     ///
-    /// Return a non-empty parent path or None.
+    /// Return a parent path or None. The last returned path might be empty.
     pub fn parent(&self) -> Option<Path> {
-        self.0
-            .rfind('/')
-            .map(|slash| Path(self.0[0..slash].to_string()))
+        if self.str.is_empty() {
+            return None;
+        }
+        Some(
+            self.str
+                .rfind('/')
+                .map(|slash| Path {
+                    str: self.str[0..slash].to_string(),
+                })
+                .unwrap_or_else(Self::root),
+        )
     }
 
-    /// Split a possibly empty path into zero or more components.
-    pub fn components(path: Option<&Self>) -> impl Iterator<Item = &str> {
-        if let Some(path) = path {
-            path.0.split('/')
-        } else {
-            // An empty iterator of the same type as above.
-            let mut ret = "".split('/');
-            ret.next();
-
-            ret
+    /// Split a path into zero or more components.
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        let mut iter = self.str.split('/');
+        if self.str.is_empty() {
+            iter.next();
         }
+
+        iter
     }
 
     /// Return this path as a real path.
     pub fn as_real_path(&self) -> &path::Path {
-        path::Path::new(&self.0)
+        path::Path::new(&self.str)
     }
 
     /// Create a [std::path::PathBuf] from this path.
@@ -122,7 +131,7 @@ impl Path {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.str
     }
 
     /// Return true if the other path is the current path or a parent
@@ -133,7 +142,7 @@ impl Path {
     /// `Path::parts("foo")?` even though "foobar" start with
     /// "foo".
     pub fn starts_with<T: AsRef<Path>>(&self, other: T) -> bool {
-        if let Some(rest) = self.0.strip_prefix(other.as_ref().as_str()) {
+        if let Some(rest) = self.str.strip_prefix(other.as_ref().as_str()) {
             return rest == "" || rest.starts_with('/');
         }
 
@@ -148,13 +157,12 @@ impl Path {
 }
 
 fn check_path(str: &str) -> Result<(), PathError> {
-    if str.is_empty()
-        || str.find(':').is_some()
-        || str
+    if !str.is_empty()
+        && str
             .split('/')
             .any(|s| s.is_empty() || s == "." || s == "..")
     {
-        return Err(PathError::InvalidPath);
+        return Err(PathError::Invalid);
     }
     Ok(())
 }
@@ -172,15 +180,17 @@ impl From<Path> for path::PathBuf {
 
 impl std::fmt::Display for Path {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.str)
     }
 }
 
 /// Errors returned by Path functions
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    #[error("Paths must be valid unicode and not contain ., .. or :")]
-    InvalidPath,
+    #[error("Paths must not contain . or ..")]
+    Invalid,
+    #[error("Paths must be valid unicode")]
+    BadEncoding,
     #[error("Unexpected prefix")]
     WrongPrefix,
 }
@@ -214,45 +224,33 @@ mod tests {
 
     #[test]
     fn parse_invalid_paths() -> anyhow::Result<()> {
-        assert!(matches!(Path::parse(""), Err(PathError::InvalidPath),));
-        assert!(matches!(Path::parse("/"), Err(PathError::InvalidPath),));
-        assert!(matches!(Path::parse("/foo"), Err(PathError::InvalidPath),));
-        assert!(matches!(Path::parse("foo/"), Err(PathError::InvalidPath),));
-        assert!(matches!(
-            Path::parse("foo//bar"),
-            Err(PathError::InvalidPath),
-        ));
-        assert!(matches!(Path::parse("c:foo"), Err(PathError::InvalidPath),));
-        assert!(matches!(Path::parse("c:/foo"), Err(PathError::InvalidPath),));
-        assert!(matches!(
-            Path::parse("foo/../bar"),
-            Err(PathError::InvalidPath),
-        ));
-        assert!(matches!(
-            Path::parse("foo/./bar"),
-            Err(PathError::InvalidPath),
-        ));
+        assert!(matches!(Path::parse("/"), Err(PathError::Invalid),));
+        assert!(matches!(Path::parse("/foo"), Err(PathError::Invalid),));
+        assert!(matches!(Path::parse("foo/"), Err(PathError::Invalid),));
+        assert!(matches!(Path::parse("foo//bar"), Err(PathError::Invalid),));
+        assert!(matches!(Path::parse("foo/../bar"), Err(PathError::Invalid),));
+        assert!(matches!(Path::parse("foo/./bar"), Err(PathError::Invalid),));
 
         Ok(())
     }
 
     #[test]
     fn from_real_path_valid() -> anyhow::Result<()> {
-        assert_eq!(None, Path::from_real_path(path::Path::new(""))?);
+        assert_eq!(Path::root(), Path::from_real_path(path::Path::new(""))?);
         assert_eq!(
-            Some(Path::parse("foobar")?),
+            Path::parse("foobar")?,
             Path::from_real_path(path::Path::new("foobar"))?
         );
         assert_eq!(
-            Some(Path::parse("foo/bar")?),
+            Path::parse("foo/bar")?,
             Path::from_real_path(path::Path::new("foo/bar"))?
         );
         assert_eq!(
-            Some(Path::parse(".foo/.bar.txt")?),
+            Path::parse(".foo/.bar.txt")?,
             Path::from_real_path(path::Path::new(".foo/.bar.txt"))?
         );
         assert_eq!(
-            Some(Path::parse("a/b/c/d")?),
+            Path::parse("a/b/c/d")?,
             Path::from_real_path(path::Path::new("a/b/c/d"))?
         );
 
@@ -263,24 +261,24 @@ mod tests {
     fn from_real_path_invalid() -> anyhow::Result<()> {
         assert!(matches!(
             Path::from_real_path(path::Path::new("foo/./bar")),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new("/foo")),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new("//foo")),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
 
         assert!(matches!(
             Path::from_real_path(path::Path::new(OsStr::from_bytes(&[
                 0x66, 0x6f, 0x80, 0x6f
             ]))),
-            Err(PathError::InvalidPath),
+            Err(PathError::BadEncoding),
         ));
 
         Ok(())
@@ -289,11 +287,11 @@ mod tests {
     #[test]
     fn from_real_path_in() -> anyhow::Result<()> {
         assert_eq!(
-            None,
+            Path::root(),
             Path::from_real_path_in(path::Path::new("/foo"), path::Path::new("/foo"))?
         );
         assert_eq!(
-            Some(Path::parse("bar/baz")?),
+            Path::parse("bar/baz")?,
             Path::from_real_path_in(path::Path::new("/foo/bar/baz"), path::Path::new("/foo"))?
         );
         assert!(matches!(
@@ -302,7 +300,7 @@ mod tests {
         ));
         assert!(matches!(
             Path::from_real_path_in(path::Path::new("/foo/bar/../baz"), path::Path::new("/foo")),
-            Err(PathError::InvalidPath)
+            Err(PathError::Invalid)
         ));
 
         Ok(())
@@ -312,6 +310,7 @@ mod tests {
     fn name() -> anyhow::Result<()> {
         assert_eq!("foobar", Path::parse("foobar")?.name());
         assert_eq!("bar", Path::parse("foo/bar")?.name());
+        assert_eq!("", Path::root().name());
 
         Ok(())
     }
@@ -335,7 +334,8 @@ mod tests {
         );
         assert_eq!(Some(Path::parse("a/b")?), Path::parse("a/b/c")?.parent());
         assert_eq!(Some(Path::parse("a")?), Path::parse("a/b")?.parent());
-        assert_eq!(None, Path::parse("a")?.parent());
+        assert_eq!(Some(Path::root()), Path::parse("a")?.parent());
+        assert_eq!(None, Path::root().parent());
 
         Ok(())
     }
@@ -343,21 +343,29 @@ mod tests {
     #[test]
     fn components() -> anyhow::Result<()> {
         assert_eq!(
-            Path::components(Some(&Path::parse("a/b/c")?)).collect::<Vec<_>>(),
+            Path::parse("a/b/c")?.components().collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
         assert_eq!(
-            Path::components(Path::parse("a/b/c")?.parent().as_ref()).collect::<Vec<_>>(),
+            Path::parse("a/b/c")?
+                .parent()
+                .unwrap()
+                .components()
+                .collect::<Vec<_>>(),
             vec!["a", "b"]
         );
 
         assert_eq!(
-            Path::components(Some(&Path::parse("file")?)).collect::<Vec<_>>(),
+            Path::parse("file")?.components().collect::<Vec<_>>(),
             vec!["file"]
         );
 
         assert_eq!(
-            Path::components(Path::parse("file")?.parent().as_ref()).collect::<Vec<_>>(),
+            Path::parse("file")?
+                .parent()
+                .unwrap()
+                .components()
+                .collect::<Vec<&str>>(),
             Vec::<&str>::new()
         );
 
@@ -380,6 +388,10 @@ mod tests {
         assert_eq!(
             path::Path::new("/tmp/foo/bar"),
             Path::parse("foo/bar")?.within(path::Path::new("/tmp"))
+        );
+        assert_eq!(
+            path::Path::new("/tmp"),
+            Path::root().within(path::Path::new("/tmp"))
         );
 
         Ok(())
@@ -419,15 +431,15 @@ mod tests {
         );
         assert!(matches!(
             Path::parse("foo")?.join("/bar"),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
         assert!(matches!(
             Path::parse("foo")?.join("bar//baz"),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
         assert!(matches!(
             Path::parse("foo/bar")?.join("../baz"),
-            Err(PathError::InvalidPath),
+            Err(PathError::Invalid),
         ));
 
         Ok(())
