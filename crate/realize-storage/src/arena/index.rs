@@ -30,26 +30,26 @@ pub(crate) fn indexed_file_path<'b, L: Into<TreeLoc<'b>>>(
 ) -> Result<Option<std::path::PathBuf>, StorageError> {
     let loc = loc.into();
     let entry = cache.indexed(tree, loc.borrow())?;
-    if let Some(path) = tree.backtrack(loc)? {
-        let file_path = path.within(cache.datadir());
-        match hash {
-            Some(hash) => {
-                if let Some(entry) = entry
-                    && entry.hash == *hash
-                    && entry.matches_file(&file_path)
-                {
-                    return Ok(Some(file_path));
-                }
+    let path = tree.backtrack(loc)?;
+    let realpath = path.within(cache.datadir());
+    match hash {
+        Some(hash) => {
+            if let Some(entry) = entry
+                && entry.hash == *hash
+                && entry.matches_file(&realpath)
+            {
+                return Ok(Some(realpath));
             }
-            None => {
-                if entry.is_none()
-                    && fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).is_err()
-                {
-                    return Ok(Some(file_path));
-                }
+        }
+        None => {
+            if entry.is_none()
+                && fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).is_err()
+            {
+                return Ok(Some(realpath));
             }
         }
     }
+
     Ok(None)
 }
 
@@ -78,15 +78,17 @@ pub(crate) fn branch<'b, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'b>>>(
     if cache.metadata(tree, dest.borrow())?.is_some() {
         return Err(StorageError::AlreadyExists);
     }
-    let dest_path = match tree.backtrack(dest.borrow())? {
-        Some(p) => p,
-        None => return Ok(false),
-    };
+    let dest_path = tree.backtrack(dest.borrow())?;
+    if dest_path.is_root() {
+        return Ok(false);
+    }
+
     let dest_realpath = dest_path.within(cache.datadir());
-    let source_path = match tree.backtrack(source.borrow())? {
-        Some(p) => p,
-        None => return Ok(false),
-    };
+    let source_path = tree.backtrack(source.borrow())?;
+    if dest_path.is_root() {
+        return Ok(false);
+    }
+
     let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source)?
         && indexed.hash == *hash
@@ -143,14 +145,14 @@ pub(crate) fn rename<'b, 'c, L1: Into<TreeLoc<'b>>, L2: Into<TreeLoc<'c>>>(
     if cache.metadata(tree, dest.borrow())?.is_some() {
         return Err(StorageError::AlreadyExists);
     }
-    let dest_path = match tree.backtrack(dest.borrow())? {
-        Some(p) => p,
-        None => return Ok(false),
+    let dest_path = tree.backtrack(dest.borrow())?;
+    if dest_path.is_root() {
+        return Ok(false);
     };
     let dest_realpath = dest_path.within(cache.datadir());
-    let source_path = match tree.backtrack(source.borrow())? {
-        Some(p) => p,
-        None => return Ok(false),
+    let source_path = tree.backtrack(source.borrow())?;
+    if source_path.is_root() {
+        return Ok(false);
     };
     let source_realpath = source_path.within(cache.datadir());
     if let Some(indexed) = cache.indexed(tree, source.borrow())?
@@ -396,10 +398,9 @@ fn all_files(
     let tree = txn.read_tree()?;
     for entry in cache.all_indexed() {
         let (pathid, indexed) = entry?;
-        if let Some(path) = tree.backtrack(pathid)? {
-            if let Err(_) = tx.blocking_send((path, indexed)) {
-                break;
-            }
+        let path = tree.backtrack(pathid)?;
+        if let Err(_) = tx.blocking_send((path, indexed)) {
+            break;
         }
     }
 

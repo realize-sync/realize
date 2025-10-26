@@ -490,7 +490,7 @@ impl<'a> WritableOpenCache<'a> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
         let e = default_file_entry_or_err(&self.table, pathid)?;
-        let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+        let path = tree.backtrack(loc)?;
         log::debug!(
             "[{}]@local Local removal of \"{}\" pathid {pathid} {:?}",
             self.tag,
@@ -551,10 +551,16 @@ impl<'a> WritableOpenCache<'a> {
         let source = source.into();
         let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
+        if source_pathid == tree.root() {
+            return Err(StorageError::PermissionDenied);
+        }
         let dest_pathid; // delay calling tree.setup until source is checked
         match default_entry(&self.table, source_pathid)?.ok_or(StorageError::NotFound)? {
             CacheTableEntry::Dir(dir_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
+                if dest_pathid == tree.root() {
+                    return Err(StorageError::PermissionDenied);
+                }
                 match default_entry(&self.table, dest_pathid)? {
                     None => {}
                     Some(CacheTableEntry::File(_)) => return Err(StorageError::NotADirectory),
@@ -591,9 +597,7 @@ impl<'a> WritableOpenCache<'a> {
                     &mut self.table,
                     (source_pathid, Layer::Default),
                 )?;
-                if let Some(source_path) = tree.backtrack(source_pathid)? {
-                    let _ = std::fs::remove_dir(source_path.within(self.datadir()));
-                }
+                let _ = std::fs::remove_dir(self.local_path(tree, source_pathid)?);
             }
             CacheTableEntry::File(mut source_entry) => {
                 dest_pathid = tree.setup(dest.borrow())?;
@@ -609,8 +613,8 @@ impl<'a> WritableOpenCache<'a> {
                     return Err(StorageError::AlreadyExists);
                 }
 
-                let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
-                let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
+                let source_path = tree.backtrack(source)?;
+                let dest_path = tree.backtrack(dest)?;
                 if source_entry.is_local() {
                     let source_realpath = source_path.within(self.datadir());
                     let dest_realpath = dest_path.within(self.datadir());
@@ -666,13 +670,19 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(PathId, FileMetadata), StorageError> {
         let source = source.into();
         let source_pathid = tree.expect(source.borrow())?;
-        let source_path = tree.backtrack(source)?.ok_or(StorageError::IsADirectory)?;
+        if source_pathid == tree.root() {
+            return Err(StorageError::PermissionDenied);
+        }
+        let source_path = tree.backtrack(source)?;
         let mut source_entry = self.file_at_pathid_or_err(source_pathid)?;
 
         // prepare dest, but only after checking source existence
         let dest = dest.into();
         let dest_pathid = tree.setup(dest.borrow())?;
-        let dest_path = tree.backtrack(dest)?.ok_or(StorageError::IsADirectory)?;
+        if source_pathid == tree.root() {
+            return Err(StorageError::PermissionDenied);
+        }
+        let dest_path = tree.backtrack(dest)?;
         check_parent_is_dir(&self.table, tree, dest_pathid)?;
         if default_entry(&self.table, dest_pathid)?.is_some() {
             return Err(StorageError::AlreadyExists);
@@ -1184,16 +1194,16 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<PathId, StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
-        if let Some(path) = tree.backtrack(loc.borrow())? {
-            let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
-            let entry = IndexedFile { hash, mtime, size };
-            let realpath = path.within(self.datadir());
-            if !entry.matches_file(&realpath) {
-                return Err(StorageError::LocalFileMismatch);
-            }
-            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry.into_file())?;
-            history.report_added(&path, old_version.as_ref())?;
+        let path = tree.backtrack(loc.borrow())?;
+        let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
+        let entry = IndexedFile { hash, mtime, size };
+        let realpath = path.within(self.datadir());
+        if !entry.matches_file(&realpath) {
+            return Err(StorageError::LocalFileMismatch);
         }
+        self.write_default_file_entry(tree, blobs, dirty, pathid, &entry.into_file())?;
+        history.report_added(&path, old_version.as_ref())?;
+
         Ok(pathid)
     }
 
@@ -1213,7 +1223,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(PathBuf, PathBuf), StorageError> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
-        let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+        let path = tree.backtrack(loc)?;
         // Note that entry.path is not usable here as it would be
         // incorrect in a branched entry.
 
@@ -1261,9 +1271,7 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(PathBuf, PathBuf), StorageError> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
-        let path = tree
-            .backtrack(loc.borrow())?
-            .ok_or(StorageError::IsADirectory)?;
+        let path = tree.backtrack(loc.borrow())?;
         let source = path.within(self.datadir());
         let metadata = source.symlink_metadata()?;
 
@@ -1315,9 +1323,7 @@ impl<'a> WritableOpenCache<'a> {
             if let Some(entry) = default_file_entry(&self.table, pathid)?
                 && entry.is_local()
             {
-                if let Some(path) = tree.backtrack(loc)? {
-                    history.report_removed(&path, &entry.version)?;
-                }
+                history.report_removed(&tree.backtrack(loc)?, &entry.version)?;
                 self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                 return Ok(true);
             }
@@ -1396,15 +1402,14 @@ impl<'a> WritableOpenCache<'a> {
         // needs to be propagated to other peers currently tracking
         // the original version.
         if original.is_local() {
-            if let Some(path) = tree.backtrack(loc)? {
-                self.cleanup_local_file(tree, &path, &original);
+            let path = tree.backtrack(loc)?;
+            self.cleanup_local_file(tree, &path, &original);
 
-                // Report it added (replaced) so other peers are aware
-                // of the user's decision, and then immediately drop
-                // it, since it's not downloadable from this peer.
-                history.report_added(&path, Some(&original.version))?;
-                history.report_dropped(&path, goal)?;
-            }
+            // Report it added (replaced) so other peers are aware
+            // of the user's decision, and then immediately drop
+            // it, since it's not downloadable from this peer.
+            history.report_added(&path, Some(&original.version))?;
+            history.report_dropped(&path, goal)?;
         }
         Ok(())
     }
@@ -1518,11 +1523,7 @@ fn file_realm<'b, L: Into<TreeLoc<'b>>>(
     let loc = loc.into();
     let pathid = tree.expect(loc.borrow())?;
     if default_file_entry_or_err(cache_table, pathid)?.is_local() {
-        return Ok(FileRealm::Local(
-            tree.backtrack(loc)?
-                .ok_or(StorageError::IsADirectory)?
-                .within(datadir),
-        ));
+        return Ok(FileRealm::Local(tree.backtrack(loc)?.within(datadir)));
     }
 
     Ok(FileRealm::Remote(blobs.cache_status(tree, pathid)?))
@@ -1546,15 +1547,14 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
         for entry in find_peer_entry(cache_table, pathid, hash)? {
             let (peer, file_entry) = entry?;
             if avail.is_none() {
-                if let Some(path) = tree.backtrack(pathid)? {
-                    avail = Some(RemoteAvailability {
-                        arena: tree.arena(),
-                        path,
-                        size: file_entry.size,
-                        hash: file_entry.version.expect_indexed()?.clone(),
-                        peers: vec![],
-                    });
-                }
+                let path = tree.backtrack(pathid)?;
+                avail = Some(RemoteAvailability {
+                    arena: tree.arena(),
+                    path,
+                    size: file_entry.size,
+                    hash: file_entry.version.expect_indexed()?.clone(),
+                    peers: vec![],
+                });
             }
             if let Some(avail) = &mut avail {
                 avail.peers.push(peer);
@@ -1595,12 +1595,11 @@ fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
                                 // will be reported from the peer layer
                             }
                             FileEntryKind::Branched(path_id) => {
-                                if let Some(path) = tree.backtrack(path_id)? {
-                                    alternatives.push(FileAlternative::Branched(
-                                        path,
-                                        entry.version.expect_indexed()?.clone(),
-                                    ));
-                                }
+                                let path = tree.backtrack(path_id)?;
+                                alternatives.push(FileAlternative::Branched(
+                                    path,
+                                    entry.version.expect_indexed()?.clone(),
+                                ));
                             }
                         }
                     }
@@ -2037,11 +2036,7 @@ fn local_path<'b, L: Into<TreeLoc<'b>>>(
     tree: &impl TreeReadOperations,
     loc: L,
 ) -> Result<std::path::PathBuf, StorageError> {
-    if let Some(path) = tree.backtrack(loc)? {
-        Ok(path.within(datadir))
-    } else {
-        Ok(datadir.to_path_buf())
-    }
+    Ok(tree.backtrack(loc)?.within(datadir))
 }
 
 #[cfg(test)]
@@ -2270,7 +2265,7 @@ mod tests {
 
             Ok(pathids
                 .into_iter()
-                .filter_map(|i| tree.backtrack(i).ok().flatten())
+                .filter_map(|i| tree.backtrack(i).ok())
                 .collect())
         }
 
@@ -2357,7 +2352,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(dirty_pathids(dirty)?
             .into_iter()
-            .filter_map(|i| tree.backtrack(i).ok().flatten())
+            .filter_map(|i| tree.backtrack(i).ok())
             .collect())
     }
 

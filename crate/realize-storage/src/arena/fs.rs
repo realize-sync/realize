@@ -242,9 +242,7 @@ impl ArenaFilesystem {
 
             let loc = loc.into().into_tree_loc(&cache)?;
             let pathid = tree.setup(loc.borrow())?;
-            let path = tree
-                .backtrack(loc.borrow())?
-                .ok_or(StorageError::AlreadyExists)?;
+            let path = tree.backtrack(loc.borrow())?;
 
             // Parent must exist in the cache, but might not exist on
             // the filesystem.
@@ -360,7 +358,7 @@ impl ArenaFilesystem {
             pathid = tree.expect(loc.borrow())?;
             let cache = txn.read_cache()?;
             if cache.file_entry_or_err(&tree, pathid)?.is_local() {
-                let path = tree.backtrack(loc)?.ok_or(StorageError::IsADirectory)?;
+                let path = tree.backtrack(loc)?;
                 let realpath = path.within(cache.datadir());
                 return Ok(FileContent::Local(realpath));
             }

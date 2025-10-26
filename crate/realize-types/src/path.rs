@@ -130,6 +130,10 @@ impl Path {
         path.as_ref().join(self.as_real_path())
     }
 
+    pub fn is_root(&self) -> bool {
+        self.str.is_empty()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.str
     }

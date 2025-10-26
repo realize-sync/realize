@@ -309,7 +309,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(dirty_pathids(dirty)?
             .into_iter()
-            .filter_map(|i| tree.backtrack(i).ok().flatten())
+            .filter_map(|i| tree.backtrack(i).ok())
             .collect())
     }
 

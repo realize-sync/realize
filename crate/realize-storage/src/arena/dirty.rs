@@ -468,7 +468,7 @@ mod tests {
     ) -> Result<HashSet<Path>, StorageError> {
         Ok(all(dirty)?
             .into_iter()
-            .filter_map(|(pathid, _)| tree.backtrack(pathid).ok().flatten())
+            .filter_map(|(pathid, _)| tree.backtrack(pathid).ok())
             .collect())
     }
 

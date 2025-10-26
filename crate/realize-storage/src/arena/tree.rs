@@ -267,8 +267,8 @@ pub(crate) trait TreeExt {
 
     /// Follow the pathids back up to the root and build a path.
     ///
-    /// Returns None if the location points to the arena root.
-    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError>;
+    /// Returns [Path::root] if the location points to the arena root.
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError>;
 
     /// Return an iterator that returns the parent of pathid and it
     /// parent until the root.
@@ -322,14 +322,13 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Option<Path>, StorageError> {
+    fn backtrack<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<Path, StorageError> {
         match loc.into() {
-            TreeLoc::PathRef(path) => Ok(Some(path.clone())),
-            TreeLoc::Path(path) => Ok(Some(path)),
-            TreeLoc::PathIdAndName(pathid, name) => match self.backtrack(pathid)? {
-                None => Ok(Some(Path::parse(name)?)),
-                Some(path) => Ok(Some(Path::parse(&format!("{}/{}", path, name))?)),
-            },
+            TreeLoc::PathRef(path) => Ok(path.clone()),
+            TreeLoc::Path(path) => Ok(path),
+            TreeLoc::PathIdAndName(pathid, name) => {
+                Ok(self.backtrack(pathid)?.join(name.as_ref())?)
+            }
             TreeLoc::PathId(pathid) => {
                 let mut components = VecDeque::new();
                 let mut current = pathid;
@@ -347,10 +346,10 @@ impl<T: TreeReadOperations> TreeExt for T {
                     return Err(StorageError::NotFound);
                 }
                 if components.is_empty() {
-                    return Ok(None);
+                    return Ok(Path::root());
                 }
 
-                Ok(Some(Path::parse(components.make_contiguous().join("/"))?))
+                Ok(Path::parse(components.make_contiguous().join("/"))?)
             }
         }
     }
@@ -1091,12 +1090,10 @@ mod tests {
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
         let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
 
-        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?.unwrap());
-        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?.unwrap());
-        assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?.unwrap());
-
-        // Root cannot be turned into a path, as empty paths are invalid.
-        assert!(tree.backtrack(tree.root())?.is_none());
+        assert_eq!(Path::parse("foo/bar/baz")?, tree.backtrack(baz)?);
+        assert_eq!(Path::parse("foo/bar")?, tree.backtrack(bar)?);
+        assert_eq!(Path::parse("foo")?, tree.backtrack(foo)?);
+        assert_eq!(Path::root(), tree.backtrack(tree.root())?);
 
         // Invalid pathids are reported as NotFound
         assert!(matches!(

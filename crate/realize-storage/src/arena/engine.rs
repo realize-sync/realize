@@ -505,9 +505,8 @@ impl Engine {
             return Ok(Some(StorageJob::UnprotectBlob(pathid)));
         }
         if let Some(hash) = should_download {
-            if let Some(path) = tree.backtrack(pathid)? {
-                return Ok(Some(StorageJob::External(Job::Download(path, hash))));
-            }
+            let path = tree.backtrack(pathid)?;
+            return Ok(Some(StorageJob::External(Job::Download(path, hash))));
         }
         if let Some(hash) = should_realize {
             return Ok(Some(StorageJob::Realize { pathid, hash }));
