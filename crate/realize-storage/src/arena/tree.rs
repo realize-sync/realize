@@ -258,17 +258,12 @@ pub(crate) trait TreeExt {
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_>;
 
     /// Goes through whole tree, starting at pathid and return it as an
-    /// iterator (depth-first).
+    /// iterator of pathids (depth-first).
     ///
     /// Only enters the nodes for which `enter` returns true.
-    fn recurse<'a, L, F>(
-        &self,
-        loc: L,
-        enter: F,
-    ) -> impl Iterator<Item = Result<PathId, StorageError>>
+    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
-        L: Into<TreeLoc<'a>>,
-        F: FnMut(PathId) -> bool;
+        L: Into<TreeLoc<'a>>;
 
     /// Follow the pathids back up to the root and build a path.
     ///
@@ -317,18 +312,12 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn recurse<'a, L, F>(
-        &self,
-        loc: L,
-        enter: F,
-    ) -> impl Iterator<Item = Result<PathId, StorageError>>
+    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
         L: Into<TreeLoc<'a>>,
-        F: FnMut(PathId) -> bool,
     {
         RecurseIterator {
             tree: self,
-            enter,
             stack: VecDeque::from([self.readdir(loc)]),
         }
     }
@@ -405,20 +394,17 @@ where
 }
 
 /// Implements [TreeExt::recurse].
-struct RecurseIterator<'a, T, F>
+struct RecurseIterator<'a, T>
 where
     T: TreeReadOperations,
-    F: FnMut(PathId) -> bool,
 {
     tree: &'a T,
-    enter: F,
     stack: VecDeque<ReadDirIterator<'a>>,
 }
 
-impl<'a, T, F> Iterator for RecurseIterator<'a, T, F>
+impl<'a, T> Iterator for RecurseIterator<'a, T>
 where
     T: TreeReadOperations,
-    F: FnMut(PathId) -> bool,
 {
     type Item = Result<PathId, StorageError>;
 
@@ -430,9 +416,7 @@ where
                         return Some(Err(err));
                     }
                     Ok((_, pathid)) => {
-                        if (self.enter)(pathid) {
-                            self.stack.push_back(self.tree.readdir_pathid(pathid));
-                        }
+                        self.stack.push_back(self.tree.readdir_pathid(pathid));
                         return Some(Ok(pathid));
                     }
                 }
@@ -1354,53 +1338,8 @@ mod tests {
 
         assert_eq!(
             vec![bar, baz, qux, corge, graply, grault, quux, waldo, fred],
-            tree.recurse(foo, |_| true).collect::<Result<Vec<_>, _>>()?
+            tree.recurse(foo).collect::<Result<Vec<_>, _>>()?
         );
-
-        // don't enter corge or baz
-        assert_eq!(
-            vec![bar, baz, corge, quux, waldo, fred],
-            tree.recurse(foo, |pathid| pathid != baz && pathid != corge)
-                .collect::<Result<Vec<_>, _>>()?
-        );
-
-        // don't enter anything; list foo's children
-        assert_eq!(
-            vec![bar, fred],
-            tree.recurse(foo, |_| false)
-                .collect::<Result<Vec<_>, _>>()?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn recurse_path() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let txn = fixture.db.begin_write()?;
-        let mut tree = txn.write_tree()?;
-
-        let bar = tree.setup(Path::parse("foo/bar")?)?;
-        let baz = tree.setup(Path::parse("foo/bar/baz")?)?;
-        let qux = tree.setup(Path::parse("foo/bar/baz/qux")?)?;
-
-        assert_eq!(
-            vec![bar, baz, qux],
-            tree.recurse(Path::parse("foo")?, |_| true)
-                .collect::<Result<Vec<_>, _>>()?
-        );
-
-        assert_eq!(
-            vec![baz, qux],
-            tree.recurse(Path::parse("foo/bar")?, |_| true)
-                .collect::<Result<Vec<_>, _>>()?
-        );
-
-        assert!(matches!(
-            tree.recurse(Path::parse("doesnotexist")?, |_| true)
-                .collect::<Result<Vec<_>, _>>(),
-            Err(StorageError::NotFound)
-        ));
 
         Ok(())
     }

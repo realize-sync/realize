@@ -281,7 +281,7 @@ impl<'a> WritableOpenDirty<'a> {
             if start != tree.root() {
                 self.mark_dirty(start, reason)?;
             }
-            for pathid in tree.recurse(start, |_| true) {
+            for pathid in tree.recurse(start) {
                 self.mark_dirty(pathid?, reason)?;
             }
         }
