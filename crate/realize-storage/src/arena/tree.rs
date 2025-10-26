@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::db::BeforeCommit;
 use crate::PathIdAllocator;
 use crate::arena::db::Tag;
@@ -66,7 +64,6 @@ pub(crate) struct ReadableOpenTree<T>
 where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
-    tag: Tag,
     table: T,
     root: PathId,
     arena: Arena,
@@ -76,9 +73,8 @@ impl<T> ReadableOpenTree<T>
 where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
-    pub(crate) fn new(tag: Tag, table: T, tree: &Tree) -> Self {
+    pub(crate) fn new(table: T, tree: &Tree) -> Self {
         Self {
-            tag,
             table,
             root: tree.root,
             arena: tree.arena,
@@ -99,9 +95,6 @@ pub(crate) trait TreeReadOperations {
     /// List names under the given pathid.
     fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_>;
 
-    /// Check whether the given pathid exists
-    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError>;
-
     /// Return the parent of the given pathid, or None if not found.
     ///
     /// The parent of the root pathid is None. All other existing pathids
@@ -119,9 +112,6 @@ pub(crate) trait TreeReadOperations {
 
     /// Returns the arena this tree belongs to.
     fn arena(&self) -> Arena;
-
-    /// Return the database tag, for logging.
-    fn tag(&self) -> Tag;
 }
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
@@ -137,9 +127,6 @@ where
     fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
         readdir(&self.table, pathid)
     }
-    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError> {
-        exists(&self.table, self.root, pathid)
-    }
     fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
     }
@@ -153,9 +140,6 @@ where
     fn arena(&self) -> Arena {
         self.arena
     }
-    fn tag(&self) -> Tag {
-        self.tag
-    }
 }
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
@@ -167,9 +151,6 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     }
     fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
         readdir(&self.table, pathid)
-    }
-    fn pathid_exists(&self, pathid: PathId) -> Result<bool, StorageError> {
-        exists(&self.table, self.tree.root, pathid)
     }
     fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
@@ -183,9 +164,6 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     }
     fn arena(&self) -> Arena {
         self.tree.arena
-    }
-    fn tag(&self) -> Tag {
-        self.tag
     }
 }
 
@@ -276,23 +254,13 @@ pub(crate) trait TreeExt {
     /// path - which might just be the root if nothing matches.
     fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, path: L) -> Result<PathId, StorageError>;
 
-    /// Lookup a specific entry in the given directory.
-    fn lookup<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-        name: &str,
-    ) -> Result<Option<PathId>, StorageError>;
-
     /// Read the content of the given directory.
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_>;
-
-    /// Checks whether a given location exists in the tree.
-    fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError>;
 
     /// Goes through whole tree, starting at pathid and return it as an
     /// iterator (depth-first).
     ///
-    /// Only enters the node for which `enter` returns true.
+    /// Only enters the nodes for which `enter` returns true.
     fn recurse<'a, L, F>(
         &self,
         loc: L,
@@ -342,28 +310,11 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn lookup<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-        name: &str,
-    ) -> Result<Option<PathId>, StorageError> {
-        self.lookup_pathid(self.expect(loc)?, name)
-    }
-
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_> {
         match self.expect(loc) {
             Err(err) => ReadDirIterator::failed(err),
             Ok(pathid) => self.readdir_pathid(pathid),
         }
-    }
-
-    fn exists<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<bool, StorageError> {
-        Ok(match loc.into() {
-            TreeLoc::PathId(pathid) => self.pathid_exists(pathid)?,
-            TreeLoc::Path(path) => resolve_path(self, &path)?.is_some(),
-            TreeLoc::PathRef(path) => resolve_path(self, path)?.is_some(),
-            TreeLoc::PathIdAndName(pathid, cow) => self.lookup(pathid, cow.as_ref())?.is_some(),
-        })
     }
 
     fn recurse<'a, L, F>(
@@ -591,92 +542,6 @@ impl<'a> WritableOpenTree<'a> {
         Ok(false)
     }
 
-    /// Remove the given pathid and all of its children from the given table.
-    ///
-    /// The entries are removed from `table` if `pred` returns true
-    /// and their reference count is decreased in the tree.
-    ///
-    /// `keygen` generates keys for `table` from an pathid.
-    pub fn remove_recursive_and_decref_checked<'b, 'k, K, V, FK, KB, F, L>(
-        &mut self,
-        start: L,
-        table: &mut Table<'_, K, V>,
-        keygen: FK,
-        mut pred: F,
-    ) -> Result<(), StorageError>
-    where
-        L: Into<TreeLoc<'b>>,
-        K: redb::Key + 'static,
-        V: redb::Value + 'static,
-        FK: Fn(PathId) -> KB,
-        KB: std::borrow::Borrow<K::SelfType<'k>>,
-        F: for<'f> FnMut(PathId, V::SelfType<'f>) -> Result<bool, StorageError>,
-    {
-        let mut decrement = vec![];
-        let start = match self.resolve(start)? {
-            Some(pathid) => pathid,
-            None => {
-                return Ok(());
-            }
-        };
-        for pathid in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
-            let pathid = pathid?;
-            let remove = match table.get((keygen)(pathid))? {
-                None => false,
-                Some(v) => (pred)(pathid, v.value())?,
-            };
-            if remove {
-                if table.remove((keygen)(pathid))?.is_some() {
-                    decrement.push(pathid);
-                }
-            }
-        }
-        for pathid in decrement {
-            self.decref(pathid)?;
-        }
-
-        Ok(())
-    }
-
-    /// Remove the given pathid and all of its children from the given table.
-    ///
-    /// The entries are removed from `table` if `pred` returns true
-    /// and their reference count is decreased in the tree.
-    ///
-    /// `keygen` generates keys for `table` from an pathid.
-    pub fn remove_recursive_and_decref<'b, 'k, K, V, FK, KB, L>(
-        &mut self,
-        start: L,
-        table: &mut Table<'_, K, V>,
-        keygen: FK,
-    ) -> Result<(), StorageError>
-    where
-        L: Into<TreeLoc<'b>>,
-        K: redb::Key + 'static,
-        V: redb::Value + 'static,
-        FK: Fn(PathId) -> KB,
-        KB: std::borrow::Borrow<K::SelfType<'k>>,
-    {
-        let mut decrement = vec![];
-        let start = match self.resolve(start)? {
-            Some(pathid) => pathid,
-            None => {
-                return Ok(());
-            }
-        };
-        for pathid in std::iter::once(Ok(start)).chain(self.recurse(start, |_| true)) {
-            let pathid = pathid?;
-            if table.remove((keygen)(pathid))?.is_some() {
-                decrement.push(pathid);
-            }
-        }
-        for pathid in decrement {
-            self.decref(pathid)?;
-        }
-
-        Ok(())
-    }
-
     /// Get or create a mapping for all parts of the given path.
     ///
     /// A new pathid allocated by this function has a reference count
@@ -881,18 +746,6 @@ fn lookup(
     name: &str,
 ) -> Result<Option<PathId>, StorageError> {
     Ok(tree_table.get((pathid, name))?.map(|v| v.value()))
-}
-
-fn exists(
-    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
-    root_pathid: PathId,
-    pathid: PathId,
-) -> Result<bool, StorageError> {
-    if root_pathid == pathid {
-        return Ok(true);
-    }
-
-    Ok(tree_table.get((pathid, ".."))?.is_some())
 }
 
 fn name_in(
@@ -1271,28 +1124,10 @@ mod tests {
     }
 
     #[test]
-    fn exists() -> anyhow::Result<()> {
-        let fixture = Fixture::setup()?;
-        let txn = fixture.db.begin_write()?;
-        let mut tree = txn.write_tree()?;
-        assert!(tree.pathid_exists(tree.root())?);
-        assert!(!tree.pathid_exists(PathId(999))?);
-
-        let foo = tree.setup(&Path::parse("foo")?)?;
-        let bar = tree.setup(&Path::parse("foo/bar")?)?;
-        assert!(tree.pathid_exists(foo)?);
-        assert!(tree.pathid_exists(bar)?);
-
-        Ok(())
-    }
-
-    #[test]
     fn parent() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.pathid_exists(tree.root())?);
-        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1311,8 +1146,6 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.pathid_exists(tree.root())?);
-        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1339,8 +1172,6 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        assert!(tree.pathid_exists(tree.root())?);
-        assert!(!tree.pathid_exists(PathId(999))?);
 
         let foo = tree.setup(&Path::parse("foo")?)?;
         let bar = tree.setup(&Path::parse("foo/bar")?)?;
@@ -1359,10 +1190,13 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        let bar = tree.setup(&Path::parse("foo/bar")?)?;
-        let foo = tree.lookup_pathid(tree.root(), "foo")?.unwrap();
-        let baz = tree.setup(&Path::parse("foo/bar/baz")?)?;
-        let qux = tree.setup(&Path::parse("foo/qux")?)?;
+        let bar_path = Path::parse("foo/bar")?;
+        let baz_path = Path::parse("foo/bar/baz")?;
+        let qux_path = Path::parse("foo/qux")?;
+        let foo_path = Path::parse("foo")?;
+        let bar = tree.setup(&bar_path)?;
+        let baz = tree.setup(&baz_path)?;
+        let qux = tree.setup(&qux_path)?;
 
         tree.incref(bar)?;
         tree.incref(baz)?;
@@ -1370,22 +1204,23 @@ mod tests {
 
         // decref qux deletes it, but not foo
         tree.decref(qux)?;
-        assert!(tree.pathid_exists(foo)?);
-        assert!(tree.pathid_exists(bar)?);
-        assert!(tree.pathid_exists(baz)?);
-        assert!(!tree.pathid_exists(qux)?);
+        assert!(tree.resolve(&foo_path)?.is_some());
+        assert!(tree.resolve(&bar_path)?.is_some());
+        assert!(tree.resolve(&baz_path)?.is_some());
+        assert!(tree.resolve(&qux_path)?.is_none());
 
         // decref bar does not delete it, because it contains baz
         tree.decref(bar)?;
-        assert!(tree.pathid_exists(foo)?);
-        assert!(tree.pathid_exists(bar)?);
-        assert!(tree.pathid_exists(baz)?);
+        assert!(tree.resolve(&foo_path)?.is_some());
+        assert!(tree.resolve(&bar_path)?.is_some());
+        assert!(tree.resolve(&baz_path)?.is_some());
 
-        // decref baz deletes bar and baz, but not foo
+        // decref baz deletes everything
         tree.decref(baz)?;
-        assert!(!tree.pathid_exists(foo)?);
-        assert!(!tree.pathid_exists(bar)?);
-        assert!(!tree.pathid_exists(baz)?);
+        assert!(tree.resolve(&foo_path)?.is_none());
+        assert!(tree.resolve(&bar_path)?.is_none());
+        assert!(tree.resolve(&baz_path)?.is_none());
+        assert!(tree.resolve(&qux_path)?.is_none());
 
         Ok(())
     }
@@ -1394,16 +1229,20 @@ mod tests {
     fn setup() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let bar: PathId;
-        let foo: PathId;
+        let foo_path = Path::parse("foo")?;
+        let bar_path = Path::parse("foo/bar")?;
+        let qux_path = Path::parse("baz/qux")?;
+        let baz_path = Path::parse("baz")?;
         let qux: PathId;
         let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
-            bar = tree.setup(&Path::parse("foo/bar")?)?;
-            qux = tree.setup(&Path::parse("baz/qux")?)?;
-            foo = tree.lookup(tree.root(), "foo")?.unwrap();
-            baz = tree.lookup(tree.root(), "baz")?.unwrap();
+            let bar = tree.setup(&bar_path)?;
+            qux = tree.setup(&qux_path)?;
+            baz = tree.resolve(&baz_path)?.unwrap();
+
+            assert_eq!(Some(bar), tree.resolve(&bar_path)?);
+            assert_eq!(Some(qux), tree.resolve(&qux_path)?);
 
             // refcount is incremented for qux, but not bar, so foo
             // and bar will be removed before committing the
@@ -1414,11 +1253,10 @@ mod tests {
 
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree()?;
-        assert!(tree.exists(qux)?);
-        assert!(tree.exists(baz)?);
-
-        assert!(!tree.exists(bar)?);
-        assert!(!tree.exists(foo)?);
+        assert_eq!(Some(qux), tree.resolve(&qux_path)?);
+        assert_eq!(Some(baz), tree.resolve(&baz_path)?);
+        assert_eq!(None, tree.resolve(&bar_path)?);
+        assert_eq!(None, tree.resolve(&foo_path)?);
 
         Ok(())
     }
@@ -1427,16 +1265,24 @@ mod tests {
     fn setup_name() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
-        let bar: PathId;
-        let foo: PathId;
+        let qux_path = Path::parse("baz/qux")?;
+        let baz_path = Path::parse("baz")?;
+        let bar_path = Path::parse("foo/bar")?;
+        let foo_path = Path::parse("foo")?;
+
         let qux: PathId;
         let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
-            foo = tree.setup_name(tree.root(), "foo")?;
-            bar = tree.setup_name(foo, "bar")?;
+            let foo = tree.setup_name(tree.root(), "foo")?;
+            let bar = tree.setup_name(foo, "bar")?;
             baz = tree.setup_name(tree.root(), "baz")?;
             qux = tree.setup_name(baz, "qux")?;
+
+            assert_eq!(Some(foo), tree.resolve(&foo_path)?);
+            assert_eq!(Some(bar), tree.resolve(&bar_path)?);
+            assert_eq!(Some(baz), tree.resolve(&baz_path)?);
+            assert_eq!(Some(qux), tree.resolve(&qux_path)?);
 
             // refcount is incremented for qux, but not bar, so foo
             // and bar will be removed before committing the
@@ -1447,11 +1293,12 @@ mod tests {
 
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree()?;
-        assert!(tree.exists(qux)?);
-        assert!(tree.exists(baz)?);
 
-        assert!(!tree.exists(bar)?);
-        assert!(!tree.exists(foo)?);
+        assert_eq!(Some(qux), tree.resolve(qux_path)?);
+        assert_eq!(Some(baz), tree.resolve(baz_path)?);
+
+        assert_eq!(None, tree.resolve(bar_path)?);
+        assert_eq!(None, tree.resolve(foo_path)?);
 
         Ok(())
     }
@@ -1461,8 +1308,10 @@ mod tests {
         let fixture = Fixture::setup()?;
         let txn = fixture.db.begin_write()?;
         let mut tree = txn.write_tree()?;
-        let baz = tree.setup(Path::parse("foo/bar/baz")?)?;
-        let bar = tree.expect(Path::parse("foo/bar")?)?;
+        let baz_path = Path::parse("foo/bar/baz")?;
+        let bar_path = Path::parse("foo/bar")?;
+        let baz = tree.setup(&baz_path)?;
+        let bar = tree.resolve(&bar_path)?.unwrap();
 
         tree.incref(baz)?;
         tree.incref(bar)?;
@@ -1471,16 +1320,16 @@ mod tests {
 
         // decref baz deletes baz, but not bar
         tree.decref(baz)?;
-        assert!(tree.pathid_exists(bar)?);
-        assert!(!tree.pathid_exists(baz)?);
+        assert!(tree.resolve(&bar_path)?.is_some());
+        assert!(tree.resolve(&baz_path)?.is_none());
 
         // now that baz is gone, it still takes 3 decref to delete bar
         tree.decref(bar)?;
-        assert!(tree.pathid_exists(bar)?);
+        assert!(tree.resolve(&bar_path)?.is_some());
         tree.decref(bar)?;
-        assert!(tree.pathid_exists(bar)?);
+        assert!(tree.resolve(&bar_path)?.is_some());
         tree.decref(bar)?;
-        assert!(!tree.pathid_exists(bar)?);
+        assert!(tree.resolve(&bar_path)?.is_none());
 
         Ok(())
     }

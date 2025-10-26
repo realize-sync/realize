@@ -2402,10 +2402,13 @@ mod tests {
     #[tokio::test]
     async fn add_and_remove_mirrored_in_tree() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arena(test_arena())?;
-        let file_path = Path::parse("a/b/c.txt")?;
         let mtime = test_time();
 
-        fixture.add_to_cache(&file_path, 100, mtime)?;
+        let a_path = Path::parse("a")?;
+        let b_path = Path::parse("a/b")?;
+        let c_path = Path::parse("a/b/c.txt")?;
+
+        fixture.add_to_cache(&c_path, 100, mtime)?;
 
         let a: PathId;
         let b: PathId;
@@ -2416,40 +2419,36 @@ mod tests {
             let cache = txn.read_cache()?;
             assert_eq!(fixture.db.tree().root(), tree.root());
 
-            a = tree.resolve(Path::parse("a")?)?.unwrap();
-            b = tree.resolve(Path::parse("a/b")?)?.unwrap();
-            c = tree.resolve(Path::parse("a/b/c.txt")?)?.unwrap();
+            a = tree.resolve(&a_path)?.unwrap();
+            b = tree.resolve(&b_path)?.unwrap();
+            c = tree.resolve(&c_path)?.unwrap();
+            log::debug!("a:{a}, b:{b}, c:{c}");
+
+            assert!(tree.resolve(&a_path)?.is_some());
+            assert!(tree.resolve(&b_path)?.is_some());
+            assert!(tree.resolve(&c_path)?.is_some());
 
             assert!(cache.metadata(&tree, b)?.is_some());
             assert!(cache.metadata(&tree, a)?.is_some());
             assert!(cache.metadata(&tree, c)?.is_some());
-
-            assert!(tree.pathid_exists(a)?);
-            assert!(tree.pathid_exists(b)?);
-            assert!(tree.pathid_exists(c)?);
-
-            assert_eq!(Some(a), tree.lookup_pathid(tree.root(), "a")?);
-            assert_eq!(Some(b), tree.lookup_pathid(a, "b")?);
-            assert_eq!(Some(c), tree.lookup_pathid(b, "c.txt")?);
         }
 
-        fixture.remove_from_cache(&file_path)?;
+        fixture.remove_from_cache(&c_path)?;
 
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
 
-            assert!(cache.metadata(&tree, &file_path)?.is_none());
+            assert!(cache.metadata(&tree, &c_path)?.is_none());
 
             // The file is gone from tree, since this was the only
             // reference to it.
-            assert!(!tree.pathid_exists(c)?);
-            assert_eq!(None, tree.lookup_pathid(b, "c.txt")?);
+            assert_eq!(None, tree.resolve(&c_path)?);
 
             // The directories were cleaned up.
-            assert!(!tree.pathid_exists(a)?);
-            assert!(!tree.pathid_exists(b)?);
+            assert_eq!(None, tree.resolve(&a_path)?);
+            assert_eq!(None, tree.resolve(&b_path)?);
         }
         Ok(())
     }
@@ -4499,7 +4498,7 @@ mod tests {
 
         // Create directory
         let (pathid, _) = cache.mkdir(&mut tree, &dir_path)?;
-        assert!(tree.pathid_exists(pathid)?);
+        assert_eq!(tree.resolve(&dir_path)?, Some(pathid));
 
         // Remove directory
         cache.rmdir(&mut tree, &dir_path)?;
@@ -4600,7 +4599,7 @@ mod tests {
         assert!(matches!(result, Err(StorageError::NotADirectory)));
 
         // Verify file still exists
-        assert!(tree.pathid_exists(file_pathid)?);
+        assert_eq!(Some(file_pathid), tree.resolve(&file_path)?);
 
         Ok(())
     }
@@ -4635,6 +4634,9 @@ mod tests {
         let (parent_pathid, _) = cache.mkdir(&mut tree, &parent_path)?;
         let (child_pathid, _) = cache.mkdir(&mut tree, &child_path)?;
 
+        assert_eq!(Some(parent_pathid), tree.resolve(&parent_path)?);
+        assert_eq!(Some(child_pathid), tree.resolve(&child_path)?);
+
         // Get parent mtime before removal
         let parent_mtime_before = cache.dir_mtime(&tree, parent_pathid)?;
 
@@ -4646,7 +4648,7 @@ mod tests {
         assert!(parent_mtime_after >= parent_mtime_before);
 
         // Verify child is gone
-        assert!(!tree.pathid_exists(child_pathid)?);
+        assert_eq!(None, tree.resolve(&child_path)?);
 
         Ok(())
     }

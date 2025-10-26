@@ -329,7 +329,6 @@ impl ArenaDatabase {
     pub fn begin_read(&self) -> Result<ArenaReadTransaction<'_>, StorageError> {
         Ok(ArenaReadTransaction {
             inner: self.db.begin_read()?,
-            tag: self.tag,
             subsystems: &self.subsystems,
         })
     }
@@ -442,7 +441,6 @@ impl<'db> ArenaWriteTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
-            self.tag,
             self.inner
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
@@ -561,7 +559,6 @@ impl<'db> ArenaWriteTransaction<'db> {
 
 pub struct ArenaReadTransaction<'db> {
     inner: redb::ReadTransaction,
-    tag: Tag,
     subsystems: &'db Subsystems,
 }
 
@@ -570,7 +567,6 @@ impl<'db> ArenaReadTransaction<'db> {
     #[track_caller]
     pub(crate) fn read_tree(&self) -> Result<impl TreeReadOperations, StorageError> {
         Ok(ReadableOpenTree::new(
-            self.tag,
             self.inner
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
