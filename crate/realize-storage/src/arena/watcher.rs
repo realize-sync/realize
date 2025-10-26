@@ -248,7 +248,8 @@ impl FsEvent {
             EventKind::Modify(ModifyKind::Name(_)) => Some(FsEvent::Moved(
                 ev.paths
                     .into_iter()
-                    .flat_map(|p| Path::from_real_path_in(&p, root))
+                    .flat_map(|p| Path::from_real_path_in(&p, root).ok())
+                    .flat_map(|p| p)
                     .filter(|p| !p.matches_any(exclude))
                     .collect(),
             )),
@@ -270,7 +271,7 @@ impl FsEvent {
 }
 
 fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Option<Path> {
-    if let Some(p) = Path::from_real_path_in(&ev.paths.pop()?, root)
+    if let Ok(Some(p)) = Path::from_real_path_in(&ev.paths.pop()?, root)
         && !p.matches_any(exclude)
     {
         return Some(p);
@@ -732,6 +733,8 @@ impl RealWatcherWorker {
     {
         let path = path.as_ref();
         realize_types::Path::from_real_path_in(&path, &self.db.cache().datadir())
+            .ok()
+            .flatten()
     }
 }
 

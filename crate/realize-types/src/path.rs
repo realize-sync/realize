@@ -1,4 +1,4 @@
-use std::path::{self};
+use std::path::{self, StripPrefixError};
 
 /// A path within an Arena.
 ///
@@ -35,9 +35,11 @@ impl Path {
     ///
     /// Not all real paths can be transformed. They must be relative,
     /// non-empty paths containing only valid unicode strings.
-    pub fn from_real_path<T: AsRef<path::Path>>(path: T) -> Result<Path, PathError> {
+    pub fn from_real_path<T: AsRef<path::Path>>(path: T) -> Result<Option<Path>, PathError> {
         let path = path.as_ref();
+        let mut empty = true;
         for component in path.components() {
+            empty = false;
             match component {
                 std::path::Component::Normal(_) => {}
                 _ => {
@@ -45,23 +47,24 @@ impl Path {
                 }
             }
         }
-
-        Path::parse(path.to_str().ok_or(PathError::InvalidPath)?)
+        if empty {
+            Ok(None)
+        } else {
+            Ok(Some(Path::parse(
+                path.to_str().ok_or(PathError::InvalidPath)?,
+            )?))
+        }
     }
 
     /// Build a path from the given path, relative to the given root.
     ///
     /// For this to work, the given path must be inside the given root.
-    pub fn from_real_path_in<T, U>(path: T, root: U) -> Option<Path>
+    pub fn from_real_path_in<T, U>(path: T, root: U) -> Result<Option<Path>, PathError>
     where
         T: AsRef<path::Path>,
         U: AsRef<path::Path>,
     {
-        path.as_ref()
-            .strip_prefix(root.as_ref())
-            .ok()
-            .map(|p| Path::from_real_path(p).ok())
-            .flatten()
+        Path::from_real_path(path.as_ref().strip_prefix(root.as_ref())?)
     }
 
     /// The name part of the path, without any parent element.
@@ -176,8 +179,21 @@ impl std::fmt::Display for Path {
 /// Errors returned by Path functions
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    #[error("Invalid path. Paths must be valid unicode and not contain ., .. or :")]
+    #[error("Paths must be valid unicode and not contain ., .. or :")]
     InvalidPath,
+    #[error("Unexpected prefix")]
+    WrongPrefix,
+}
+
+impl From<StripPrefixError> for PathError {
+    fn from(_: StripPrefixError) -> Self {
+        PathError::WrongPrefix
+    }
+}
+impl From<&StripPrefixError> for PathError {
+    fn from(_: &StripPrefixError) -> Self {
+        PathError::WrongPrefix
+    }
 }
 
 #[cfg(test)]
@@ -222,20 +238,21 @@ mod tests {
 
     #[test]
     fn from_real_path_valid() -> anyhow::Result<()> {
+        assert_eq!(None, Path::from_real_path(path::Path::new(""))?);
         assert_eq!(
-            Path::parse("foobar")?,
+            Some(Path::parse("foobar")?),
             Path::from_real_path(path::Path::new("foobar"))?
         );
         assert_eq!(
-            Path::parse("foo/bar")?,
+            Some(Path::parse("foo/bar")?),
             Path::from_real_path(path::Path::new("foo/bar"))?
         );
         assert_eq!(
-            Path::parse(".foo/.bar.txt")?,
+            Some(Path::parse(".foo/.bar.txt")?),
             Path::from_real_path(path::Path::new(".foo/.bar.txt"))?
         );
         assert_eq!(
-            Path::parse("a/b/c/d")?,
+            Some(Path::parse("a/b/c/d")?),
             Path::from_real_path(path::Path::new("a/b/c/d"))?
         );
 
@@ -264,6 +281,28 @@ mod tests {
                 0x66, 0x6f, 0x80, 0x6f
             ]))),
             Err(PathError::InvalidPath),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn from_real_path_in() -> anyhow::Result<()> {
+        assert_eq!(
+            None,
+            Path::from_real_path_in(path::Path::new("/foo"), path::Path::new("/foo"))?
+        );
+        assert_eq!(
+            Some(Path::parse("bar/baz")?),
+            Path::from_real_path_in(path::Path::new("/foo/bar/baz"), path::Path::new("/foo"))?
+        );
+        assert!(matches!(
+            Path::from_real_path_in(path::Path::new("/notfoo"), path::Path::new("/foo")),
+            Err(PathError::WrongPrefix)
+        ));
+        assert!(matches!(
+            Path::from_real_path_in(path::Path::new("/foo/bar/../baz"), path::Path::new("/foo")),
+            Err(PathError::InvalidPath)
         ));
 
         Ok(())
