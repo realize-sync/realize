@@ -1462,6 +1462,27 @@ impl From<&FileTableEntry> for Option<IndexedFile> {
     }
 }
 
+/// Status of a entry in the cache.
+#[derive(Debug)]
+pub(crate) enum CacheEntryStatus {
+    /// There are no such entry.
+    Missing,
+
+    /// The entry is a preindexed file
+    Preindexed,
+
+    /// The entry is an indexed file with the given mtime and size.
+    Indexed { mtime: UnixTime, size: u64 },
+
+    /// The entry is a remote file.
+    Remote,
+
+    /// The entry is a directory.
+    ///
+    /// If local is true, the directory is known to exist locally.
+    Dir { local: bool },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,7 @@ use tokio_util::task::JoinMap;
 
 pub(crate) struct DebouncerMap<K, V> {
     map: JoinMap<K, V>,
-    debounce: Duration,
+    delay: Duration,
     sem: Option<Arc<Semaphore>>,
 }
 
@@ -21,23 +21,13 @@ where
         };
         Self {
             map: JoinMap::new(),
-            debounce,
+            delay: debounce,
             sem,
         }
     }
 
     pub(crate) async fn join_next(&mut self) -> Option<(K, Result<V, JoinError>)> {
         self.map.join_next().await
-    }
-
-    /// Debounce `task`, don't limit parallelism.
-    pub(crate) fn spawn_unlimited<F>(&mut self, key: K, task: F)
-    where
-        F: Future<Output = V>,
-        F: Send + 'static,
-        V: Send,
-    {
-        self.spawn_limited(key, false, task)
     }
 
     /// Debounce `task` and, if `limited` is true, limit its parallelism.
@@ -47,7 +37,7 @@ where
         F: Send + 'static,
         V: Send,
     {
-        let debounce = self.debounce;
+        let debounce = self.delay;
         let sem = if limited { self.sem.clone() } else { None };
         self.map.spawn(key, async move {
             if !debounce.is_zero() {

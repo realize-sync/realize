@@ -10,7 +10,7 @@ use crate::arena::db::Tag;
 use crate::arena::history::WritableOpenHistory;
 use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
-use crate::arena::types::{DirMetadata, Version};
+use crate::arena::types::{CacheEntryStatus, DirMetadata, Version};
 use crate::global::types::PathAssignment;
 use crate::types::Inode;
 use crate::utils::holder::Holder;
@@ -93,6 +93,19 @@ pub(crate) trait CacheReadOperations {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<std::path::PathBuf, StorageError>;
+
+    /// Return a short description of what's in the cache for the
+    /// given entry, file or directory.
+    ///
+    /// This is primarily meant for comparing with the local files.
+    /// Most use-cases should use [CacheReadOperations::metadata],
+    /// which checks both the cache and the local files and returns a
+    /// higher-level, merged view.
+    fn entry_status<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<CacheEntryStatus, StorageError>;
 }
 
 /// A cache open for reading with a read transaction.
@@ -224,6 +237,14 @@ where
     ) -> Result<std::path::PathBuf, StorageError> {
         local_path(self.cache.datadir(), tree, loc)
     }
+
+    fn entry_status<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<CacheEntryStatus, StorageError> {
+        entry_status(&self.table, tree, loc)
+    }
 }
 
 impl<'a> CacheReadOperations for WritableOpenCache<'a> {
@@ -267,7 +288,6 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         loc: L,
     ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
         let loc = loc.into();
-
         ReadDirIterator::new(
             &self.table,
             tree,
@@ -314,6 +334,14 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         loc: L,
     ) -> Result<std::path::PathBuf, StorageError> {
         local_path(self.cache.datadir(), tree, loc)
+    }
+
+    fn entry_status<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<CacheEntryStatus, StorageError> {
+        entry_status(&self.table, tree, loc)
     }
 }
 
@@ -2109,6 +2137,34 @@ fn local_path<'b, L: Into<TreeLoc<'b>>>(
     loc: L,
 ) -> Result<std::path::PathBuf, StorageError> {
     Ok(tree.backtrack(loc)?.within(datadir))
+}
+
+fn entry_status<'b, L: Into<TreeLoc<'b>>>(
+    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    tree: &impl TreeReadOperations,
+    loc: L,
+) -> Result<CacheEntryStatus, StorageError> {
+    match tree.resolve(loc)? {
+        None => Ok(CacheEntryStatus::Missing),
+        Some(pathid) => match default_entry(cache_table, pathid)? {
+            None => Ok(CacheEntryStatus::Missing),
+            Some(CacheTableEntry::Dir(e)) => Ok(CacheEntryStatus::Dir {
+                local: e.is_local(),
+            }),
+            Some(CacheTableEntry::File(e)) => {
+                if !e.is_local() {
+                    return Ok(CacheEntryStatus::Remote);
+                }
+                match e.version {
+                    Version::Modified(_) => Ok(CacheEntryStatus::Preindexed),
+                    Version::Indexed(_) => Ok(CacheEntryStatus::Indexed {
+                        mtime: e.mtime,
+                        size: e.size,
+                    }),
+                }
+            }
+        },
+    }
 }
 
 #[cfg(test)]

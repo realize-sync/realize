@@ -1,16 +1,19 @@
-#![allow(dead_code)] // work in progress
-
 use super::db::ArenaDatabase;
 use super::index;
-use crate::arena::cache::CacheExt;
+use crate::StorageError;
+use crate::arena::blob::WritableOpenBlob;
+use crate::arena::cache::{CacheReadOperations, WritableOpenCache};
+use crate::arena::db::Tag;
+use crate::arena::dirty::WritableOpenDirty;
+use crate::arena::history::WritableOpenHistory;
+use crate::arena::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
+use crate::arena::types::CacheEntryStatus;
 use crate::utils::debouncer::DebouncerMap;
 use crate::utils::{fs_utils, hash};
-use crate::{StorageError, Version};
-use futures::StreamExt as _;
 use notify::event::{CreateKind, MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use realize_types::{self, Path, UnixTime};
-use std::os::unix::fs::MetadataExt as _;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{self, File};
@@ -27,7 +30,6 @@ pub struct RealWatcher {
 
 /// Builder for creating a RealWatcher with convenient configuration options.
 pub struct RealWatcherBuilder {
-    root: std::path::PathBuf,
     db: Arc<ArenaDatabase>,
     exclude: Vec<realize_types::Path>,
     initial_scan: bool,
@@ -37,13 +39,8 @@ pub struct RealWatcherBuilder {
 
 impl RealWatcherBuilder {
     /// Create a new builder for watching the given root directory with the specified database.
-    pub fn new<P>(root: P, db: Arc<ArenaDatabase>) -> Self
-    where
-        P: AsRef<std::path::Path>,
-    {
-        let root = root.as_ref();
+    pub fn new(db: Arc<ArenaDatabase>) -> Self {
         Self {
-            root: root.to_path_buf(),
             db,
             exclude: Vec::new(),
             initial_scan: false,
@@ -80,12 +77,6 @@ impl RealWatcherBuilder {
         self
     }
 
-    /// Add a single path to exclude from watching.
-    pub fn exclude(mut self, path: &realize_types::Path) -> Self {
-        self.exclude.push(path.clone());
-        self
-    }
-
     /// Add multiple paths to exclude from watching.
     pub fn exclude_all<'a>(mut self, paths: impl Iterator<Item = &'a realize_types::Path>) -> Self {
         for path in paths {
@@ -115,8 +106,7 @@ impl RealWatcherBuilder {
 impl RealWatcher {
     /// Create a builder for configuring and spawning a RealWatcher.
     pub fn builder(db: Arc<ArenaDatabase>) -> RealWatcherBuilder {
-        let root = db.cache().datadir().to_path_buf();
-        RealWatcherBuilder::new(root, db)
+        RealWatcherBuilder::new(db)
     }
 
     async fn spawn(
@@ -134,7 +124,6 @@ impl RealWatcher {
         let watcher = {
             let root = root.clone();
             let watch_tx = watch_tx.clone();
-            let exclude = exclude.clone();
             tokio::task::spawn_blocking(move || {
                 let mut watcher = notify::recommended_watcher({
                     let root = root.clone();
@@ -142,9 +131,9 @@ impl RealWatcher {
                         if let Ok(ev) = ev {
                             log::trace!("[{tag}] Notify event: {ev:?}");
                             if ev.flag() == Some(notify::event::Flag::Rescan) {
-                                let _ = watch_tx.blocking_send(FsEvent::Rescan);
+                                let _ = watch_tx.blocking_send(FsEvent::Scan(Path::root()));
                             }
-                            if let Some(ev) = FsEvent::from_notify(&root, &exclude, ev) {
+                            for ev in FsEvent::from_notify(&root, ev) {
                                 let _ = watch_tx.blocking_send(ev);
                             }
                         }
@@ -159,37 +148,32 @@ impl RealWatcher {
         };
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (rescan_tx, rescan_rx) = mpsc::channel(16);
 
         let worker = Arc::new(RealWatcherWorker {
             db: db.clone(),
-            exclude,
+            exclude: Arc::new(exclude),
+        });
+
+        task::spawn({
+            let watch_tx = watch_tx.clone();
+            async move {
+                let _watcher = watcher;
+
+                worker
+                    .event_loop(debounce, max_parallelism, watch_tx, watch_rx, shutdown_rx)
+                    .await;
+            }
         });
 
         if initial_scan {
-            rescan_tx.send(()).await?;
+            watch_tx.send(FsEvent::Scan(Path::root())).await?;
         }
-
-        task::spawn({
-            let worker = Arc::clone(&worker);
-            let watch_tx = watch_tx.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-
-            async move {
-                worker.rescan_loop(rescan_rx, watch_tx, shutdown_rx).await;
-            }
-        });
-        task::spawn(async move {
-            let _watcher = watcher;
-            worker
-                .event_loop(debounce, max_parallelism, watch_rx, rescan_tx, shutdown_rx)
-                .await;
-        });
 
         Ok(Self { shutdown_tx })
     }
 
     /// Shutdown background tasks and wait for them to be finished.
+    #[allow(dead_code)]
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let _ = self.shutdown_tx.send(());
         self.shutdown_tx.closed().await;
@@ -204,78 +188,47 @@ impl RealWatcher {
 /// generated when scanning.
 #[derive(Debug)]
 enum FsEvent {
-    /// Notify reported that this file was removed
-    Removed(Path),
-    /// Notify reported that a new directory was created at this path.
-    DirCreated(Path),
+    /// Notify reported that a scan may be needed
+    Scan(Path),
 
-    /// Notify reported that a new file was created at this path.
-    FileCreated(Path),
-
-    /// Notify reported the following files moved.
-    ///
-    /// The path vector both sources and destinations.
-    Moved(Vec<Path>),
-
-    /// Notify reported that metadata of this file have changed.
-    MetadataChanged(Path),
-
-    /// Notify reported that the content of this file has changed.
-    ContentModified(Path),
-
-    /// Notify reported that a rescan may be needed
-    Rescan,
-
-    /// Couldn't find the path anymore while scanning.
-    Gone(Path),
-
-    /// While scanning, it was noticed that the file at this path has
-    /// changed since it was indexed.
+    /// Notify or scanning reported some changes to the given file or
+    /// dir.
     NeedsUpdate(Path),
+
+    /// Request indexing of the given path.
+    Index(Path, UnixTime, u64),
 }
 
 impl FsEvent {
     /// Create a [FsEvent] from a [notify::Event]
-    fn from_notify(root: &std::path::Path, exclude: &Vec<Path>, ev: Event) -> Option<Self> {
-        match ev.kind {
-            EventKind::Remove(_) => take_path(root, exclude, ev).map(|p| FsEvent::Removed(p)),
-            EventKind::Create(CreateKind::Folder) => {
-                take_path(root, exclude, ev).map(|p| FsEvent::DirCreated(p))
-            }
-            EventKind::Create(CreateKind::File) => {
-                take_path(root, exclude, ev).map(|p| FsEvent::FileCreated(p))
-            }
-            EventKind::Modify(ModifyKind::Name(_)) => Some(FsEvent::Moved(
-                ev.paths
-                    .into_iter()
-                    .flat_map(|p| Path::from_real_path_in(&p, root).ok())
-                    .filter(|p| !p.matches_any(exclude))
-                    .collect(),
-            )),
-            EventKind::Modify(ModifyKind::Metadata(
+    fn from_notify(root: &std::path::Path, ev: Event) -> Vec<Self> {
+        let needs_update = match ev.kind {
+            EventKind::Modify(ModifyKind::Name(_))
+            | EventKind::Remove(_)
+            | EventKind::Create(CreateKind::Folder)
+            | EventKind::Create(CreateKind::File)
+            | EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Any,
-            )) => take_path(root, exclude, ev).map(|p| FsEvent::MetadataChanged(p)),
+            )) => true,
 
             #[cfg(target_os = "linux")]
             EventKind::Access(notify::event::AccessKind::Close(
                 notify::event::AccessMode::Write,
-            )) => take_path(root, exclude, ev).map(|p| FsEvent::ContentModified(p)),
+            )) => true,
             #[cfg(target_os = "macos")]
-            EventKind::Modify(ModifyKind::Data(_)) => {
-                take_path(root, exclude, ev).map(|p| FsEvent::ContentModified(p))
-            }
-            _ => None,
+            EventKind::Modify(ModifyKind::Data(_)) => true,
+            _ => false,
+        };
+        if needs_update {
+            ev.paths
+                .into_iter()
+                .flat_map(|p| Path::from_real_path_in(&p, root).ok())
+                .map(|p| FsEvent::NeedsUpdate(p))
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
         }
     }
-}
-
-fn take_path(root: &std::path::Path, exclude: &Vec<Path>, mut ev: Event) -> Option<Path> {
-    if let Ok(p) = Path::from_real_path_in(&ev.paths.pop()?, root)
-        && !p.matches_any(exclude)
-    {
-        return Some(p);
-    }
-    None
 }
 
 struct RealWatcherWorker {
@@ -284,164 +237,17 @@ struct RealWatcherWorker {
     /// Paths that should be excluded from the index. These may be
     /// files or directories. For directories, the whole directory
     /// content is excluded.
-    exclude: Vec<realize_types::Path>,
+    exclude: Arc<Vec<realize_types::Path>>,
 }
 
 impl RealWatcherWorker {
-    /// Process messages from `rescan_rx`. For each message, scan the
-    /// database and directory and report any differences to
-    /// `watch_tx`.
-    async fn rescan_loop(
-        &self,
-        mut rescan_rx: mpsc::Receiver<()>,
-        watch_tx: mpsc::Sender<FsEvent>,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
-        let tag = self.db.tag();
-        loop {
-            tokio::select!(
-            _ = shutdown_rx.recv() =>{
-                return;
-            }
-            ret = rescan_rx.recv() => {
-                if ret.is_none() {
-                    return;
-                }
-                // run scan, below
-            });
-            let root = self.db.cache().datadir();
-            log::info!("[{tag}] Scanning {root:?}");
-            if let Err(err) = self.rescan_added(&watch_tx, &mut shutdown_rx).await {
-                log::warn!("[{tag}] Scanning {root:?} for added files failed: {err}");
-            }
-            if let Err(err) = self
-                .rescan_removed_or_modified(&watch_tx, &mut shutdown_rx)
-                .await
-            {
-                log::warn!("[{tag}] Scanning {root:?} for modified or removed files failed: {err}",);
-            }
-            log::info!("[{tag}] Finished scanning {root:?}");
-        }
-    }
-
-    /// Look for files in the index that have been deleted or modified
-    /// and generate remove or modify events.
-    async fn rescan_removed_or_modified(
-        &self,
-        watch_tx: &mpsc::Sender<FsEvent>,
-        shutdown_rx: &mut broadcast::Receiver<()>,
-    ) -> anyhow::Result<()> {
-        let root = self.db.cache().datadir();
-        let mut files = std::pin::pin!(index::all_files_stream(&self.db));
-        loop {
-            tokio::select!(
-            _ = shutdown_rx.recv() => {
-                break;
-            },
-            next = files.next() => {
-                let (path, entry) = match next {
-                    None => {
-                        break;
-                    },
-                    Some(e) => e,
-                };
-
-                let mut is_deleted = false;
-                let mut is_modified = false;
-                if path.matches_any(&self.exclude) {
-                    // If the file is now to be excluded, delete it
-                    // from the index.
-                    is_deleted = true;
-                } else {
-                    match fs_utils::metadata_no_symlink(root, &path).await {
-                        Err(_) => {
-                            is_deleted = true;
-                        }
-                        Ok(m) => {
-                            if !file_is_readable(&path.within(root)).await {
-                                is_deleted = true;
-                            } else if m.len() != entry.size || UnixTime::mtime(&m) != entry.mtime {
-                                is_modified = true;
-                            }
-                        }
-                    }
-                }
-
-                if is_deleted {
-                    watch_tx.send(FsEvent::Gone(path)).await?;
-                } else if is_modified {
-                    watch_tx.send(FsEvent::NeedsUpdate(path)).await?;
-                }
-            });
-        }
-        Ok(())
-    }
-
-    /// Look for files not yet in the index yet and generate create events.
-    async fn rescan_added(
-        &self,
-        watch_tx: &mpsc::Sender<FsEvent>,
-        shutdown_rx: &mut broadcast::Receiver<()>,
-    ) -> anyhow::Result<()> {
-        let root = self.db.cache().datadir();
-        let mut direntries = async_walkdir::WalkDir::new(root).filter(only_regular);
-
-        loop {
-            tokio::select!(
-            _ = shutdown_rx.recv() => {
-                break;
-            }
-            direntry = direntries.next() => {
-                let direntry = match direntry {
-                    None => {
-                        break;
-                    }
-                    Some(Err(_)) => {
-                        continue;
-                    }
-                    Some(Ok(e)) => e,
-                };
-
-                // Only take files into account.
-                if !direntry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-
-                let full_path = direntry.path();
-                let path = match self.relative_path(&full_path) {
-                    Some(p) => p,
-                    None => {
-                        continue;
-                    }
-                };
-
-                // Skip if the file is already in the index.
-                if index::has_local_file_async(&self.db, &path).await.unwrap_or(false) {
-                    continue;
-                }
-
-                // Skip if the file is to be excluded
-                if path.matches_any(&self.exclude) {
-                    continue;
-                }
-
-                // Send an event to add the file to the index. Note
-                // that this is not a create event as we already have
-                // file content.
-                watch_tx.send(FsEvent::NeedsUpdate(path)).await?;
-            });
-        }
-
-        Ok(())
-    }
-
     /// Listen to notifications from the filesystem or when scanning files.
     async fn event_loop(
         &self,
         debounce: Duration,
         max_parallelism: usize,
+        watch_tx: mpsc::Sender<FsEvent>,
         mut watch_rx: mpsc::Receiver<FsEvent>,
-        rescan_tx: mpsc::Sender<()>,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) {
         let tag = self.db.tag();
@@ -458,7 +264,7 @@ impl RealWatcherWorker {
                         Some(ev) =>{
                             log::debug!("[{tag}] {ev:?}");
                             barrier.allow().await;
-                            if let Err(err) = self.handle_event(&ev, &rescan_tx, &mut debouncer).await {
+                            if let Err(err) = self.handle_event(&ev, &watch_tx, &mut debouncer).await {
                                 log::warn!("[{tag}] Handling of {ev:?} failed: {err}");
                             }
                         }
@@ -474,295 +280,462 @@ impl RealWatcherWorker {
     async fn handle_event(
         &self,
         ev: &FsEvent,
-        rescan_tx: &mpsc::Sender<()>,
+        watch_tx: &mpsc::Sender<FsEvent>,
         debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
     ) -> anyhow::Result<()> {
-        let root = self.db.cache().datadir();
         match ev {
-            FsEvent::Removed(path) => {
-                if index::has_local_file_async(&self.db, &path).await? {
-                    // For a single-file deletion, use the debouncer,
-                    // which adds a little delay. This avoids removing
-                    // a file that might be recreated by the
-                    // application right away.
-                    debouncer.spawn_unlimited(path.clone(), {
-                        let db = self.db.clone();
-                        let path = path.clone();
-                        async move {
-                            let tag = db.tag();
-                            log::info!("[{tag}] Remove: \"{path}\"");
-                            if !index::remove_file_if_missing_async(&db, &path).await? {
-                                log::debug!("[{tag}] Mismatch; Skipped removing \"{path}\"",);
-                            }
-                            Ok(())
-                        }
-                    });
+            FsEvent::Scan(path) => {
+                self.process_path(watch_tx, path, true).await?;
+            }
+            FsEvent::NeedsUpdate(path) => {
+                self.process_path(watch_tx, path, false).await?;
+            }
+            FsEvent::Index(path, mtime, size) => {
+                if path.matches_any(&self.exclude) {
                     return Ok(());
                 }
-                self.file_or_dir_removed(path).await?;
-            }
-
-            FsEvent::Gone(path) => {
-                self.file_or_dir_removed(path).await?;
-            }
-
-            FsEvent::DirCreated(path) => {
-                let m = fs_utils::metadata_no_symlink(root, path).await?;
-                // Checking is_dir() because the  folder might actually be a symlink.
-                if m.is_dir() {
-                    self.dir_created_or_modified(path, debouncer).await?;
-                }
-            }
-
-            FsEvent::FileCreated(path) => {
-                if let Ok(m) = fs_utils::metadata_no_symlink(root, path).await
-                    && m.is_file()
-                {
-                    // If not a hard link, not a rename and len > 0,
-                    // this means that writing on the file has already
-                    // started, so there's no point in creating an
-                    // entry; we'll get a Modify event soon enough.
-                    if m.nlink() > 1 || m.len() == 0 {
-                        self.file_created_or_modified(path, debouncer).await?;
-                    }
-                }
-            }
-
-            FsEvent::Moved(paths) => {
-                // We can't trust that the notification tells us
-                // whether a file or dir was moved to or from the
-                // directory; check both.
-                //
-                // Anything outside the root directory is ignored when
-                // converting to realize_types::Path, so we don't bother
-                // checking here.
-
-                for path in paths {
-                    match fs_utils::metadata_no_symlink(root, path).await {
-                        Ok(m) => {
-                            // Possibly moved to; add or update
-                            if m.is_file() {
-                                self.file_created_or_modified(path, debouncer).await?;
-                            } else if m.is_dir() {
-                                self.dir_created_or_modified(path, debouncer).await?;
-                            }
-                        }
-                        Err(_) => {
-                            // Possibly moved from; remove
-                            self.file_or_dir_removed(path).await?;
-                        }
-                    }
-                }
-            }
-            FsEvent::MetadataChanged(path) => {
-                // Files that were accessible might have become
-                // inacessible or the other way round. This is stored
-                // as add/remove, with inaccessible files treated as
-                // if they're gone.
-                match fs_utils::metadata_no_symlink(root, path).await {
-                    Err(_) => {
-                        // Not accessible anymore.
-                        self.file_or_dir_removed(path).await?;
-                    }
-                    Ok(m) => {
-                        if m.is_dir() {
-                            if fs::read_dir(path.within(root)).await.is_ok() {
-                                // Might have just become accessible.
-                                self.dir_created_or_modified(path, debouncer).await?;
-                            } else {
-                                // Might have just become inaccessible
-                                self.file_or_dir_removed(path).await?;
-                            }
+                debouncer.spawn_limited(path.clone(), *size > 0, {
+                    let db = self.db.clone();
+                    let path = path.clone();
+                    let size = *size;
+                    let mtime = *mtime;
+                    async move {
+                        let tag = db.tag();
+                        let hash = if size == 0 {
+                            hash::empty()
                         } else {
-                            if file_is_readable(&path.within(root)).await {
-                                // Might have just become accessible.
-                                self.file_created_or_modified(path, debouncer).await?;
-                            } else {
-                                // Might have just become inaccessible
-                                self.file_or_dir_removed(path).await?;
-                            }
+                            let realpath = path.within(db.cache().datadir());
+                            hash::hash_file(File::open(realpath).await?).await?
+                        };
+                        log::info!("[{tag}] Hashed: \"{path}\" {mtime:?} {hash} size={size}");
+                        if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
+                            log::debug!("[{tag}] Mismatch; Skipped adding \"{path}\" {mtime:?}",);
                         }
+                        Ok(())
                     }
-                }
-            }
-
-            FsEvent::ContentModified(path) | FsEvent::NeedsUpdate(path) => {
-                let m = fs_utils::metadata_no_symlink(root, path).await?;
-                if m.is_file() {
-                    // This event only matters if it's a file.
-                    self.file_created_or_modified(path, debouncer).await?;
-                }
-            }
-            FsEvent::Rescan => {
-                rescan_tx.send(()).await?;
+                });
             }
         }
 
         Ok(())
     }
 
-    async fn file_or_dir_removed(&self, path: &Path) -> anyhow::Result<()> {
-        index::remove_file_or_dir_async(&self.db, &path).await?;
-
-        Ok(())
-    }
-
-    async fn dir_created_or_modified(
+    async fn process_path(
         &self,
-        dirpath: &Path,
-        debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
-    ) -> Result<(), anyhow::Error> {
-        let mut direntries =
-            async_walkdir::WalkDir::new(dirpath.within(&self.db.cache().datadir()))
-                .filter(only_regular);
-        while let Some(direntry) = direntries.next().await {
-            let direntry = match direntry {
-                Err(_) => {
-                    continue;
-                }
-                Ok(e) => e,
-            };
-
-            // Only take files into account.
-            if !direntry
-                .file_type()
-                .await
-                .map(|t| t.is_file())
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let realpath = direntry.path();
-            let path = match self.relative_path(&realpath) {
-                Some(p) => p,
-                None => {
-                    continue;
-                }
-            };
-
-            if let Err(err) = self.file_created_or_modified(&path, debouncer).await {
-                log::debug!("[{}] Failed to add \"{path}\": {err}", self.db.tag());
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn file_created_or_modified(
-        &self,
+        watch_tx: &mpsc::Sender<FsEvent>,
         path: &Path,
-        debouncer: &mut DebouncerMap<Path, Result<(), StorageError>>,
+        scan: bool,
     ) -> Result<(), anyhow::Error> {
-        if path.matches_any(&self.exclude) {
-            return Ok(());
-        }
-
-        let (reindex, size, mtime) = tokio::task::spawn_blocking({
-            let path = path.clone();
-            let db = Arc::clone(&self.db);
-
-            move || {
+        let db = self.db.clone();
+        let watch_tx = watch_tx.clone();
+        let exclude = self.exclude.clone();
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut needs_writing = false;
+            {
+                let txn = db.begin_read()?;
+                let tree = txn.read_tree()?;
+                let cache = txn.read_cache()?;
+                if !process_path_read(db.tag(), &tree, &cache, &path, scan, &exclude, &watch_tx)? {
+                    needs_writing = true;
+                }
+            }
+            if needs_writing {
                 let txn = db.begin_write()?;
-                let m = path.within(db.cache().datadir()).metadata()?;
-                let mtime = UnixTime::mtime(&m);
-                let size = m.len();
                 {
-                    let mut cache = txn.write_cache()?;
                     let mut tree = txn.write_tree()?;
-                    let mut dirty = txn.write_dirty()?;
+                    let mut cache = txn.write_cache()?;
                     let mut blobs = txn.write_blobs()?;
-                    let tag = db.tag();
-                    match cache.file_entry(&tree, &path)? {
-                        Some(entry) => {
-                            let v = &entry.version;
-                            match v {
-                                Version::Indexed(_) => {
-                                    if entry.size == size && entry.mtime == mtime {
-                                        log::info!("[{tag}] No changes: \"{path}\" {v:?}",);
-                                        return Ok((false, size, mtime));
-                                    }
-                                    log::info!("[{tag}] File modified; rehash: \"{path}\" {v:?}",);
-                                    cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
-                                }
-                                Version::Modified(_) => {
-                                    log::info!("[{tag}] File modified; rehash: \"{path}\" {v:?}",);
-                                }
-                            }
-                        }
-                        None => {
-                            log::info!("[{tag}] File create; hashing: \"{path}\"",);
-                            cache.preindex(&mut tree, &mut blobs, &mut dirty, &path)?;
-                        }
-                    }
+                    let mut dirty = txn.write_dirty()?;
+                    let mut history = txn.write_history()?;
+                    process_path_write(
+                        &mut tree,
+                        &mut cache,
+                        &mut blobs,
+                        &mut history,
+                        &mut dirty,
+                        &db,
+                        &path,
+                        scan,
+                        &exclude,
+                        &watch_tx,
+                    )?;
                 }
                 txn.commit()?;
-                Ok::<_, StorageError>((true, size, mtime))
             }
+            Ok::<(), anyhow::Error>(())
         })
         .await??;
-        if reindex {
-            debouncer.spawn_limited(path.clone(), size > 0, {
-                let db = self.db.clone();
-                let path = path.clone();
-                async move {
-                    let hash = if size > 0 {
-                        hash::hash_file(File::open(path.within(db.cache().datadir())).await?)
-                            .await?
-                    } else {
-                        hash::empty()
-                    };
-                    let tag = db.tag();
-                    log::info!("[{tag}] Hashed: \"{path}\" {hash} size={size}");
-                    if !index::add_file_if_matches_async(&db, &path, size, mtime, hash).await? {
-                        log::debug!("[{tag}] Mismatch; Skipped adding \"{path}\"",);
-                    }
-                    Ok(())
-                }
-            });
-        }
-
         Ok(())
     }
+}
 
-    /// Convert a full path to a [realize_types::Path] within the arena, if possible.
-    fn relative_path<P>(&self, path: P) -> Option<realize_types::Path>
-    where
-        P: AsRef<std::path::Path>,
-    {
-        let path = path.as_ref();
-        realize_types::Path::from_real_path_in(&path, &self.db.cache().datadir()).ok()
+/// Status of a filesystem node, to be compared with [CacheEntryStatus].
+#[derive(Debug)]
+enum FsNodeStatus {
+    /// Node doesn't exist.
+    Missing,
+
+    /// Node exists and is a directory.
+    Dir,
+
+    /// Node exists and is a readable, regular file, with the given
+    /// mtime and size.
+    ReadableRegularFile(UnixTime, u64),
+
+    /// Node exists and is neither a directory nor a readable regular file.
+    OtherFile,
+}
+
+impl FsNodeStatus {
+    /// Build a [FsNodeStatus] from the given metadata.
+    ///
+    /// This call may make blocking FS calls to check whether a
+    /// regular file is readable.
+    fn new_blocking(realpath: &std::path::Path, m: Option<&std::fs::Metadata>) -> FsNodeStatus {
+        match m {
+            None => FsNodeStatus::Missing,
+            Some(m) => {
+                if m.is_dir() {
+                    return FsNodeStatus::Dir;
+                }
+                if m.is_file() && std::fs::File::open(realpath).is_ok() {
+                    return FsNodeStatus::ReadableRegularFile(UnixTime::mtime(&m), m.len());
+                }
+                FsNodeStatus::OtherFile
+            }
+        }
     }
 }
 
-/// Check whether the given file can be read.
-///
-/// Instead of duplicating the access rules of the OS, which might not
-/// be limited to the traditional unix rules, this function simply
-/// tries to open the file for reading.
-async fn file_is_readable<P>(realpath: P) -> bool
-where
-    P: AsRef<std::path::Path>,
-{
-    let realpath = realpath.as_ref();
-    File::open(realpath).await.is_ok()
+#[derive(Debug)]
+enum WatcherAction {
+    /// Remove file or dir, recursively, from the database
+    Remove,
+    /// Create dir in the database
+    CreateDir,
+    /// Compare the content of the directories in cache and on the fs and
+    /// add or remove cache entries as necessary.
+    ProcessDirContent,
+    /// Trigger indexing of a local file, with the given mtime and size.
+    Index(UnixTime, u64),
+    /// Store previously indexed entry into the cache as local
+    /// modification.
+    Unindex,
+    /// Store entry into the cache as local modification.
+    Preindex,
 }
 
-/// Filter for [async_walkdir::WalkDir] to ignore everything except
-/// regular files and directories.
+/// Decide on a set of [WatcherAction] to execute for a path given a
+/// filesystem and cache status.
+fn choose_actions(
+    path: &Path,
+    fs_status: &FsNodeStatus,
+    cache_status: &CacheEntryStatus,
+    exclude: &Vec<Path>,
+) -> Vec<WatcherAction> {
+    match (fs_status, cache_status) {
+        (FsNodeStatus::Dir, CacheEntryStatus::Dir { local: true, .. }) => {
+            vec![WatcherAction::ProcessDirContent]
+        }
+        (FsNodeStatus::Dir, CacheEntryStatus::Dir { local: false, .. }) => {
+            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+        }
+        (FsNodeStatus::Dir, CacheEntryStatus::Preindexed) => vec![
+            WatcherAction::Remove,
+            WatcherAction::CreateDir,
+            WatcherAction::ProcessDirContent,
+        ],
+        (FsNodeStatus::Dir, CacheEntryStatus::Indexed { .. }) => vec![
+            WatcherAction::Remove,
+            WatcherAction::CreateDir,
+            WatcherAction::ProcessDirContent,
+        ],
+        (FsNodeStatus::Dir, CacheEntryStatus::Missing) => {
+            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+        }
+        (FsNodeStatus::Dir, CacheEntryStatus::Remote) => {
+            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+        }
+        (FsNodeStatus::Missing, CacheEntryStatus::Missing) => vec![],
+        (FsNodeStatus::Missing, CacheEntryStatus::Remote) => vec![],
+        (FsNodeStatus::Missing, CacheEntryStatus::Dir { local: true, .. }) => {
+            vec![WatcherAction::Remove]
+        }
+        (FsNodeStatus::Missing, CacheEntryStatus::Dir { local: false, .. }) => vec![],
+        (FsNodeStatus::Missing, CacheEntryStatus::Preindexed) => vec![WatcherAction::Remove],
+        (FsNodeStatus::Missing, CacheEntryStatus::Indexed { .. }) => vec![WatcherAction::Remove],
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Dir { .. }) => {
+            vec![WatcherAction::Remove, WatcherAction::Preindex]
+        }
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Indexed { .. }) => vec![WatcherAction::Unindex],
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Preindexed) => vec![],
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Missing) => vec![WatcherAction::Preindex],
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Remote) => vec![WatcherAction::Preindex],
+        (
+            FsNodeStatus::ReadableRegularFile(mtime_a, size_a),
+            CacheEntryStatus::Indexed {
+                mtime: mtime_b,
+                size: size_b,
+            },
+        ) => {
+            if path.matches_any(exclude) {
+                vec![WatcherAction::Unindex]
+            } else if mtime_a == mtime_b && size_a == size_b {
+                vec![]
+            } else {
+                // reindexing is needed
+                vec![WatcherAction::Index(*mtime_a, *size_a)]
+            }
+        }
+        (FsNodeStatus::ReadableRegularFile(mtime, size), CacheEntryStatus::Preindexed) => {
+            if path.matches_any(exclude) {
+                vec![]
+            } else {
+                vec![WatcherAction::Index(*mtime, *size)]
+            }
+        }
+        (
+            FsNodeStatus::ReadableRegularFile(mtime, size),
+            CacheEntryStatus::Missing | CacheEntryStatus::Remote,
+        ) => vec![WatcherAction::Preindex, WatcherAction::Index(*mtime, *size)],
+        (FsNodeStatus::ReadableRegularFile(mtime, size), CacheEntryStatus::Dir { .. }) => {
+            let mut actions = vec![WatcherAction::Remove, WatcherAction::Preindex];
+            if !path.matches_any(exclude) {
+                actions.push(WatcherAction::Index(*mtime, *size));
+            }
+
+            actions
+        }
+    }
+}
+
+/// Process a path within a read transaction, if possible.
 ///
-/// This excludes symlinks. With this filter, WalkDir won't enter into
-/// symlinks to directories.
-async fn only_regular(e: async_walkdir::DirEntry) -> async_walkdir::Filtering {
-    if e.file_type() // does not follow symlinks
-        .await
-        .map(|t| t.is_dir() || t.is_file())
-        .unwrap_or(false)
-    {
-        async_walkdir::Filtering::Continue
+/// There's very little that can be done from within a read transaction; this call serves as
+/// a filter as, in most case, there's nothing to do.
+///
+/// Return false if it turns out that a write transaction is
+/// necessary.
+fn process_path_read(
+    tag: Tag,
+    tree: &impl TreeReadOperations,
+    cache: &impl CacheReadOperations,
+    path: &Path,
+    scan: bool,
+    exclude: &Vec<Path>,
+    tx: &mpsc::Sender<FsEvent>,
+) -> anyhow::Result<bool> {
+    let metadata = fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).ok();
+    let realpath = path.within(cache.datadir());
+    let fs_status = FsNodeStatus::new_blocking(&realpath, metadata.as_ref());
+    let cache_status = cache.entry_status(tree, path)?;
+    let actions = choose_actions(path, &fs_status, &cache_status, exclude);
+    if !actions.is_empty() {
+        log::debug!("[{tag}](r) {path} ({fs_status:?}, {cache_status:?}) -> actions {actions:?}");
+    }
+
+    for action in actions {
+        match action {
+            WatcherAction::ProcessDirContent => {
+                process_dir_content(tag, tree, cache, path, scan, tx)?;
+            }
+            _ => {
+                log::debug!("[{tag}](r) {path} switch to write txn for {action:?}");
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn process_path_write(
+    tree: &mut WritableOpenTree,
+    cache: &mut WritableOpenCache,
+    blobs: &mut WritableOpenBlob,
+    history: &mut WritableOpenHistory,
+    dirty: &mut WritableOpenDirty,
+    db: &Arc<ArenaDatabase>,
+    path: &Path,
+    scan: bool,
+    exclude: &Vec<Path>,
+    tx: &mpsc::Sender<FsEvent>,
+) -> anyhow::Result<()> {
+    let metadata = fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).ok();
+    let realpath = path.within(cache.datadir());
+    let fs_status = FsNodeStatus::new_blocking(&realpath, metadata.as_ref());
+    let cache_status = cache.entry_status(tree, path)?;
+    let actions = choose_actions(path, &fs_status, &cache_status, exclude);
+    let tag = db.tag();
+    if !actions.is_empty() {
+        log::debug!("[{tag}](w) {path} ({fs_status:?}, {cache_status:?}) -> actions {actions:?}");
+    }
+
+    for action in actions {
+        log::debug!("[{tag}](w) {path} execute {action:?}");
+        match action {
+            WatcherAction::ProcessDirContent => {
+                process_dir_content(tag, tree, cache, path, scan, tx)?;
+            }
+            WatcherAction::Remove => {
+                cache.remove_from_index_recursively(tree, blobs, history, dirty, path)?;
+            }
+            WatcherAction::CreateDir => {
+                cache.mkdir(tree, path)?;
+            }
+            WatcherAction::Index(mtime, size) => {
+                if size == 0 {
+                    cache.index(tree, blobs, history, dirty, path, 0, mtime, hash::empty())?;
+                } else {
+                    let path = path.clone();
+                    let tx = tx.clone();
+                    let tag = db.tag();
+                    tokio::spawn(async move {
+                        if let Err(err) = tx.send(FsEvent::Index(path.clone(), mtime, size)).await {
+                            log::debug!("[{tag}] failed to index {path} {mtime:?}: {err:?}")
+                        }
+                    });
+                }
+            }
+            WatcherAction::Preindex => {
+                cache.preindex(tree, blobs, dirty, path)?;
+            }
+            WatcherAction::Unindex => {
+                cache.unindex(tree, blobs, history, dirty, path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn process_dir_content(
+    tag: Tag,
+    tree: &impl TreeReadOperations,
+    cache: &impl CacheReadOperations,
+    path: &Path,
+    scan: bool,
+    tx: &mpsc::Sender<FsEvent>,
+) -> Result<(), anyhow::Error> {
+    if scan {
+        scan_dir_content(tag, tree, cache, path, tx)
     } else {
-        async_walkdir::Filtering::IgnoreDir
+        process_dir_content_diff(tag, tree, cache, path, tx)
     }
+}
+
+fn process_dir_content_diff(
+    tag: Tag,
+    tree: &impl TreeReadOperations,
+    cache: &impl CacheReadOperations,
+    path: &Path,
+    tx: &mpsc::Sender<FsEvent>,
+) -> Result<(), anyhow::Error> {
+    let cached = cached_dir_content(tree, cache, path)?;
+    let real = fs_dir_content(&path.within(cache.datadir()))?;
+
+    let diff = cached
+        .symmetric_difference(&real)
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    if !diff.is_empty() {
+        log::debug!("[{tag}] {path} processing dir diff {diff:?}",);
+        let base = path.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for name in diff {
+                if let Ok(path) = base.join(&name) {
+                    let _ = tx.send(FsEvent::Scan(path)).await;
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn scan_dir_content(
+    tag: Tag,
+    tree: &impl TreeReadOperations,
+    cache: &impl CacheReadOperations,
+    path: &Path,
+    tx: &mpsc::Sender<FsEvent>,
+) -> Result<(), anyhow::Error> {
+    let cached = cached_dir_content(tree, cache, path)?;
+    let real = fs_dir_content(&path.within(cache.datadir()))?;
+    let to_process = cached
+        .into_iter()
+        .chain(real.into_iter())
+        .collect::<Vec<_>>();
+    if !to_process.is_empty() {
+        log::debug!("[{tag}](scan) {path} processing dir content {to_process:?}",);
+        let base = path.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for name in to_process {
+                if let Ok(path) = base.join(&name) {
+                    let _ = tx.send(FsEvent::Scan(path)).await;
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn cached_dir_content(
+    tree: &impl TreeReadOperations,
+    cache: &impl CacheReadOperations,
+    path: &Path,
+) -> Result<HashSet<String>, StorageError> {
+    let mut ret = HashSet::new();
+    for res in tree.readdir(path) {
+        let (name, pathid) = res?;
+        if !matches!(
+            cache.entry_status(tree, pathid)?,
+            CacheEntryStatus::Missing | CacheEntryStatus::Dir { local: false, .. }
+        ) {
+            ret.insert(name);
+        }
+    }
+    Ok(ret)
+}
+
+fn fs_dir_content(realpath: &std::path::Path) -> Result<HashSet<String>, StorageError> {
+    let mut ret = HashSet::new();
+    match std::fs::read_dir(realpath) {
+        Err(err) => {
+            if !matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+            ) {
+                return Err(err.into());
+            }
+            // treat dir as empty
+        }
+        Ok(readdir) => {
+            for entry in readdir {
+                match entry {
+                    Ok(entry) => {
+                        if let Ok(name) = entry.file_name().into_string() {
+                            ret.insert(name);
+                        }
+                    }
+                    Err(err) => {
+                        if !matches!(
+                            err.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                        ) {
+                            return Err(err.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(ret)
 }
 
 #[cfg(test)]
@@ -916,7 +889,11 @@ mod tests {
 
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
-        assert!(index::has_local_file_async(&fixture.db, &path).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &path)
+                .await?
+                .is_some()
+        );
 
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
@@ -940,7 +917,11 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(index::has_local_file_async(&fixture.db, &path).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &path)
+                .await?
+                .is_some()
+        );
 
         fs::remove_file(foobar.path()).await?;
         fixture.wait_for_history_event(2).await?;
@@ -961,8 +942,16 @@ mod tests {
         fixture.root.child("a/b/bar").write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(db, &realize_types::Path::parse("a/b/foo")?).await?);
-        assert!(index::has_local_file_async(db, &realize_types::Path::parse("a/b/bar")?).await?);
+        assert!(
+            index::indexed_file_async(db, &realize_types::Path::parse("a/b/foo")?)
+                .await?
+                .is_some()
+        );
+        assert!(
+            index::indexed_file_async(db, &realize_types::Path::parse("a/b/bar")?)
+                .await?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -982,8 +971,8 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         fs::remove_dir_all(dir.path()).await?;
 
@@ -1011,8 +1000,8 @@ mod tests {
         fs::rename(dir, fixture.root.join("newdir")).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         Ok(())
     }
@@ -1032,8 +1021,8 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         fs::rename(dir.path(), fixture.tempdir.child("out").path()).await?;
 
@@ -1059,8 +1048,8 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         fs::rename(
             fixture.root.child("a").path(),
@@ -1074,8 +1063,8 @@ mod tests {
 
         let newfoo = realize_types::Path::parse("newa/b/foo")?;
         let newbar = realize_types::Path::parse("newa/b/bar")?;
-        assert!(index::has_local_file_async(db, &newfoo).await?);
-        assert!(index::has_local_file_async(db, &newbar).await?);
+        assert!(index::indexed_file_async(db, &newfoo).await?.is_some());
+        assert!(index::indexed_file_async(db, &newbar).await?.is_some());
 
         Ok(())
     }
@@ -1091,7 +1080,11 @@ mod tests {
         fs::rename(newfile.path(), fixture.root.join("newfile")).await?;
 
         fixture.wait_for_history_event(1).await?;
-        assert!(index::has_local_file_async(db, &realize_types::Path::parse("newfile")?).await?);
+        assert!(
+            index::indexed_file_async(db, &realize_types::Path::parse("newfile")?)
+                .await?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -1105,7 +1098,11 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(index::has_local_file_async(&fixture.db, &path).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &path)
+                .await?
+                .is_some()
+        );
 
         fs::rename(foobar.path(), fixture.tempdir.child("out").path()).await?;
 
@@ -1124,14 +1121,22 @@ mod tests {
         foo.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foo")?;
-        assert!(index::has_local_file_async(&fixture.db, &path).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &path)
+                .await?
+                .is_some()
+        );
 
         fs::rename(foo.path(), fixture.root.child("bar")).await?;
 
         fixture.wait_for_history_event(3).await?;
         assert!(!index::has_local_file_async(&fixture.db, &path).await?);
         let path = realize_types::Path::parse("bar")?;
-        assert!(index::has_local_file_async(&fixture.db, &path).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &path)
+                .await?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -1152,11 +1157,12 @@ mod tests {
         make_inaccessible(&foo_pathbuf).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_none());
+        assert!(index::has_local_file_async(db, &foo).await?);
 
         make_accessible(&foo_pathbuf).await?;
         fixture.wait_for_history_event(3).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
 
         Ok(())
     }
@@ -1175,21 +1181,25 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("a/b/foo")?;
         let bar = realize_types::Path::parse("a/b/foo")?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         let dir = fixture.root.join("a");
         make_inaccessible(&dir).await?;
 
         fixture.wait_for_history_event(4).await?;
+
+        // an inaccessible file is removed, not just unindexed.
+        assert!(index::indexed_file_async(db, &foo).await?.is_none());
+        assert!(index::indexed_file_async(db, &bar).await?.is_none());
         assert!(!index::has_local_file_async(db, &foo).await?);
         assert!(!index::has_local_file_async(db, &bar).await?);
 
         make_accessible(&dir).await?;
 
         fixture.wait_for_history_event(6).await?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         Ok(())
     }
@@ -1208,8 +1218,8 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         Ok(())
     }
@@ -1246,8 +1256,8 @@ mod tests {
         .await?;
 
         // Verify files are in index
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
 
         // Delete the files from disk (simulating external deletion)
         fs::remove_file(foo_child.path()).await?;
@@ -1322,7 +1332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_scan_removes_inaccessible_files() -> anyhow::Result<()> {
+    async fn initial_scan_unindexes_inaccessible_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let db = &fixture.db;
 
@@ -1357,14 +1367,17 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index::has_local_file_async(db, &foo).await?);
-        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_none());
+        assert!(index::has_local_file_async(db, &foo).await?);
+
+        assert!(index::indexed_file_async(db, &bar).await?.is_none());
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn initial_scan_removes_files_in_inaccessible_dirs() -> anyhow::Result<()> {
+    async fn initial_scan_unindexes_files_in_inaccessible_dirs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let db = &fixture.db;
 
@@ -1410,8 +1423,12 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index::has_local_file_async(db, &foo).await?);
-        assert!(!index::has_local_file_async(db, &bar).await?);
+        // foo and bar are unindexed, but they're still there as
+        // preindexed local file
+        assert!(index::indexed_file_async(db, &foo).await?.is_none());
+        assert!(index::indexed_file_async(db, &bar).await?.is_none());
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1432,15 +1449,38 @@ mod tests {
         bar.write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
+
+        // file_symlink is preindexed, but not indexed
         assert!(
-            !index::has_local_file_async(db, &realize_types::Path::parse("file_symlink")?).await?
+            index::indexed_file_async(db, &realize_types::Path::parse("file_symlink")?)
+                .await?
+                .is_none()
+        );
+        assert!(
+            index::has_local_file_async(db, &realize_types::Path::parse("file_symlink")?).await?
+        );
+
+        // dir_symlink is preindexed, dir_symlink/bar isn't because
+        // that would require following the symlink.
+        assert!(
+            index::has_local_file_async(db, &realize_types::Path::parse("dir_symlink")?).await?
         );
         assert!(
             !index::has_local_file_async(db, &realize_types::Path::parse("dir_symlink/bar")?)
                 .await?
         );
-        assert!(index::has_local_file_async(db, &realize_types::Path::parse("foo")?).await?);
-        assert!(index::has_local_file_async(db, &realize_types::Path::parse("b/bar")?).await?);
+
+        // foo and bar are indexed
+        assert!(
+            index::indexed_file_async(db, &realize_types::Path::parse("foo")?)
+                .await?
+                .is_some()
+        );
+        assert!(
+            index::indexed_file_async(db, &realize_types::Path::parse("b/bar")?)
+                .await?
+                .is_some()
+        );
 
         Ok(())
     }
@@ -1467,9 +1507,14 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/c/bar")?;
         let file_symlink = realize_types::Path::parse("file_symlink")?;
         let bar_through_symlink = realize_types::Path::parse("dir_symlink/b/c/bar")?;
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
-        assert!(!index::has_local_file_async(db, &file_symlink).await?);
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_some());
+        assert!(
+            index::indexed_file_async(db, &file_symlink)
+                .await?
+                .is_none()
+        );
+        assert!(index::has_local_file_async(db, &file_symlink).await?);
         assert!(!index::has_local_file_async(db, &bar_through_symlink).await?);
 
         Ok(())
@@ -1487,20 +1532,36 @@ mod tests {
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("bar")?;
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_local_file_async(&fixture.db, &foo).await?);
-        assert!(index::has_local_file_async(&fixture.db, &bar).await?);
+        assert!(
+            index::indexed_file_async(&fixture.db, &foo)
+                .await?
+                .is_some()
+        );
+        assert!(
+            index::indexed_file_async(&fixture.db, &bar)
+                .await?
+                .is_some()
+        );
 
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(!index::has_local_file_async(&fixture.db, &bar).await?);
+
+        // File is unindexed, but not removed. It is reported as
+        // removed to peers, though so there is a history event.
+        assert!(
+            index::indexed_file_async(&fixture.db, &bar)
+                .await?
+                .is_none()
+        );
+        assert!(index::has_local_file_async(&fixture.db, &bar).await?);
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn initial_scan_removes_files_turned_into_symlinks() -> anyhow::Result<()> {
+    async fn initial_scan_unindexes_files_turned_into_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let db = &fixture.db;
 
@@ -1534,8 +1595,14 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
+
+        // The file is unindexed, not removed, though it is reported
+        // as removed in the history.
+        assert!(index::indexed_file_async(db, &foo).await?.is_some());
+        assert!(index::indexed_file_async(db, &bar).await?.is_none());
+
         assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(!index::has_local_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1620,14 +1687,26 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let db = &fixture.db;
-        assert!(!index::has_local_file_async(db, &realize_types::Path::parse("excluded")?).await?);
+        let excluded = realize_types::Path::parse("excluded")?;
+        let also_excluded = realize_types::Path::parse("a/b/also_excluded")?;
+        let not_excluded = realize_types::Path::parse("a/not_excluded")?;
+
+        // excluded are not indexed, but they are preindexed
+        assert!(index::indexed_file_async(db, &excluded).await?.is_none());
         assert!(
-            !index::has_local_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?)
+            index::indexed_file_async(db, &also_excluded)
                 .await?
+                .is_none()
         );
         assert!(
-            index::has_local_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?
+            index::indexed_file_async(db, &not_excluded)
+                .await?
+                .is_some()
         );
+
+        assert!(index::has_local_file_async(db, &excluded).await?);
+        assert!(index::has_local_file_async(db, &also_excluded).await?);
+        assert!(index::has_local_file_async(db, &not_excluded).await?);
 
         Ok(())
     }
@@ -1647,13 +1726,17 @@ mod tests {
 
         fixture.wait_for_history_event(1).await?;
         let not_excluded = realize_types::Path::parse("not_excluded")?;
-        assert!(index::has_local_file_async(db, &not_excluded).await?);
+        assert!(
+            index::indexed_file_async(db, &not_excluded)
+                .await?
+                .is_some()
+        );
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn initial_scan_removes_excluded() -> anyhow::Result<()> {
+    async fn initial_scan_unindexes_excluded() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture.exclude(realize_types::Path::parse("a/b")?);
         fixture.exclude(realize_types::Path::parse("excluded")?);
@@ -1686,8 +1769,14 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_local_file_async(db, &excluded).await?);
-        assert!(!index::has_local_file_async(db, &excluded_too).await?);
+        assert!(index::indexed_file_async(db, &excluded).await?.is_none());
+        assert!(
+            index::indexed_file_async(db, &excluded_too)
+                .await?
+                .is_none()
+        );
+        assert!(index::has_local_file_async(db, &excluded).await?);
+        assert!(index::has_local_file_async(db, &excluded_too).await?);
 
         Ok(())
     }
@@ -1707,14 +1796,26 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let db = &fixture.db;
-        assert!(!index::has_local_file_async(db, &realize_types::Path::parse("excluded")?).await?);
+        let excluded = realize_types::Path::parse("excluded")?;
+        let also_excluded = realize_types::Path::parse("a/b/also_excluded")?;
+        let not_excluded = realize_types::Path::parse("a/not_excluded")?;
+
+        // excluded files are not indexed, but they are preindexed
+        assert!(index::indexed_file_async(db, &excluded).await?.is_none());
         assert!(
-            !index::has_local_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?)
+            index::indexed_file_async(db, &also_excluded)
                 .await?
+                .is_none()
         );
         assert!(
-            index::has_local_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?
+            index::indexed_file_async(db, &not_excluded)
+                .await?
+                .is_some()
         );
+
+        assert!(index::has_local_file_async(db, &excluded).await?);
+        assert!(index::has_local_file_async(db, &also_excluded).await?);
+        assert!(index::has_local_file_async(db, &not_excluded).await?);
 
         Ok(())
     }
