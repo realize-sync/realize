@@ -743,7 +743,7 @@ impl<'a> WritableOpenCache<'a> {
         Ok((pathid, metadata))
     }
 
-    /// Removes a local directory on the database and on the filesystem.
+    /// Remove a local directory on the database and on the filesystem.
     ///
     /// The directory must be empty for this call to work, that is,
     /// there must not be any local nor remote files.
@@ -754,6 +754,9 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
+        if pathid == tree.root() {
+            return Err(StorageError::PermissionDenied);
+        }
         match default_entry(&self.table, pathid)? {
             None => Err(StorageError::NotFound),
             Some(CacheTableEntry::File(_)) => Err(StorageError::NotADirectory),
@@ -1307,7 +1310,42 @@ impl<'a> WritableOpenCache<'a> {
         return Ok((source, dest));
     }
 
-    /// Remove a file entry at the given location, if it exists.
+    /// Switch an indexed file back to preindex.
+    ///
+    /// This is reported to remote peers as a removal, but the local remains available locally.
+    ///
+    /// Return true if an indexed file was unindexed.
+    pub(crate) fn unindex<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty,
+        loc: L,
+    ) -> Result<bool, StorageError> {
+        let loc = loc.into();
+        if let Some(pathid) = tree.resolve(loc.borrow())? {
+            if let Some(mut entry) = default_file_entry(&self.table, pathid)?
+                && entry.is_local()
+                && matches!(entry.version, Version::Indexed(_))
+            {
+                let path = tree.backtrack(loc)?;
+                history.report_removed(&path, &entry.version)?;
+                entry.version = Version::modification_of(Some(entry.version));
+                self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Remove a local file or directory entry at the given location, if it exists.
+    ///
+    /// Note that this only touches the local portion of the file and directory. Remote files and
+    /// their parent directories are not removed.
+    ///
+    /// The actual file isn't modified or checked by this call.
     ///
     /// Return true if something was removed.
     pub(crate) fn remove_from_index<'b, L: Into<TreeLoc<'b>>>(
@@ -1320,12 +1358,44 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<bool, StorageError> {
         let loc = loc.into();
         if let Some(pathid) = tree.resolve(loc.borrow())? {
-            if let Some(entry) = default_file_entry(&self.table, pathid)?
-                && entry.is_local()
-            {
-                history.report_removed(&tree.backtrack(loc)?, &entry.version)?;
-                self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
-                return Ok(true);
+            match default_entry(&self.table, pathid)? {
+                None => {}
+                Some(CacheTableEntry::Dir(mut entry)) => {
+                    if pathid == tree.root() {
+                        return Err(StorageError::PermissionDenied);
+                    }
+                    if entry.local {
+                        if entry.mtime.is_some()
+                            && ReadDirIterator::new(&self.table, tree, None, pathid)
+                                .next()
+                                .is_some()
+                        {
+                            // The directory is available remotely and isn't
+                            // empty; keep it.
+                            entry.local = false;
+                            self.table.insert(
+                                (pathid, Layer::Default),
+                                Holder::new(&CacheTableEntry::Dir(entry))?,
+                            )?;
+                        } else {
+                            // This was a local-only directory; we can get rid of it.
+                            tree.remove_and_decref(
+                                pathid,
+                                &mut self.table,
+                                (pathid, Layer::Default),
+                            )?;
+                        }
+                        return Ok(true);
+                    }
+                }
+                Some(CacheTableEntry::File(entry)) => {
+                    if entry.is_local() {
+                        let path = tree.backtrack(loc)?;
+                        history.report_removed(&path, &entry.version)?;
+                        self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
+                        return Ok(true);
+                    }
+                }
             }
         }
 
@@ -1334,6 +1404,8 @@ impl<'a> WritableOpenCache<'a> {
 
     /// Remove a tree location (path or pathid) that can be a file or a
     /// directory.
+    ///
+    /// The actual file isn't modified or checked by this call.
     ///
     /// If the location is a directory, all files within that
     /// directory are removed, recursively.
@@ -1349,11 +1421,11 @@ impl<'a> WritableOpenCache<'a> {
             Some(p) => p,
             None => return Ok(()),
         };
-        self.remove_from_index(tree, blobs, history, dirty, pathid)?;
         let children = tree.readdir_pathid(pathid).collect::<Result<Vec<_>, _>>()?;
         for (_, pathid) in children.into_iter() {
             self.remove_from_index_recursively(tree, blobs, history, dirty, pathid)?;
         }
+        self.remove_from_index(tree, blobs, history, dirty, pathid)?;
         Ok(())
     }
 
@@ -2056,6 +2128,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
+    use nix::sys::stat::{Mode, SFlag};
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
     use std::collections::{HashMap, HashSet};
     use std::os::unix;
@@ -3134,6 +3207,104 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(entries.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_lists_new_special_files() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        fixture.datadir.child("dir/empty").write_str("")?;
+        unix::fs::symlink(
+            std::path::Path::new("doesnotexist"),
+            fixture.datadir.child("dir/sym").path(),
+        )?;
+        nix::sys::stat::mknod(
+            fixture.datadir.child("dir/nod").path(),
+            SFlag::S_IFIFO,
+            Mode::S_IRWXU,
+            0,
+        )?;
+
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let entries = cache
+            .readdir(&tree, Path::parse("dir")?)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let entries = entries
+            .into_iter()
+            .map(|(name, _, m)| (name, m))
+            .collect::<HashMap<String, crate::Metadata>>();
+        let filenames = vec!["empty", "sym", "nod"];
+        assert_unordered::assert_eq_unordered!(
+            filenames.clone(),
+            entries.keys().map(|s| s.as_str()).collect::<Vec<_>>()
+        );
+        for filename in filenames {
+            let real_metadata =
+                std::fs::symlink_metadata(fixture.datadir.child("dir").join(filename))?;
+            let metadata = &entries[filename];
+            match metadata {
+                crate::Metadata::File(m) => {
+                    // Mode specifies the type; it must not be filtered out.
+                    assert_eq!(real_metadata.mode(), m.mode);
+                    assert_eq!(real_metadata.len(), m.size);
+                }
+                _ => {
+                    panic!("unexpected metadata type {metadata:?}")
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readdir_lists_preindexed_special_files() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        fixture.datadir.child("dir/empty").write_str("")?;
+        unix::fs::symlink(
+            std::path::Path::new("doesnotexist"),
+            fixture.datadir.child("dir/sym").path(),
+        )?;
+        nix::sys::stat::mknod(
+            fixture.datadir.child("dir/nod").path(),
+            SFlag::S_IFIFO,
+            Mode::S_IRWXU,
+            0,
+        )?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut cache = txn.write_cache()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let empty_pathid =
+            cache.preindex(&mut tree, &mut blobs, &mut dirty, Path::parse("dir/empty")?)?;
+        let sym_pathid =
+            cache.preindex(&mut tree, &mut blobs, &mut dirty, Path::parse("dir/sym")?)?;
+        let nod_pathid =
+            cache.preindex(&mut tree, &mut blobs, &mut dirty, Path::parse("dir/nod")?)?;
+
+        let entries = cache
+            .readdir(&tree, Path::parse("dir")?)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_unordered::assert_eq_unordered!(
+            vec![
+                ("empty", empty_pathid),
+                ("sym", sym_pathid),
+                ("nod", nod_pathid)
+            ],
+            entries
+                .iter()
+                .map(|(n, pathid, _)| (n.as_str(), *pathid.as_ref().unwrap()))
+                .collect::<Vec<(&str, PathId)>>()
+        );
 
         Ok(())
     }
@@ -5830,19 +6001,11 @@ mod tests {
     }
 
     #[test]
-    fn remove_dir_from_index_recursively() -> anyhow::Result<()> {
+    fn remove_local_dir_from_index() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        // Create two files in foo/ directory
-        let path1 = Path::parse("foo/bar1.txt")?;
-        let path2 = Path::parse("foo/bar2.txt")?;
-        let childpath1 = fixture.datadir.child("foo/bar1.txt");
-        let childpath2 = fixture.datadir.child("foo/bar2.txt");
-
-        let contents1 = "content for bar1.txt";
-        let contents2 = "content for bar2.txt";
-        let (size1, mtime1, hash1) = create_test_file(&childpath1, contents1)?;
-        let (size2, mtime2, hash2) = create_test_file(&childpath2, contents2)?;
+        let path = Path::parse("foo/bar")?;
+        let childpath = fixture.datadir.child("foo/bar");
 
         let txn = fixture.db.begin_write()?;
         let mut cache = txn.write_cache()?;
@@ -5851,37 +6014,99 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut history = txn.write_history()?;
 
+        let (size, mtime, hash) = create_test_file(&childpath, "test")?;
         cache.index(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
-            path1.clone(),
-            size1,
-            mtime1,
-            hash1,
-        )?;
-        cache.index(
-            &mut tree,
-            &mut blobs,
-            &mut history,
-            &mut dirty,
-            path2.clone(),
-            size2,
-            mtime2,
-            hash2,
+            path.clone(),
+            size,
+            mtime,
+            hash,
         )?;
 
+        let foo = Path::parse("foo")?;
+        assert!(matches!(
+            cache.metadata(&tree, &foo)?,
+            Some(crate::Metadata::Dir(_))
+        ));
+        std::fs::remove_file(childpath.path())?;
+        std::fs::remove_dir_all(childpath.parent().unwrap())?;
         cache.remove_from_index_recursively(
             &mut tree,
             &mut blobs,
             &mut history,
             &mut dirty,
-            Path::parse("foo")?,
+            &foo,
         )?;
 
-        assert!(!cache.has_local_file(&tree, path1)?);
-        assert!(!cache.has_local_file(&tree, path2)?);
+        assert_eq!(None, cache.metadata(&tree, &foo)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_local_and_remote_dir() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let remote = Path::parse("foo/remote")?;
+        fixture.add_to_cache(&remote, 4, test_time())?;
+
+        let local = Path::parse("foo/local")?;
+        let local_child = fixture.datadir.child("foo/local");
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        let (size, mtime, hash) = create_test_file(&local_child, "test")?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            local.clone(),
+            size,
+            mtime,
+            hash,
+        )?;
+
+        let foo = Path::parse("foo")?;
+        assert!(matches!(
+            cache.metadata(&tree, &foo)?,
+            Some(crate::Metadata::Dir(_))
+        ));
+        std::fs::remove_file(local_child.path())?;
+        std::fs::remove_dir_all(local_child.parent().unwrap())?;
+        cache.remove_from_index_recursively(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &foo,
+        )?;
+
+        // Directory is still there, since it contains "remote", but
+        // is now marked remote-only.
+        assert!(cache.metadata(&tree, &foo)?.is_some());
+
+        // Once all remote files are gone, the remote-only dir is
+        // deleted.
+        cache.notify_dropped_or_removed(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            test_peer(),
+            remote,
+            &test_hash(),
+            false,
+        )?;
+
+        assert_eq!(None, cache.metadata(&tree, &foo)?);
 
         Ok(())
     }
@@ -6371,6 +6596,54 @@ mod tests {
             )
             .unwrap();
         assert!(cache.indexed(&tree, &path)?.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn unindex() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let path = Path::parse("foo/bar.txt")?;
+        let childpath = fixture.datadir.child("foo/bar.txt");
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut history = txn.write_history()?;
+
+        childpath.write_str("test")?;
+        let mtime = UnixTime::mtime(&childpath.metadata()?);
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &path,
+            4,     // actual file size
+            mtime, // actual file mtime
+            hash::digest("test"),
+        )?;
+
+        let history_start = history_start(&history)?;
+        clear_dirty(&mut dirty)?;
+        cache.unindex(&mut tree, &mut blobs, &mut history, &mut dirty, &path)?;
+
+        // path is not index inymore, but is still in the index as a
+        // local file.
+        assert_eq!(None, cache.indexed(&tree, &path)?);
+        assert!(cache.has_local_file(&tree, &path)?);
+        assert_eq!(HashSet::from([path.clone()]), dirty_paths(&dirty, &tree)?);
+
+        // The file has been reported as having been removed.
+        assert_eq!(
+            vec![HistoryTableEntry::Remove(
+                path.clone(),
+                hash::digest("test")
+            )],
+            collect_history_entries(&history, history_start)?
+        );
 
         Ok(())
     }
