@@ -339,7 +339,7 @@ mod tests {
         }
 
         fn find_in_index(&self, path_str: &str) -> Result<Option<IndexedFile>, StorageError> {
-            index::get_file(&self.db, &Path::parse(path_str)?)
+            index::indexed_file(&self.db, &Path::parse(path_str)?)
         }
 
         fn open_blob(&self, path_str: &str) -> anyhow::Result<Blob> {

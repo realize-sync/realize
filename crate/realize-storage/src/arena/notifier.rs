@@ -363,7 +363,7 @@ async fn send_notifications(
             HistoryTableEntry::Add(path) => {
                 if let Some(IndexedFile {
                     size, mtime, hash, ..
-                }) = index::get_file_async(db, &path).await?
+                }) = index::indexed_file_async(db, &path).await?
                 {
                     Some(Notification::Add {
                         index: hist_index,
@@ -388,7 +388,7 @@ async fn send_notifications(
 
                 if let Some(IndexedFile {
                     size, mtime, hash, ..
-                }) = index::get_file_async(db, &path).await?
+                }) = index::indexed_file_async(db, &path).await?
                 {
                     Some(Notification::Replace {
                         index: hist_index,
@@ -409,7 +409,7 @@ async fn send_notifications(
                 }
             }
             HistoryTableEntry::Drop(path, old_hash) => {
-                if index::has_file_async(db, &path).await? {
+                if index::has_local_file_async(db, &path).await? {
                     None
                 } else {
                     Some(Notification::Drop {

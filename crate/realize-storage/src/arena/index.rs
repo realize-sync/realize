@@ -206,7 +206,7 @@ impl Index {
 }
 
 /// Get a file entry.
-pub(crate) fn get_file(
+pub(crate) fn indexed_file(
     db: &Arc<ArenaDatabase>,
     path: &realize_types::Path,
 ) -> Result<Option<IndexedFile>, StorageError> {
@@ -218,18 +218,18 @@ pub(crate) fn get_file(
 }
 
 /// Get a file entry
-pub async fn get_file_async(
+pub async fn indexed_file_async(
     db: &Arc<ArenaDatabase>,
     path: &realize_types::Path,
 ) -> Result<Option<IndexedFile>, StorageError> {
     let db = Arc::clone(db);
     let path = path.clone();
 
-    task::spawn_blocking(move || get_file(&db, &path)).await?
+    task::spawn_blocking(move || indexed_file(&db, &path)).await?
 }
 
 /// Check whether a given file is in the index already.
-pub(crate) fn has_file(
+pub(crate) fn has_local_file(
     db: &Arc<ArenaDatabase>,
     path: &realize_types::Path,
 ) -> Result<bool, StorageError> {
@@ -241,7 +241,7 @@ pub(crate) fn has_file(
 }
 
 /// Check whether a given file is in the index already.
-pub async fn has_file_async<T>(db: &Arc<ArenaDatabase>, path: T) -> Result<bool, StorageError>
+pub async fn has_local_file_async<T>(db: &Arc<ArenaDatabase>, path: T) -> Result<bool, StorageError>
 where
     T: AsRef<realize_types::Path>,
 {
@@ -249,7 +249,7 @@ where
     let db = Arc::clone(db);
     let path = path.clone();
 
-    task::spawn_blocking(move || has_file(&db, &path)).await?
+    task::spawn_blocking(move || has_local_file(&db, &path)).await?
 }
 
 /// Mark the file as modified, but not yet indexed.
@@ -579,8 +579,8 @@ mod tests {
         super::add_file(&fixture.db, &path, size, mtime, hash.clone())?;
 
         // Verify the file was added
-        assert!(super::has_file(&fixture.db, &path)?);
-        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        assert!(super::has_local_file(&fixture.db, &path)?);
+        let entry = super::indexed_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.hash, hash);
@@ -602,7 +602,7 @@ mod tests {
             UnixTime::mtime(&foo.metadata()?),
             hash::digest("foo"),
         )?);
-        assert!(super::has_file(
+        assert!(super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("foo")?
         )?);
@@ -624,7 +624,7 @@ mod tests {
             UnixTime::from_secs(1234567890),
             hash::digest("foo"),
         )?);
-        assert!(!super::has_file(
+        assert!(!super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("foo")?
         )?);
@@ -646,7 +646,7 @@ mod tests {
             UnixTime::mtime(&file_path.metadata()?),
             hash::digest("foo"),
         )?);
-        assert!(!super::has_file(
+        assert!(!super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("foo")?
         )?);
@@ -670,7 +670,7 @@ mod tests {
             mtime,
             hash::digest("foo"),
         )?);
-        assert!(!super::has_file(
+        assert!(!super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("foo")?
         )?);
@@ -695,8 +695,8 @@ mod tests {
         super::add_file(&fixture.db, &path, size2, mtime2, hash2.clone())?;
 
         // Verify the file was replaced
-        assert!(super::has_file(&fixture.db, &path)?);
-        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        assert!(super::has_local_file(&fixture.db, &path)?);
+        let entry = super::indexed_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size2);
         assert_eq!(entry.mtime, mtime2);
         assert_eq!(entry.hash, hash2);
@@ -713,12 +713,12 @@ mod tests {
         let (size, mtime, hash) = fixture.setup_file(&path, content)?;
         super::add_file(&fixture.db, &path, size, mtime, hash)?;
 
-        assert!(super::has_file(&fixture.db, &path)?);
-        assert!(!super::has_file(
+        assert!(super::has_local_file(&fixture.db, &path)?);
+        assert!(!super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("bar.txt")?
         )?);
-        assert!(!super::has_file(
+        assert!(!super::has_local_file(
             &fixture.db,
             &realize_types::Path::parse("other.txt")?
         )?);
@@ -735,7 +735,7 @@ mod tests {
         let (size, mtime, hash) = fixture.setup_file(&path, content)?;
         super::add_file(&fixture.db, &path, size, mtime, hash.clone())?;
 
-        let entry = super::get_file(&fixture.db, &path)?.unwrap();
+        let entry = super::indexed_file(&fixture.db, &path)?.unwrap();
         assert_eq!(entry.size, size);
         assert_eq!(entry.mtime, mtime);
         assert_eq!(entry.hash, hash);
@@ -753,7 +753,7 @@ mod tests {
         super::add_file(&fixture.db, &path, size, mtime, hash)?;
         super::remove_file_or_dir(&fixture.db, &path)?;
 
-        assert!(!super::has_file(&fixture.db, &path)?);
+        assert!(!super::has_local_file(&fixture.db, &path)?);
 
         Ok(())
     }
@@ -771,7 +771,7 @@ mod tests {
         std::fs::remove_file(fixture.datadir.child("bar.txt").path())?;
 
         assert!(super::remove_file_if_missing(&fixture.db, &path)?);
-        assert!(!super::has_file(&fixture.db, &path)?);
+        assert!(!super::has_local_file(&fixture.db, &path)?);
 
         Ok(())
     }
@@ -787,7 +787,7 @@ mod tests {
 
         // File still exists on disk (created by setup_file), so removal should fail
         assert!(!super::remove_file_if_missing(&fixture.db, &path)?);
-        assert!(super::has_file(&fixture.db, &path)?);
+        assert!(super::has_local_file(&fixture.db, &path)?);
 
         Ok(())
     }
@@ -822,12 +822,12 @@ mod tests {
         super::remove_file_or_dir(&fixture.db, &realize_types::Path::parse("foo")?)?;
 
         // Verify all files in the directory were removed
-        assert!(!super::has_file(&fixture.db, &path_a)?);
-        assert!(!super::has_file(&fixture.db, &path_b)?);
-        assert!(!super::has_file(&fixture.db, &path_c)?);
+        assert!(!super::has_local_file(&fixture.db, &path_a)?);
+        assert!(!super::has_local_file(&fixture.db, &path_b)?);
+        assert!(!super::has_local_file(&fixture.db, &path_c)?);
 
         // But the file outside the directory should remain
-        assert!(super::has_file(&fixture.db, &path_foobar)?);
+        assert!(super::has_local_file(&fixture.db, &path_foobar)?);
 
         Ok(())
     }
@@ -932,7 +932,7 @@ mod tests {
 
         // Destination does not exist yet (neither in filesystem nor in cache)
         let dest_index_path = Path::parse("dest.txt")?;
-        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(!super::has_local_file(&fixture.db, &dest_index_path)?);
 
         // Test successful branch (create hard link)
         let txn = fixture.db.begin_write()?;
@@ -965,11 +965,11 @@ mod tests {
 
         // Verify destination now exists in cache after commit
         assert!(
-            super::has_file(&fixture.db, &dest_index_path)?,
+            super::has_local_file(&fixture.db, &dest_index_path)?,
             "Destination should be in cache after branch"
         );
 
-        let dest_entry = super::get_file(&fixture.db, &dest_index_path)?.unwrap();
+        let dest_entry = super::indexed_file(&fixture.db, &dest_index_path)?.unwrap();
         assert_eq!(dest_entry.hash, source_hash);
         assert_eq!(dest_entry.size, source_content.len() as u64);
         assert_eq!(dest_entry.mtime, source_mtime);
@@ -1025,8 +1025,8 @@ mod tests {
         )?;
 
         // Verify both files are in the index
-        assert!(super::has_file(&fixture.db, &source_index_path)?);
-        assert!(super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(super::has_local_file(&fixture.db, &source_index_path)?);
+        assert!(super::has_local_file(&fixture.db, &dest_index_path)?);
 
         // Test branch fails when destination exists in cache
         let txn = fixture.db.begin_write()?;
@@ -1260,7 +1260,7 @@ mod tests {
         let dest_index_path = Path::parse("dest.txt")?;
 
         // Verify dest is not in cache
-        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(!super::has_local_file(&fixture.db, &dest_index_path)?);
 
         // Test branch should fail
         let txn = fixture.db.begin_write()?;
@@ -1389,8 +1389,8 @@ mod tests {
         )?;
 
         // Verify both files are in the index
-        assert!(super::has_file(&fixture.db, &source_index_path)?);
-        assert!(super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(super::has_local_file(&fixture.db, &source_index_path)?);
+        assert!(super::has_local_file(&fixture.db, &dest_index_path)?);
 
         // Test rename fails when destination exists in cache
         let txn = fixture.db.begin_write()?;
@@ -1453,7 +1453,7 @@ mod tests {
         let dest_index_path = Path::parse("dest.txt")?;
 
         // Verify dest is not in cache
-        assert!(!super::has_file(&fixture.db, &dest_index_path)?);
+        assert!(!super::has_local_file(&fixture.db, &dest_index_path)?);
 
         // Test rename should succeed (dest exists on disk but not in cache)
         let txn = fixture.db.begin_write()?;

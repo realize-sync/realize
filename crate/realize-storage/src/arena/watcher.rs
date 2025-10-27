@@ -416,7 +416,7 @@ impl RealWatcherWorker {
                 };
 
                 // Skip if the file is already in the index.
-                if index::has_file_async(&self.db, &path).await.unwrap_or(false) {
+                if index::has_local_file_async(&self.db, &path).await.unwrap_or(false) {
                     continue;
                 }
 
@@ -480,7 +480,7 @@ impl RealWatcherWorker {
         let root = self.db.cache().datadir();
         match ev {
             FsEvent::Removed(path) => {
-                if index::has_file_async(&self.db, &path).await? {
+                if index::has_local_file_async(&self.db, &path).await? {
                     // For a single-file deletion, use the debouncer,
                     // which adds a little delay. This avoids removing
                     // a file that might be recreated by the
@@ -878,7 +878,7 @@ mod tests {
                 mtime,
                 hash: hash::digest(b"test"),
             }),
-            index::get_file_async(&fixture.db, &path).await?
+            index::indexed_file_async(&fixture.db, &path).await?
         );
 
         Ok(())
@@ -901,7 +901,7 @@ mod tests {
                 mtime,
                 hash: hash::digest([]),
             }),
-            index::get_file_async(&fixture.db, &path).await?
+            index::indexed_file_async(&fixture.db, &path).await?
         );
 
         Ok(())
@@ -916,13 +916,13 @@ mod tests {
 
         let path = realize_types::Path::parse("foobar")?;
         fixture.wait_for_history_event(1).await?;
-        assert!(index::has_file_async(&fixture.db, &path).await?);
+        assert!(index::has_local_file_async(&fixture.db, &path).await?);
 
         foobar.write_str("boo")?;
         let mtime = UnixTime::mtime(&fs::metadata(foobar.path()).await?);
         fixture.wait_for_history_event(2).await?;
         assert!(
-            index::get_file_async(&fixture.db, &path)
+            index::indexed_file_async(&fixture.db, &path)
                 .await?
                 .unwrap()
                 .matches(3, mtime)
@@ -940,11 +940,11 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(index::has_file_async(&fixture.db, &path).await?);
+        assert!(index::has_local_file_async(&fixture.db, &path).await?);
 
         fs::remove_file(foobar.path()).await?;
         fixture.wait_for_history_event(2).await?;
-        assert!(!index::has_file_async(&fixture.db, &path).await?);
+        assert!(!index::has_local_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -961,8 +961,8 @@ mod tests {
         fixture.root.child("a/b/bar").write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(db, &realize_types::Path::parse("a/b/foo")?).await?);
-        assert!(index::has_file_async(db, &realize_types::Path::parse("a/b/bar")?).await?);
+        assert!(index::has_local_file_async(db, &realize_types::Path::parse("a/b/foo")?).await?);
+        assert!(index::has_local_file_async(db, &realize_types::Path::parse("a/b/bar")?).await?);
 
         Ok(())
     }
@@ -982,14 +982,14 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         fs::remove_dir_all(dir.path()).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1011,8 +1011,8 @@ mod tests {
         fs::rename(dir, fixture.root.join("newdir")).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1032,14 +1032,14 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         fs::rename(dir.path(), fixture.tempdir.child("out").path()).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1059,8 +1059,8 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/bar")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         fs::rename(
             fixture.root.child("a").path(),
@@ -1069,13 +1069,13 @@ mod tests {
         .await?;
 
         fixture.wait_for_history_event(6).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         let newfoo = realize_types::Path::parse("newa/b/foo")?;
         let newbar = realize_types::Path::parse("newa/b/bar")?;
-        assert!(index::has_file_async(db, &newfoo).await?);
-        assert!(index::has_file_async(db, &newbar).await?);
+        assert!(index::has_local_file_async(db, &newfoo).await?);
+        assert!(index::has_local_file_async(db, &newbar).await?);
 
         Ok(())
     }
@@ -1091,7 +1091,7 @@ mod tests {
         fs::rename(newfile.path(), fixture.root.join("newfile")).await?;
 
         fixture.wait_for_history_event(1).await?;
-        assert!(index::has_file_async(db, &realize_types::Path::parse("newfile")?).await?);
+        assert!(index::has_local_file_async(db, &realize_types::Path::parse("newfile")?).await?);
 
         Ok(())
     }
@@ -1105,12 +1105,12 @@ mod tests {
         foobar.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foobar")?;
-        assert!(index::has_file_async(&fixture.db, &path).await?);
+        assert!(index::has_local_file_async(&fixture.db, &path).await?);
 
         fs::rename(foobar.path(), fixture.tempdir.child("out").path()).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index::has_file_async(&fixture.db, &path).await?);
+        assert!(!index::has_local_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -1124,14 +1124,14 @@ mod tests {
         foo.write_str("test")?;
         fixture.wait_for_history_event(1).await?;
         let path = realize_types::Path::parse("foo")?;
-        assert!(index::has_file_async(&fixture.db, &path).await?);
+        assert!(index::has_local_file_async(&fixture.db, &path).await?);
 
         fs::rename(foo.path(), fixture.root.child("bar")).await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(!index::has_file_async(&fixture.db, &path).await?);
+        assert!(!index::has_local_file_async(&fixture.db, &path).await?);
         let path = realize_types::Path::parse("bar")?;
-        assert!(index::has_file_async(&fixture.db, &path).await?);
+        assert!(index::has_local_file_async(&fixture.db, &path).await?);
 
         Ok(())
     }
@@ -1152,11 +1152,11 @@ mod tests {
         make_inaccessible(&foo_pathbuf).await?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
 
         make_accessible(&foo_pathbuf).await?;
         fixture.wait_for_history_event(3).await?;
-        assert!(index::has_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
 
         Ok(())
     }
@@ -1175,21 +1175,21 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("a/b/foo")?;
         let bar = realize_types::Path::parse("a/b/foo")?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         let dir = fixture.root.join("a");
         make_inaccessible(&dir).await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         make_accessible(&dir).await?;
 
         fixture.wait_for_history_event(6).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1208,8 +1208,8 @@ mod tests {
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("a/b/c/bar")?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1246,8 +1246,8 @@ mod tests {
         .await?;
 
         // Verify files are in index
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
 
         // Delete the files from disk (simulating external deletion)
         fs::remove_file(foo_child.path()).await?;
@@ -1257,8 +1257,8 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1305,7 +1305,7 @@ mod tests {
                 mtime: UnixTime::mtime(&fs::metadata(foo_child.path()).await?),
                 hash: hash::digest("foo".as_bytes()),
             }),
-            index::get_file_async(&fixture.db, &foo).await?
+            index::indexed_file_async(&fixture.db, &foo).await?
         );
 
         // Bar was updated
@@ -1315,7 +1315,7 @@ mod tests {
                 mtime: UnixTime::mtime(&fs::metadata(bar_child.path()).await?),
                 hash: hash::digest(b"barbar"),
             }),
-            index::get_file_async(&fixture.db, &bar).await?
+            index::indexed_file_async(&fixture.db, &bar).await?
         );
 
         Ok(())
@@ -1357,8 +1357,8 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
 
         Ok(())
     }
@@ -1410,8 +1410,8 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        assert!(!index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1432,10 +1432,15 @@ mod tests {
         bar.write_str("test")?;
 
         fixture.wait_for_history_event(2).await?;
-        assert!(!index::has_file_async(db, &realize_types::Path::parse("file_symlink")?).await?);
-        assert!(!index::has_file_async(db, &realize_types::Path::parse("dir_symlink/bar")?).await?);
-        assert!(index::has_file_async(db, &realize_types::Path::parse("foo")?).await?);
-        assert!(index::has_file_async(db, &realize_types::Path::parse("b/bar")?).await?);
+        assert!(
+            !index::has_local_file_async(db, &realize_types::Path::parse("file_symlink")?).await?
+        );
+        assert!(
+            !index::has_local_file_async(db, &realize_types::Path::parse("dir_symlink/bar")?)
+                .await?
+        );
+        assert!(index::has_local_file_async(db, &realize_types::Path::parse("foo")?).await?);
+        assert!(index::has_local_file_async(db, &realize_types::Path::parse("b/bar")?).await?);
 
         Ok(())
     }
@@ -1462,10 +1467,10 @@ mod tests {
         let bar = realize_types::Path::parse("a/b/c/bar")?;
         let file_symlink = realize_types::Path::parse("file_symlink")?;
         let bar_through_symlink = realize_types::Path::parse("dir_symlink/b/c/bar")?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(index::has_file_async(db, &bar).await?);
-        assert!(!index::has_file_async(db, &file_symlink).await?);
-        assert!(!index::has_file_async(db, &bar_through_symlink).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(index::has_local_file_async(db, &bar).await?);
+        assert!(!index::has_local_file_async(db, &file_symlink).await?);
+        assert!(!index::has_local_file_async(db, &bar_through_symlink).await?);
 
         Ok(())
     }
@@ -1482,14 +1487,14 @@ mod tests {
         let foo = realize_types::Path::parse("foo")?;
         let bar = realize_types::Path::parse("bar")?;
         fixture.wait_for_history_event(2).await?;
-        assert!(index::has_file_async(&fixture.db, &foo).await?);
-        assert!(index::has_file_async(&fixture.db, &bar).await?);
+        assert!(index::has_local_file_async(&fixture.db, &foo).await?);
+        assert!(index::has_local_file_async(&fixture.db, &bar).await?);
 
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(!index::has_file_async(&fixture.db, &bar).await?);
+        assert!(!index::has_local_file_async(&fixture.db, &bar).await?);
 
         Ok(())
     }
@@ -1529,8 +1534,8 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
-        assert!(index::has_file_async(db, &foo).await?);
-        assert!(!index::has_file_async(db, &bar).await?);
+        assert!(index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
@@ -1565,8 +1570,8 @@ mod tests {
         assert_eq!(
             (true, false),
             (
-                index::has_file_async(db, &foo_in_b).await?,
-                index::has_file_async(db, &foo).await?,
+                index::has_local_file_async(db, &foo_in_b).await?,
+                index::has_local_file_async(db, &foo).await?,
             )
         );
 
@@ -1594,7 +1599,7 @@ mod tests {
                 mtime,
                 hash: hash::digest("test".as_bytes()),
             }),
-            index::get_file_async(db, &realize_types::Path::parse("bar")?).await?
+            index::indexed_file_async(db, &realize_types::Path::parse("bar")?).await?
         );
 
         Ok(())
@@ -1615,11 +1620,14 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let db = &fixture.db;
-        assert!(!index::has_file_async(db, &realize_types::Path::parse("excluded")?).await?);
+        assert!(!index::has_local_file_async(db, &realize_types::Path::parse("excluded")?).await?);
         assert!(
-            !index::has_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?).await?
+            !index::has_local_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?)
+                .await?
         );
-        assert!(index::has_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?);
+        assert!(
+            index::has_local_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?
+        );
 
         Ok(())
     }
@@ -1639,7 +1647,7 @@ mod tests {
 
         fixture.wait_for_history_event(1).await?;
         let not_excluded = realize_types::Path::parse("not_excluded")?;
-        assert!(index::has_file_async(db, &not_excluded).await?);
+        assert!(index::has_local_file_async(db, &not_excluded).await?);
 
         Ok(())
     }
@@ -1678,8 +1686,8 @@ mod tests {
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
-        assert!(!index::has_file_async(db, &excluded).await?);
-        assert!(!index::has_file_async(db, &excluded_too).await?);
+        assert!(!index::has_local_file_async(db, &excluded).await?);
+        assert!(!index::has_local_file_async(db, &excluded_too).await?);
 
         Ok(())
     }
@@ -1699,11 +1707,14 @@ mod tests {
         fixture.wait_for_history_event(1).await?;
 
         let db = &fixture.db;
-        assert!(!index::has_file_async(db, &realize_types::Path::parse("excluded")?).await?);
+        assert!(!index::has_local_file_async(db, &realize_types::Path::parse("excluded")?).await?);
         assert!(
-            !index::has_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?).await?
+            !index::has_local_file_async(db, &realize_types::Path::parse("a/b/also_excluded")?)
+                .await?
         );
-        assert!(index::has_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?);
+        assert!(
+            index::has_local_file_async(db, &realize_types::Path::parse("a/not_excluded")?).await?
+        );
 
         Ok(())
     }

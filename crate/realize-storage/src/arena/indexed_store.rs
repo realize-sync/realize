@@ -22,7 +22,7 @@ impl Reader {
         path: &realize_types::Path,
     ) -> Result<Self, StorageError> {
         // The file must exist in the index
-        index::get_file_async(db, path)
+        index::indexed_file_async(db, path)
             .await?
             .ok_or(StorageError::NotFound)?;
 
@@ -42,7 +42,7 @@ impl Reader {
     pub async fn metadata(&self) -> Result<(u64, Option<Hash>), StorageError> {
         let (m, entry) = tokio::join!(
             self.file.metadata(),
-            index::get_file_async(&self.db, &self.path)
+            index::indexed_file_async(&self.db, &self.path)
         );
         let m = m?;
 
@@ -100,7 +100,7 @@ pub(crate) async fn rsync(
     sig: Signature,
 ) -> Result<Delta, StorageError> {
     let sig = fast_rsync::Signature::deserialize(sig.0)?;
-    index::get_file_async(db, path)
+    index::indexed_file_async(db, path)
         .await?
         .ok_or(StorageError::NotFound)?;
 
