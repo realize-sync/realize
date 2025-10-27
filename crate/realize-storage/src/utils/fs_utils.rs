@@ -6,11 +6,14 @@ use std::io::{self, ErrorKind};
 /// reject if any symlink is encountered (blocking version).
 ///
 /// This function traverses the path components and checks each intermediate directory
-/// to ensure no symlinks are present. Only succeeds if the final path exists and
-/// is not a symlink.
+/// to ensure no symlinks are present. Only succeeds if the final path is reachable without
+/// going through any symlinks.
 ///
-/// Returns the metadata of the final file/directory if found and no symlinks are encountered.
-/// Returns an error if any component in the path is a symlink or if the path doesn't exist.
+/// Returns the metadata of the final path entry if found without
+/// going through symlinks. That entry may be a symlink.
+///
+/// Returns I/O error with [ErrorKind::NotADirectory] if any
+/// intermediate component of the path is a symlink.
 pub fn metadata_no_symlink_blocking(
     root: &std::path::Path,
     path: &Path,
@@ -40,26 +43,22 @@ pub fn metadata_no_symlink_blocking(
     }
 
     let current_path = path.within(root);
-    let m = std::fs::symlink_metadata(&current_path)?;
-    if m.file_type().is_symlink() {
-        return Err(io::Error::new(
-            ErrorKind::NotFound,
-            format!("rejected symlink {current_path:?}"),
-        ));
-    }
 
-    Ok(m)
+    std::fs::symlink_metadata(&current_path)
 }
 
 /// Find a file at the given path within the root directory, but
 /// reject if any symlink is encountered (async version).
 ///
 /// This function traverses the path components and checks each intermediate directory
-/// to ensure no symlinks are present. Only succeeds if the final path exists and
-/// is not a symlink.
+/// to ensure no symlinks are present. Only succeeds if the final path is reachable without
+/// going through any symlinks.
 ///
-/// Returns the metadata of the final file/directory if found and no symlinks are encountered.
-/// Returns an error if any component in the path is a symlink or if the path doesn't exist.
+/// Returns the metadata of the final path entry if found without
+/// going through symlinks. That entry may be a symlink.
+///
+/// Returns I/O error with [ErrorKind::NotADirectory] if any
+/// intermediate component of the path is a symlink.
 pub async fn metadata_no_symlink(
     root: &std::path::Path,
     path: &Path,
@@ -113,6 +112,26 @@ mod tests {
         let metadata = metadata_no_symlink(&root, &path).await?;
 
         assert!(metadata.is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_no_symlink_symlink() -> anyhow::Result<()> {
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path().to_path_buf();
+
+        // Create directory structure: root/a/b/c
+        let dir_a = root.join("a");
+        let dir_b = dir_a.join("b");
+        let file_c = dir_b.join("c");
+
+        fs::create_dir_all(&dir_b).await?;
+        fs::symlink(&std::path::Path::new("doesnotexist"), &file_c).await?;
+
+        let path = Path::parse("a/b/c")?;
+        let metadata = metadata_no_symlink(&root, &path).await?;
+
+        assert!(metadata.is_symlink());
         Ok(())
     }
 
