@@ -1423,12 +1423,9 @@ mod tests {
 
         fixture.wait_for_history_event(4).await?;
 
-        // foo and bar are unindexed, but they're still there as
-        // preindexed local file
-        assert!(index::indexed_file_async(db, &foo).await?.is_none());
-        assert!(index::indexed_file_async(db, &bar).await?.is_none());
-        assert!(index::has_local_file_async(db, &foo).await?);
-        assert!(index::has_local_file_async(db, &bar).await?);
+        // foo and bar are removed, not just unindexed, as they're inaccessible.
+        assert!(!index::has_local_file_async(db, &foo).await?);
+        assert!(!index::has_local_file_async(db, &bar).await?);
 
         Ok(())
     }
