@@ -136,6 +136,7 @@ mod tests {
     use realize_types::{Arena, Path};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+    use tokio::io::AsyncReadExt;
 
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * MB;
@@ -559,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_after_blobs_dropped() -> anyhow::Result<()> {
+    async fn test_cleanup_with_open_blobs() -> anyhow::Result<()> {
         let path1 = Path::parse("1")?;
         let path2 = Path::parse("2")?;
         let fixture = Fixture::setup()?;
@@ -567,8 +568,8 @@ mod tests {
         fixture.create_blob_with_data(&path1, "x".repeat(2 * MB as usize))?;
         fixture.create_blob_with_data(&path2, "y".repeat(2 * MB as usize))?;
 
-        let blob1 = Blob::open(&fixture.db, &path1)?;
-        let blob2 = Blob::open(&fixture.db, &path2)?;
+        let mut blob1 = Blob::open(&fixture.db, &path1)?;
+        let mut blob2 = Blob::open(&fixture.db, &path2)?;
 
         let limits = DiskUsageLimits::max_bytes(0);
         let shutdown = CancellationToken::new();
@@ -577,10 +578,6 @@ mod tests {
             let shutdown = shutdown.clone();
             async move { run_loop(db, limits, shutdown).await }
         });
-
-        // make sure the blobs still exist
-        let blob1_2 = Blob::open(&fixture.db, &path1);
-        let blob2_2 = Blob::open(&fixture.db, &path2);
 
         let blobs_exist = || {
             let txn = fixture.db.begin_read()?;
@@ -591,23 +588,20 @@ mod tests {
                 blobs.get(&tree, &path2)?.is_some(),
             ))
         };
-        tokio::task::yield_now().await;
 
-        assert_eq!((true, true), blobs_exist()?);
-
-        drop(blob1);
-        drop(blob2);
-        drop(blob1_2);
-        drop(blob2_2);
-
-        // Now that all blobs have been dropped, cleanup should run
-        // and delete them.
+        // Cleanup should run and delete all blobs.
         let limit = Instant::now() + Duration::from_secs(3);
         while blobs_exist()? != (false, false) && Instant::now() < limit {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-
         assert_eq!((false, false), blobs_exist()?);
+
+        // Even deleted, open blobs are still readable.
+        let mut buf = [0; 5];
+        blob1.read_exact(&mut buf).await?;
+        assert_eq!(b"xxxxx", &buf);
+        blob2.read_exact(&mut buf).await?;
+        assert_eq!(b"yyyyy", &buf);
 
         shutdown.cancel();
         handle.await?;
