@@ -1226,14 +1226,24 @@ impl<'a> WritableOpenCache<'a> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         let path = tree.backtrack(loc.borrow())?;
-        let old_version = default_file_entry(&self.table, pathid)?.map(|e| e.version);
         let entry = IndexedFile { hash, mtime, size };
         let realpath = path.within(self.datadir());
         if !entry.matches_file(&realpath) {
             return Err(StorageError::LocalFileMismatch);
         }
+        let existing = default_file_entry(&self.table, pathid)?;
+        if let Some(e) = &existing
+            && e.kind == FileEntryKind::LocalFile
+            && e.size == size
+            && e.mtime == mtime
+            && e.version == Version::Indexed(entry.hash.clone())
+        {
+            // nothing to do
+            return Ok(pathid);
+        }
         self.write_default_file_entry(tree, blobs, dirty, pathid, &entry.into_file())?;
-        history.report_added(&path, old_version.as_ref())?;
+
+        history.report_added(&path, existing.map(|e| e.version).as_ref())?;
 
         Ok(pathid)
     }
