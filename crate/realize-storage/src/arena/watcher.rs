@@ -666,7 +666,7 @@ fn scan_dir_content(
     let to_process = cached
         .into_iter()
         .chain(real.into_iter())
-        .collect::<Vec<_>>();
+        .collect::<HashSet<String>>();
     if !to_process.is_empty() {
         log::debug!("[{tag}](scan) {path} processing dir content {to_process:?}",);
         let base = path.clone();
