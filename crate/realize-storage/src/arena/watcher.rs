@@ -10,7 +10,7 @@ use crate::arena::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use crate::arena::types::CacheEntryStatus;
 use crate::utils::debouncer::DebouncerMap;
 use crate::utils::{fs_utils, hash};
-use notify::event::{CreateKind, MetadataKind, ModifyKind};
+use notify::event::{MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
 use realize_types::{self, Path, UnixTime};
 use std::collections::HashSet;
@@ -205,8 +205,7 @@ impl FsEvent {
         let needs_update = match ev.kind {
             EventKind::Modify(ModifyKind::Name(_))
             | EventKind::Remove(_)
-            | EventKind::Create(CreateKind::Folder)
-            | EventKind::Create(CreateKind::File)
+            | EventKind::Create(_)
             | EventKind::Modify(ModifyKind::Metadata(
                 MetadataKind::Permissions | MetadataKind::Ownership | MetadataKind::Any,
             )) => true,
