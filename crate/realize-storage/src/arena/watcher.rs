@@ -639,13 +639,17 @@ fn process_dir_content_diff(
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
     if !diff.is_empty() {
-        log::debug!("[{tag}] {path} processing dir diff {diff:?}",);
+        log::debug!(
+            "[{tag}] {path} processing dir diff {diff:?} ({} cached, {} real)",
+            cached.len(),
+            real.len()
+        );
         let base = path.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             for name in diff {
                 if let Ok(path) = base.join(&name) {
-                    let _ = tx.send(FsEvent::Scan(path)).await;
+                    let _ = tx.send(FsEvent::NeedsUpdate(path)).await;
                 }
             }
         });
