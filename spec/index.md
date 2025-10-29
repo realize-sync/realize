@@ -2,15 +2,13 @@
 
 ## Sections
 
-1. [Overview](design.md) - Overall design (planned)
+1. [Overview](design.md) - Overall design
 
-2. [The Unreal](unreal.md) - Cache-based remote filesystem (cross-systems)
+2. [The Unreal](unreal.md) - Local store
 
-3. [The Real](real.md) - Remote and local filesystems overlayed (Linux)
+3. [The Real](real.md) - Remote and local filesystems overlayed
 
-4. [Consensus](consensus.md) - Manages real and unreal content (a.k.a). This supersedes [Sync
-   Algorithm](movedirs.md) - Older design, concentrating moving files
-   reliably between hosts (implemented)
+4. [Consensus](consensus.md) - Manages real and unreal content
 
 5. [Project Rules and Conventions](conventions.md)
 
