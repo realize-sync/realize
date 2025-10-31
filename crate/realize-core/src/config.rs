@@ -81,10 +81,10 @@ mod tests {
                             config: realize_storage::config::ArenaConfig {
                             datadir: PathBuf::from("/path/to/arena1/data"),
                             workdir: PathBuf::from("/path/to/arena1"),
-                            disk_usage: Some(realize_storage::config::DiskUsageLimits {
-                                max: realize_storage::config::BytesOrPercent::Percent(50),
+                            disk_usage: realize_storage::config::DiskUsageConfig {
+                                max: Some(realize_storage::config::BytesOrPercent::Percent(50)),
                                 leave: Some(realize_storage::config::BytesOrPercent::Bytes(1024 * 1024 * 1024)),
-                            }),
+                            },
                             }
                         },
                     ],

@@ -26,6 +26,7 @@ mod jobs;
 pub mod mark;
 pub mod notifier;
 mod peer;
+mod settings;
 mod tree;
 pub mod types;
 mod update;
@@ -89,14 +90,18 @@ impl ArenaStorage {
             .spawn()
             .await
             .with_context(|| format!("{datadir:?}"))?;
-        if let Some(limits) = &arena_config.disk_usage {
-            tokio::spawn({
-                let db = Arc::clone(&db);
-                let shutdown = shutdown.clone();
-                let limits = limits.clone();
+        tokio::spawn({
+            let db = Arc::clone(&db);
+            let shutdown = shutdown.clone();
 
-                async move { cleaner::run_loop(db, limits, shutdown).await }
-            });
+            async move { cleaner::run_loop(db, shutdown).await }
+        });
+        // TODO: allow configuring disk usage dynamically
+        {
+            let txn = db.begin_write()?;
+            txn.write_settings()?
+                .configure_disk_usage(&arena_config.disk_usage)?;
+            txn.commit()?;
         }
         tokio::spawn({
             let db = Arc::clone(&db);

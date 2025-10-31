@@ -132,9 +132,15 @@ pub enum ByteConversionError {
     #[error(transparent)]
     Path(#[from] PathError),
 
-    #[error("invalid string: {0}")]
-    Utf8(#[from] Utf8Error),
+    #[error("invalid UTF-8")]
+    Utf8,
 
     #[error("invalid {0}")]
     Invalid(&'static str),
+}
+
+impl From<Utf8Error> for ByteConversionError {
+    fn from(_: Utf8Error) -> Self {
+        ByteConversionError::Utf8
+    }
 }

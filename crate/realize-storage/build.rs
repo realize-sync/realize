@@ -25,6 +25,7 @@ fn capnpc() -> anyhow::Result<()> {
         .file("capnp/arena/engine.capnp")
         .file("capnp/arena/history.capnp")
         .file("capnp/arena/mark.capnp")
+        .file("capnp/arena/settings.capnp")
         .file("capnp/global/cache.capnp")
         // keep files sorted
         .run()?;

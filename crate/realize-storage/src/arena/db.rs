@@ -4,6 +4,7 @@ use super::dirty::{Dirty, DirtyReadOperations, ReadableOpenDirty, WritableOpenDi
 use super::history::{History, HistoryReadOperations, ReadableOpenHistory, WritableOpenHistory};
 use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::peer::{PeersReadOperations, ReadableOpenPeers, WritableOpenPeers};
+use super::settings::{Settings, WritableOpenSettings};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
 use super::types::Layer;
 use super::types::{
@@ -11,11 +12,12 @@ use super::types::{
     PeerTableEntry, QueueTableEntry,
 };
 use crate::StorageError;
+use crate::arena::types::SettingsTableEntry;
 use crate::types::Inode;
-use crate::utils::holder::{ByteConversionError, Holder};
+use crate::utils::holder::Holder;
 use crate::{PathId, PathIdAllocator};
 use realize_types::Arena;
-use redb::{ReadableTable, Table, TableDefinition};
+use redb::TableDefinition;
 use std::cell::RefCell;
 use std::panic::Location;
 use std::sync::Arc;
@@ -30,9 +32,10 @@ const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
 
 /// Database settings.
 ///
-/// Key: string
-/// Value: depends on the setting
-const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index.settings");
+/// Key: ()
+/// Value: Settings
+const SETTINGS_TABLE: TableDefinition<(), Holder<SettingsTableEntry>> =
+    TableDefinition::new("settings");
 
 /// Tree branches and leaves, associated to pathids.
 ///
@@ -178,6 +181,7 @@ struct Subsystems {
     history: History,
     blobs: Blobs,
     cache: Cache,
+    settings: Settings,
 }
 
 impl ArenaDatabase {
@@ -226,6 +230,7 @@ impl ArenaDatabase {
         let dirty: Dirty;
         let history: History;
         let blobs: Blobs;
+        let settings: Settings;
         let uuid: Uuid;
         let tag: Tag;
         let txn = db.begin_write()?;
@@ -253,7 +258,8 @@ impl ArenaDatabase {
 
             dirty = Dirty::setup(&dirty_log_table)?;
             history = History::setup(&history_table)?;
-            uuid = load_or_assign_uuid(&mut settings_table)?;
+            settings = Settings::setup(&mut settings_table)?;
+            uuid = settings.borrow().uuid;
             tag = Tag::new(uuid, arena);
             blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
             cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref())?;
@@ -270,6 +276,7 @@ impl ArenaDatabase {
                 history,
                 blobs,
                 cache,
+                settings,
             },
             tag,
         }))
@@ -286,6 +293,12 @@ impl ArenaDatabase {
 
     pub fn tag(&self) -> Tag {
         self.tag
+    }
+
+    /// Return handle on the Settings subsystem.
+    #[allow(dead_code)]
+    pub fn settings(&self) -> &Settings {
+        &self.subsystems.settings
     }
 
     /// Return handle on the Tree subsystem.
@@ -410,6 +423,18 @@ impl<'db> ArenaWriteTransaction<'db> {
             self.inner.open_table(INODE_TO_PATHID_TABLE)?,
             self.inner.open_table(PENDING_CATCHUP_TABLE)?,
             &self.subsystems.cache,
+        ))
+    }
+
+    #[track_caller]
+    #[allow(dead_code)]
+    pub(crate) fn write_settings(&self) -> Result<WritableOpenSettings<'_>, StorageError> {
+        Ok(WritableOpenSettings::new(
+            self.inner
+                .open_table(SETTINGS_TABLE)
+                .map_err(|e| StorageError::open_table(e, Location::caller()))?,
+            &self.subsystems.settings,
+            &self.after_commit,
         ))
     }
 
@@ -712,25 +737,6 @@ impl BeforeCommit {
     }
 }
 
-fn load_or_assign_uuid(
-    settings_table: &mut Table<'_, &'static str, &'static [u8]>,
-) -> Result<Uuid, StorageError> {
-    if let Some(value) = settings_table.get("uuid")? {
-        let bytes: uuid::Bytes = value
-            .value()
-            .try_into()
-            .map_err(|_| ByteConversionError::Invalid("uuid"))?;
-
-        Ok(Uuid::from_bytes(bytes))
-    } else {
-        let uuid = Uuid::now_v7();
-        let bytes: &[u8] = uuid.as_bytes();
-        settings_table.insert("uuid", &bytes)?;
-
-        Ok(uuid)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::{GlobalDatabase, utils::redb_utils};
@@ -870,9 +876,10 @@ mod tests {
             &blob_dir,
             &datadir,
         )?;
-
         let uuid = db.uuid().clone();
         assert!(!uuid.is_nil());
+        assert_eq!(db.settings().borrow().uuid, *db.uuid());
+
         drop(db);
 
         let db = ArenaDatabase::new(
@@ -883,6 +890,7 @@ mod tests {
             &datadir,
         )?;
         assert_eq!(uuid, *db.uuid());
+        assert_eq!(db.settings().borrow().uuid, *db.uuid());
 
         Ok(())
     }

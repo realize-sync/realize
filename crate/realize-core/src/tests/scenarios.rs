@@ -1,6 +1,6 @@
 use crate::consensus::churten::Churten;
 use crate::rpc::testing::{self, HouseholdFixture};
-use realize_storage::config::DiskUsageLimits;
+use realize_storage::config::DiskUsageConfig;
 use realize_storage::utils::hash;
 use realize_storage::{CacheStatus, FileRealm, Mark, Version};
 use realize_types::Path;
@@ -16,7 +16,7 @@ async fn file_drop() -> anyhow::Result<()> {
     let mut builder = HouseholdFixture::builder();
     let config = builder.config_mut(a);
     let arena_config = config.arena_config_mut(arena).unwrap();
-    arena_config.disk_usage = Some(DiskUsageLimits::max_bytes(0));
+    arena_config.disk_usage = DiskUsageConfig::max_bytes(0);
 
     let mut fixture = builder.setup().await?;
     fixture
@@ -86,7 +86,7 @@ async fn link_to_own() -> anyhow::Result<()> {
     let mut builder = HouseholdFixture::builder();
     let config = builder.config_mut(a);
     let arena_config = config.arena_config_mut(arena).unwrap();
-    arena_config.disk_usage = Some(DiskUsageLimits::max_bytes(0));
+    arena_config.disk_usage = DiskUsageConfig::max_bytes(0);
 
     let mut fixture = builder.setup().await?;
     fixture

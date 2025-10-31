@@ -1,12 +1,15 @@
 use crate::StorageError;
+use crate::config::{BytesOrPercent, DiskUsageConfig};
 use crate::types::PathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
+use redb::{Key, Value};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
+use uuid::Uuid;
 
 #[allow(dead_code)]
 #[allow(unknown_lints)]
@@ -42,6 +45,13 @@ mod mark_capnp {
 #[allow(clippy::extra_unused_type_parameters)]
 mod engine_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/engine_capnp.rs"));
+}
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+mod settings_capnp {
+    include!(concat!(env!("OUT_DIR"), "/arena/settings_capnp.rs"));
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -98,8 +108,6 @@ pub enum CacheStatus {
 
 /// LRU Queue ID enum
 pub use blob_capnp::LruQueueId;
-use redb::{Key, Value};
-use uuid::Uuid;
 
 /// Layer enum for cache table keys.
 ///
@@ -1483,8 +1491,87 @@ pub(crate) enum CacheEntryStatus {
     Dir { local: bool },
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct SettingsTableEntry {
+    pub(crate) uuid: Uuid,
+    pub(crate) disk_usage: DiskUsageConfig,
+}
+
+impl NamedType for SettingsTableEntry {
+    fn typename() -> &'static str {
+        "SettingsTableEntry"
+    }
+}
+
+impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
+    fn from_bytes(
+        data: &[u8],
+    ) -> Result<SettingsTableEntry, crate::utils::holder::ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let reader: settings_capnp::settings_table_entry::Reader =
+            message_reader.get_root::<settings_capnp::settings_table_entry::Reader>()?;
+
+        let uuid = Uuid::from_u64_pair(reader.get_uuid_high(), reader.get_uuid_low());
+        let reader = reader.get_disk_usage()?;
+        let max = if reader.has_max() {
+            Some(parse_bytes_or_percent(reader.get_max()?)?)
+        } else {
+            None
+        };
+        let leave = if reader.has_leave() {
+            Some(parse_bytes_or_percent(reader.get_leave()?)?)
+        } else {
+            None
+        };
+
+        Ok(SettingsTableEntry {
+            uuid,
+            disk_usage: DiskUsageConfig { max, leave },
+        })
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, crate::utils::holder::ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: settings_capnp::settings_table_entry::Builder =
+            message.init_root::<settings_capnp::settings_table_entry::Builder>();
+
+        let (high, low) = self.uuid.as_u64_pair();
+        builder.set_uuid_high(high);
+        builder.set_uuid_low(low);
+        let mut builder = builder.init_disk_usage();
+        match self.disk_usage.max {
+            Some(BytesOrPercent::Percent(val)) => builder.reborrow().init_max().set_percent(val),
+            Some(BytesOrPercent::Bytes(val)) => builder.reborrow().init_max().set_bytes(val),
+            None => {}
+        }
+        match self.disk_usage.leave {
+            Some(BytesOrPercent::Percent(val)) => builder.reborrow().init_leave().set_percent(val),
+            Some(BytesOrPercent::Bytes(val)) => builder.reborrow().init_leave().set_bytes(val),
+            None => {}
+        }
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
+}
+
+fn parse_bytes_or_percent(
+    bop: settings_capnp::bytes_or_percent::Reader<'_>,
+) -> Result<BytesOrPercent, ByteConversionError> {
+    match bop.which()? {
+        settings_capnp::bytes_or_percent::Which::Percent(percent) => {
+            Ok(BytesOrPercent::Percent(percent))
+        }
+        settings_capnp::bytes_or_percent::Which::Bytes(bytes) => Ok(BytesOrPercent::Bytes(bytes)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::config::DiskUsageConfig;
+
     use super::*;
 
     #[test]
@@ -1965,5 +2052,46 @@ mod tests {
         assert!(remote_a < remote_b);
         assert!(remote_b < remote_z);
         assert!(remote_a < remote_z);
+    }
+
+    #[test]
+    fn convert_settings() -> anyhow::Result<()> {
+        let settings = SettingsTableEntry {
+            uuid: Uuid::now_v7(),
+            disk_usage: DiskUsageConfig {
+                max: Some(BytesOrPercent::Percent(12)),
+                leave: Some(BytesOrPercent::Bytes(1024)),
+            },
+        };
+
+        assert_eq!(
+            settings,
+            SettingsTableEntry::from_bytes(settings.clone().to_bytes()?.as_slice())?
+        );
+
+        let settings = SettingsTableEntry {
+            uuid: Uuid::now_v7(),
+            disk_usage: DiskUsageConfig::default(),
+        };
+
+        assert_eq!(
+            settings,
+            SettingsTableEntry::from_bytes(settings.clone().to_bytes()?.as_slice())?
+        );
+
+        let settings = SettingsTableEntry {
+            uuid: Uuid::now_v7(),
+            disk_usage: DiskUsageConfig {
+                max: Some(BytesOrPercent::Bytes(1024)),
+                leave: None,
+            },
+        };
+
+        assert_eq!(
+            settings,
+            SettingsTableEntry::from_bytes(settings.clone().to_bytes()?.as_slice())?
+        );
+
+        Ok(())
     }
 }

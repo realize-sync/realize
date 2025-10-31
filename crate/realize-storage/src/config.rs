@@ -105,7 +105,8 @@ pub struct ArenaConfig {
     /// Note that it might not be possible to enforce this limitation:
     /// if the size of files to keep goes above that limit, those
     /// files are kept anyways.
-    pub disk_usage: Option<DiskUsageLimits>,
+    #[serde(default)]
+    pub disk_usage: DiskUsageConfig,
 }
 
 impl NamedArenaConfig {
@@ -119,19 +120,19 @@ impl NamedArenaConfig {
             config: ArenaConfig {
                 datadir: root.as_ref().to_path_buf(),
                 workdir: metadata.as_ref().to_path_buf(),
-                disk_usage: None,
+                disk_usage: DiskUsageConfig::default(),
             },
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct DiskUsageLimits {
+pub struct DiskUsageConfig {
     /// Try to use at most that many bytes or percent of disk.
     ///
     /// The cache can temporarily go above that value.
-    pub max: BytesOrPercent,
+    pub max: Option<BytesOrPercent>,
 
     /// Reduce disk usage to keep at keep that many bytes or percent
     /// of the disk free on the disk.
@@ -140,16 +141,20 @@ pub struct DiskUsageLimits {
     pub leave: Option<BytesOrPercent>,
 }
 
-impl DiskUsageLimits {
-    pub fn max_bytes(v: u64) -> DiskUsageLimits {
+impl DiskUsageConfig {
+    pub fn is_empty(&self) -> bool {
+        return self.max.is_none() && self.leave.is_none();
+    }
+
+    pub fn max_bytes(v: u64) -> DiskUsageConfig {
         Self {
-            max: BytesOrPercent::Bytes(v),
+            max: Some(BytesOrPercent::Bytes(v)),
             leave: None,
         }
     }
-    pub fn max_percent(v: u32) -> DiskUsageLimits {
+    pub fn max_percent(v: u32) -> DiskUsageConfig {
         Self {
-            max: BytesOrPercent::Percent(v),
+            max: Some(BytesOrPercent::Percent(v)),
             leave: None,
         }
     }
@@ -407,7 +412,7 @@ mod tests {
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena1"),
                         datadir: PathBuf::from("/path/to/arena1/data"),
-                        disk_usage: None,
+                        disk_usage: DiskUsageConfig::default(),
                     },
                 },
                 NamedArenaConfig {
@@ -415,10 +420,10 @@ mod tests {
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena2"),
                         datadir: PathBuf::from("/path/to/arena2/data"),
-                        disk_usage: Some(DiskUsageLimits {
-                            max: BytesOrPercent::Bytes(1073741824),
+                        disk_usage: DiskUsageConfig {
+                            max: Some(BytesOrPercent::Bytes(1073741824)),
                             leave: None,
-                        }),
+                        },
                     },
                 },
             ],
@@ -431,41 +436,41 @@ mod tests {
     fn parse_disk_usage() {
         #[derive(serde::Deserialize)]
         struct ConfigWithDiskUsage {
-            disk_usage: Option<DiskUsageLimits>,
+            disk_usage: DiskUsageConfig,
         }
-        fn parse(str: &str) -> Option<DiskUsageLimits> {
-            toml::from_str::<ConfigWithDiskUsage>(str)
+        fn parse(str: &str) -> DiskUsageConfig {
+            toml::from_str::<ConfigWithDiskUsage>(&format!("disk_usage = {{{str}}}"))
                 .unwrap()
                 .disk_usage
         }
         assert_eq!(
-            parse(r#"disk_usage = { max = 1610612736 }"#),
-            Some(DiskUsageLimits {
-                max: BytesOrPercent::Bytes(1610612736),
+            parse(r#"max = 1610612736 "#),
+            DiskUsageConfig {
+                max: Some(BytesOrPercent::Bytes(1610612736)),
                 leave: None,
-            })
+            }
         );
-        assert_eq!(parse(""), None);
+        assert_eq!(parse(""), DiskUsageConfig::default());
         assert_eq!(
-            parse(r#"disk_usage = { max = "1.5G" }"#),
-            Some(DiskUsageLimits {
-                max: BytesOrPercent::Bytes(1610612736),
+            parse(r#"max = "1.5G" "#),
+            DiskUsageConfig {
+                max: Some(BytesOrPercent::Bytes(1610612736)),
                 leave: None,
-            })
-        );
-        assert_eq!(
-            parse(r#"disk_usage = { max = "10%" }"#),
-            Some(DiskUsageLimits {
-                max: BytesOrPercent::Percent(10),
-                leave: None,
-            })
+            }
         );
         assert_eq!(
-            parse(r#"disk_usage = { max = "512M", leave = "5%" }"#),
-            Some(DiskUsageLimits {
-                max: BytesOrPercent::Bytes(536870912),
+            parse(r#"max = "10%" "#),
+            DiskUsageConfig {
+                max: Some(BytesOrPercent::Percent(10)),
+                leave: None,
+            }
+        );
+        assert_eq!(
+            parse(r#"max = "512M", leave = "5%" "#),
+            DiskUsageConfig {
+                max: Some(BytesOrPercent::Bytes(536870912)),
                 leave: Some(BytesOrPercent::Percent(5))
-            })
+            }
         );
     }
 

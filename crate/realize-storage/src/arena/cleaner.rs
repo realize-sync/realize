@@ -4,30 +4,36 @@ use super::blob::DiskUsage;
 use super::db::ArenaDatabase;
 use crate::StorageError;
 use crate::arena::blob::BlobReadOperations;
-use crate::config::{BytesOrPercent, DiskUsageLimits};
+use crate::config::{BytesOrPercent, DiskUsageConfig};
 use std::cmp::min;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Enforce these limits on the given database.
-pub(crate) async fn run_loop(
-    db: Arc<ArenaDatabase>,
-    limits: DiskUsageLimits,
-    shutdown: CancellationToken,
-) {
-    let mut rx = db.blobs().watch_disk_usage();
+pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, shutdown: CancellationToken) {
+    let mut disk_usage_rx = db.blobs().watch_disk_usage();
+    let mut settings_rx = db.settings().watch();
 
     loop {
-        let usage = rx.borrow_and_update().clone();
-        if let Err(err) = check_limits_async(&db, &limits, usage).await {
-            log::warn!(
-                "[{}] Failed to enforce disk usage limits: {err:?}",
-                db.tag()
-            )
+        let config = settings_rx.borrow_and_update().disk_usage.clone();
+        if !config.is_empty() {
+            let usage = disk_usage_rx.borrow_and_update().clone();
+            if let Err(err) = check_limits_async(&db, &config, usage).await {
+                log::warn!(
+                    "[{}] Failed to enforce disk usage limits: {err:?}",
+                    db.tag()
+                )
+            }
         }
         tokio::select!(
         _ = shutdown.cancelled() => { return; }
-        ret = rx.changed() => {
+            ret = settings_rx.changed() => {
+                match ret {
+                    Err(_) => return,
+                    Ok(_) => continue,
+                }
+            },
+        ret = disk_usage_rx.changed() => {
             match ret {
                 Err(_) => return,
                 Ok(_) => continue,
@@ -38,12 +44,12 @@ pub(crate) async fn run_loop(
 
 async fn check_limits_async(
     db: &Arc<ArenaDatabase>,
-    limits: &DiskUsageLimits,
+    config: &DiskUsageConfig,
     usage: DiskUsage,
 ) -> Result<(), StorageError> {
     tokio::task::spawn_blocking({
         let db = db.clone();
-        let limits = limits.clone();
+        let limits = config.clone();
         move || {
             let (byte_disk_total, byte_disk_free) = db.blobs().disk_space()?;
             check_limits(&db, &limits, &usage, byte_disk_total, byte_disk_free)
@@ -57,13 +63,17 @@ async fn check_limits_async(
 /// usage has changed.
 fn check_limits(
     db: &Arc<ArenaDatabase>,
-    limits: &DiskUsageLimits,
+    limits: &DiskUsageConfig,
     usage: &DiskUsage,
     byte_disk_total: u64,
     byte_disk_free: u64,
 ) -> Result<(), StorageError> {
     let tag = db.tag();
-    let mut byte_limit = limits.max.as_bytes(byte_disk_total);
+    let mut byte_limit = limits
+        .max
+        .as_ref()
+        .map(|bop| bop.as_bytes(byte_disk_total))
+        .unwrap_or(byte_disk_total);
 
     // If leave is specified, reduce effective_limit as needed to
     // leave that much disk free.
@@ -180,6 +190,17 @@ mod tests {
             Ok(self.db.begin_write()?)
         }
 
+        fn configure(&self, config: DiskUsageConfig) -> anyhow::Result<()> {
+            let txn = self.db.begin_write()?;
+            {
+                let mut settings = txn.write_settings()?;
+                settings.configure_disk_usage(&config)?;
+            }
+            txn.commit()?;
+
+            Ok(())
+        }
+
         fn create_blob_with_data<'b, L: Into<crate::arena::tree::TreeLoc<'b>>>(
             &self,
             loc: L,
@@ -226,7 +247,7 @@ mod tests {
         fixture.create_blob_with_data(Path::parse("small.txt")?, "small data".to_string())?;
 
         let usage = fixture.get_disk_usage()?;
-        let limits = DiskUsageLimits::max_bytes(1 * GB);
+        let limits = DiskUsageConfig::max_bytes(1 * GB);
 
         // Should not trigger cleanup
         check_limits(
@@ -260,7 +281,7 @@ mod tests {
 
         let usage = fixture.get_disk_usage()?;
 
-        let limits = DiskUsageLimits::max_bytes(2 * MB);
+        let limits = DiskUsageConfig::max_bytes(2 * MB);
 
         // Should trigger cleanup
         check_limits(
@@ -297,7 +318,7 @@ mod tests {
         fixture.create_blob_with_data(Path::parse("test.txt")?, "test data".to_string())?;
 
         let usage = fixture.get_disk_usage()?;
-        let limits = DiskUsageLimits::max_percent(50);
+        let limits = DiskUsageConfig::max_percent(50);
 
         // Should not fail
         check_limits(
@@ -343,7 +364,7 @@ mod tests {
         txn.commit()?;
 
         let usage = fixture.get_disk_usage()?;
-        let limits = DiskUsageLimits::max_bytes(1 * MB);
+        let limits = DiskUsageConfig::max_bytes(1 * MB);
 
         // Should trigger cleanup
         check_limits(
@@ -394,8 +415,8 @@ mod tests {
 
         // Set a limit that would normally allow the blob, but with a
         // leave parameter that might require keeping more free space
-        let limits = DiskUsageLimits {
-            max: BytesOrPercent::Bytes(10 * MB),
+        let limits = DiskUsageConfig {
+            max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Bytes(55 * GB)), // More than available free space
         };
 
@@ -435,8 +456,8 @@ mod tests {
         let usage = fixture.get_disk_usage()?;
 
         // Set a limit with leave as percentage
-        let limits = DiskUsageLimits {
-            max: BytesOrPercent::Bytes(10 * MB),
+        let limits = DiskUsageConfig {
+            max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Percent(60)), // Leave 60% free (60GB out of 100GB)
         };
 
@@ -468,7 +489,7 @@ mod tests {
         let usage = fixture.get_disk_usage()?;
 
         // Set a limit that's just above current usage but within tolerance
-        let limits = DiskUsageLimits::max_bytes(usage.total + 500 * 1024); // Just above usage
+        let limits = DiskUsageConfig::max_bytes(usage.total + 500 * 1024); // Just above usage
 
         // Should not trigger cleanup because it's within tolerance
         check_limits(
@@ -510,7 +531,7 @@ mod tests {
         txn.commit()?;
 
         let usage = fixture.get_disk_usage()?;
-        let limits = DiskUsageLimits::max_bytes(1 * MB);
+        let limits = DiskUsageConfig::max_bytes(1 * MB);
 
         // Should not trigger cleanup because all blobs are protected (non-evictable)
         check_limits(
@@ -539,7 +560,7 @@ mod tests {
 
         let usage = fixture.get_disk_usage()?;
 
-        let limits = DiskUsageLimits::max_bytes(0);
+        let limits = DiskUsageConfig::max_bytes(0);
 
         // Should trigger cleanup to get under the limit
         check_limits(
@@ -571,12 +592,12 @@ mod tests {
         let mut blob1 = Blob::open(&fixture.db, &path1)?;
         let mut blob2 = Blob::open(&fixture.db, &path2)?;
 
-        let limits = DiskUsageLimits::max_bytes(0);
+        fixture.configure(DiskUsageConfig::max_bytes(0))?;
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn({
             let db = Arc::clone(&fixture.db);
             let shutdown = shutdown.clone();
-            async move { run_loop(db, limits, shutdown).await }
+            async move { run_loop(db, shutdown).await }
         });
 
         let blobs_exist = || {
