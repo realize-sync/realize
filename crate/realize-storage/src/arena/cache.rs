@@ -1208,7 +1208,6 @@ impl<'a> WritableOpenCache<'a> {
             entry.version,
             entry.kind,
         );
-        log::debug!("ook0= {entry:?}");
         Ok(pathid)
     }
 
