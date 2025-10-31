@@ -3,7 +3,7 @@ use realize_types::Peer;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    #[serde(rename = "peer")]
+    #[serde(rename = "peer", default)]
     pub peers: Vec<PeerConfig>,
 }
 

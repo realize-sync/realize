@@ -22,6 +22,7 @@ impl Config {
             network: NetworkConfig::new(),
             storage: StorageConfig {
                 arenas: Vec::new(),
+                watcher: realize_storage::config::WatcherConfig::default(),
                 cache: realize_storage::config::CacheConfig {
                     db: PathBuf::from("cache.db"), // Default for backward compatibility
                 },
@@ -52,9 +53,11 @@ mod tests {
             name = "arena1"
             datadir = "/path/to/arena1/data"
             workdir = "/path/to/arena1/"
+            disk_usage = { max = "50%", leave = "1G" }
+
+            [watcher]
             max_parallel_hashers = 4
             debounce = "500ms"
-            disk_usage = { max = "50%", leave = "1G" }
         "#;
 
         let config: Config = toml::from_str(toml_str).unwrap();
@@ -78,8 +81,6 @@ mod tests {
                             config: realize_storage::config::ArenaConfig {
                             datadir: PathBuf::from("/path/to/arena1/data"),
                             workdir: PathBuf::from("/path/to/arena1"),
-                            max_parallel_hashers: Some(4),
-                            debounce: Some(HumanDuration::from_millis(500)),
                             disk_usage: Some(realize_storage::config::DiskUsageLimits {
                                 max: realize_storage::config::BytesOrPercent::Percent(50),
                                 leave: Some(realize_storage::config::BytesOrPercent::Bytes(1024 * 1024 * 1024)),
@@ -90,7 +91,34 @@ mod tests {
                     cache: realize_storage::config::CacheConfig {
                         db: PathBuf::from("/path/to/cache.db"),
                     },
+                    watcher: realize_storage::config::WatcherConfig {
+                        max_parallel_hashers: Some(4),
+                        debounce: Some(HumanDuration::from_millis(500)),
+                    }
                 },
             });
+    }
+
+    #[test]
+    fn parse_minimal_config() {
+        let toml_str = r#"
+            [cache]
+            db = "/path/to/cache.db"
+        "#;
+
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config,
+            Config {
+                network: realize_network::config::NetworkConfig { peers: vec![] },
+                storage: realize_storage::config::StorageConfig {
+                    arenas: vec![],
+                    cache: realize_storage::config::CacheConfig {
+                        db: PathBuf::from("/path/to/cache.db"),
+                    },
+                    watcher: realize_storage::config::WatcherConfig::default()
+                },
+            }
+        );
     }
 }

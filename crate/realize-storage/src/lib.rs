@@ -68,6 +68,7 @@ impl Storage {
                 ArenaStorage::from_config(
                     arena,
                     arena_config,
+                    &config.watcher,
                     &exclude.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
                     &allocator,
                 )

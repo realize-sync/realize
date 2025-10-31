@@ -1,4 +1,4 @@
-use crate::config::ArenaConfig;
+use crate::config::{ArenaConfig, WatcherConfig};
 
 use super::Storage;
 use super::config::{CacheConfig, HumanDuration, NamedArenaConfig, StorageConfig};
@@ -40,9 +40,6 @@ where
                         workdir: arena_datadir.parent().unwrap().to_path_buf(),
                         datadir: arena_datadir,
 
-                        // Disabled in tests
-                        debounce: Some(HumanDuration(Duration::ZERO)),
-                        max_parallel_hashers: Some(0),
                         disk_usage: None,
                     },
                 }
@@ -50,6 +47,11 @@ where
             .collect(),
         cache: CacheConfig {
             db: dir.join("cache.db"),
+        },
+        watcher: WatcherConfig {
+            // Disabled in tests
+            debounce: Some(HumanDuration(Duration::ZERO)),
+            max_parallel_hashers: Some(0),
         },
     };
 

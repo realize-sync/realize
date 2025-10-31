@@ -6,9 +6,11 @@ use std::time::Duration;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    #[serde(rename = "arena")]
+    #[serde(rename = "arena", default)]
     pub arenas: Vec<NamedArenaConfig>,
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub watcher: WatcherConfig,
 }
 
 impl StorageConfig {
@@ -18,6 +20,7 @@ impl StorageConfig {
     {
         StorageConfig {
             arenas: Vec::new(),
+            watcher: WatcherConfig::default(),
             cache: CacheConfig {
                 db: cache_db.as_ref().to_path_buf(),
             },
@@ -60,6 +63,20 @@ impl CacheConfig {
     }
 }
 
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq, Default)]
+pub struct WatcherConfig {
+    /// Maximum number of hashers running in parallel.
+    ///
+    /// Hashing is CPU intensive, so hashing several large files in
+    /// parallel can become a problem. It's a good idea to limit
+    /// parallelism to a fraction of the available cores.
+    pub max_parallel_hashers: Option<usize>,
+
+    /// Set debounce delay for hashing files. This allows some time for
+    /// operations in progress to finish.
+    pub debounce: Option<HumanDuration>,
+}
+
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NamedArenaConfig {
@@ -82,17 +99,6 @@ pub struct ArenaConfig {
     /// This directory must be on the same directory as datadir, if specified.
     pub workdir: PathBuf,
 
-    /// Maximum number of hashers running in parallel.
-    ///
-    /// Hashing is CPU intensive, so hashing several large files in
-    /// parallel can become a problem. It's a good idea to limit
-    /// parallelism to a fraction of the available cores.
-    pub max_parallel_hashers: Option<usize>,
-
-    /// Set debounce delay for hashing files. This allows some time for
-    /// operations in progress to finish.
-    pub debounce: Option<HumanDuration>,
-
     /// Limits how much disk space will be used to store local copies
     /// of remote data.
     ///
@@ -113,8 +119,6 @@ impl NamedArenaConfig {
             config: ArenaConfig {
                 datadir: root.as_ref().to_path_buf(),
                 workdir: metadata.as_ref().to_path_buf(),
-                max_parallel_hashers: None,
-                debounce: None,
                 disk_usage: None,
             },
         }
@@ -372,12 +376,14 @@ mod tests {
             [cache]
             db = "/path/to/cache.db"
 
+            [watcher]
+            max_parallel_hashers = 4
+            debounce = "500ms"
+
             [[arena]]
             name = "arena1"
             workdir = "/path/to/arena1"
             datadir = "/path/to/arena1/data"
-            max_parallel_hashers = 4
-            debounce = "500ms"
 
             [[arena]]
             name = "arena2"
@@ -391,14 +397,16 @@ mod tests {
             cache: CacheConfig {
                 db: PathBuf::from("/path/to/cache.db"),
             },
+            watcher: WatcherConfig {
+                max_parallel_hashers: Some(4),
+                debounce: Some(HumanDuration::from_millis(500)),
+            },
             arenas: vec![
                 NamedArenaConfig {
                     arena: Arena::from("arena1"),
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena1"),
                         datadir: PathBuf::from("/path/to/arena1/data"),
-                        max_parallel_hashers: Some(4),
-                        debounce: Some(HumanDuration::from_millis(500)),
                         disk_usage: None,
                     },
                 },
@@ -407,8 +415,6 @@ mod tests {
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena2"),
                         datadir: PathBuf::from("/path/to/arena2/data"),
-                        max_parallel_hashers: None,
-                        debounce: None,
                         disk_usage: Some(DiskUsageLimits {
                             max: BytesOrPercent::Bytes(1073741824),
                             leave: None,
@@ -678,25 +684,10 @@ mod tests {
         ];
 
         for (toml_str, expected_duration) in test_cases {
-            let full_toml = format!(
-                r#"
-                [cache]
-                db = "/tmp/test.db"
-                
-                [[arena]]
-                name = "test"
-                workdir = "/tmp/test"
-                datadir = "/tmp/test/data"
-                {}
-                "#,
-                toml_str
-            );
-
-            let config: StorageConfig = toml::from_str(&full_toml).unwrap();
-            let arena_config = config.arena_config(Arena::from("test")).unwrap();
+            let config: WatcherConfig = toml::from_str(&toml_str).unwrap();
 
             assert_eq!(
-                arena_config.debounce,
+                config.debounce,
                 Some(HumanDuration(expected_duration)),
                 "Failed for TOML: {}",
                 toml_str

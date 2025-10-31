@@ -44,6 +44,7 @@ impl ArenaStorage {
     pub(crate) async fn from_config(
         arena: Arena,
         arena_config: &config::ArenaConfig,
+        watcher_config: &config::WatcherConfig,
         exclude: &Vec<&std::path::Path>,
         allocator: &Arc<PathIdAllocator>,
     ) -> anyhow::Result<Self> {
@@ -78,13 +79,13 @@ impl ArenaStorage {
             .with_initial_scan()
             .exclude_all(exclude.iter())
             .debounce(
-                arena_config
+                watcher_config
                     .debounce
                     .clone()
                     .unwrap_or(HumanDuration(Duration::from_secs(3)))
                     .into(),
             )
-            .max_parallel_hashers(arena_config.max_parallel_hashers.unwrap_or(4))
+            .max_parallel_hashers(watcher_config.max_parallel_hashers.unwrap_or(4))
             .spawn()
             .await
             .with_context(|| format!("{datadir:?}"))?;
