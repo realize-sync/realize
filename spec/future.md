@@ -7,6 +7,51 @@ for easy reference, and end with a detailled and numbered task list.
 
 Upgrade redb to version 3.
 
+## ignore mark replaces exclude {#ignore}
+
+Introduce the mark "ignore". Ignored files:
+ - won't be returned by the filesystem, neither as local nor as remote
+ - won't be preindexed or indexed
+ - won't be downloaded, realized or unrealized
+
+They'll still be stored as peer files.
+
+Changing this mark to something else than ignore will mean choosing a
+default remote version if there are more than one.
+
+Use this mark to replace exclude.
+
+## allow storing work dir inside data dir {#indatadir}
+
+Storing work dir inside data dir is currently forbidden. This
+limitation was important for overlayfs, but since realize won't be
+using it, the limitation is unnecessary.
+
+## default mark {#defaultmark}
+
+Introduce the mark "default" which is handled like watch minus
+unrealize and use that as default mark, so that there won't be
+surprises with files disappearing.
+
+## add, remove and configure arenas as commands {#arenaconfig}
+
+Arenas shouldn't be configured in the config file anymore, but rather
+in the database. This includes the position of the datadir and
+workdir.
+
+Creation, configuration and removal can be done through the
+command-line tool only.
+
+Some default arena configuration could stay in the config file.
+
+## store pathid ranges in the arena db {#pathidranges}
+
+pathid ranges should be stored in the arena dbs, not the global db. At
+startup, the ranges should be retrieved and checked for compatibility.
+
+To allocate a new range, an arena cache should ask the other arena
+caches for the ranges they use and just avoid these.
+
 ## configure "auth" logs {#logauth}
 
 setup configuration so that connection attempts and auth error/accept
@@ -47,48 +92,6 @@ fit in the working area. That's wrong.
 
 Test and document what happens if the same name is a directory on some
 peers and a file in others.
-
-## Recover inode range in Arena cache {#inoderange}
-
-When allocating a inode range in
-[cache.rs](../crate/realize-storage/src/unreal/cache.rs), there are
-two databases working together, the database of the global cache and
-the database of the arena cache. Since 2-phase commit is not supported
-between redb database, we can end up in a situation where the inode
-range allocated for the arena by do_alloc_inode_range is forgotten by the
-arena cache, as the transaction of the arena cache is aborted after
-the transaction of the global cache has been submitted.
-
-One solution to avoid that is to update the logic of
-do_alloc_inode_cache so that if it's called by an arena cache that's
-forgotten about an previously-allocated range, that
-previously-allocated range is returned instead. It is possible, since
-range only increase.
-
-Task list:
-
-- Have the arena cache pass the end of the exhausted range (or 0 the
-  first time) eventually to do_alloc_inode_range
-
-- before allocating a new range do_alloc_inode_range does a range
-  search with the exhausted range `exhausted_range_end+1..` and if
-  there is one range returned that's allocated to the current arena,
-  return that.
-
-This also allows reusing ranges if the entire arena database is deleted.
-
-Task list:
-
- 1. pass the end of the exhausted range from the arena cache to
-    do_alloc_inode_range. Make sure the range compile.
-
- 2. update do_alloc_inode_range to do a range check. Add a unit test.
-    Make sure the test passes.
-
- 3. add a test where all caches instances are dropped and re-created
-    after deleting one of the arena cache, make sure the inode range
-    of the deleted arena cache correspond to the previous range.
-
 
 ## IPV6 + IPV4 {#ipv64}
 
