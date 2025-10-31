@@ -36,6 +36,8 @@ pub use error::StorageError;
 pub use global::fs::{FileContent, Filesystem, FsLoc};
 pub use types::{Inode, JobId, PathId};
 
+use crate::config::NamedArenaConfig;
+
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
     cache: Arc<Filesystem>,
@@ -55,8 +57,12 @@ impl Storage {
             Arc::clone(&globaldb),
             config.arenas.iter().map(|a| a.arena).collect::<Vec<_>>(),
         )?;
-        for arena_config in &config.arenas {
-            let arena = Arena::from(arena_config.arena.as_str());
+        for NamedArenaConfig {
+            arena,
+            config: arena_config,
+        } in &config.arenas
+        {
+            let arena = Arena::from(arena.as_str());
             arena_storage.insert(
                 arena,
                 ArenaStorage::from_config(
@@ -283,8 +289,8 @@ fn build_exclude(config: &StorageConfig) -> Vec<std::path::PathBuf> {
     let mut exclude = vec![];
     // Cache is now required
     exclude.push(config.cache.db.clone());
-    for arena_config in &config.arenas {
-        exclude.push(arena_config.workdir.clone())
+    for NamedArenaConfig { config, .. } in &config.arenas {
+        exclude.push(config.workdir.clone())
     }
 
     exclude

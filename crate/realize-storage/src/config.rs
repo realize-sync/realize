@@ -7,7 +7,7 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(rename = "arena")]
-    pub arenas: Vec<ArenaConfig>,
+    pub arenas: Vec<NamedArenaConfig>,
     pub cache: CacheConfig,
 }
 
@@ -26,12 +26,18 @@ impl StorageConfig {
 
     /// Get arena config by name
     pub fn arena_config(&self, arena: Arena) -> Option<&ArenaConfig> {
-        self.arenas.iter().find(|c| c.arena == arena)
+        self.arenas
+            .iter()
+            .find(|c| c.arena == arena)
+            .map(|c| &c.config)
     }
 
     /// Get arena config by name (mutable)
     pub fn arena_config_mut(&mut self, arena: Arena) -> Option<&mut ArenaConfig> {
-        self.arenas.iter_mut().find(|c| c.arena == arena)
+        self.arenas
+            .iter_mut()
+            .find(|c| c.arena == arena)
+            .map(|c| &mut c.config)
     }
 }
 
@@ -56,11 +62,18 @@ impl CacheConfig {
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ArenaConfig {
+pub struct NamedArenaConfig {
     /// The name of this arena
     #[serde(rename = "name")]
     pub arena: Arena,
 
+    #[serde(flatten)]
+    pub config: ArenaConfig,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArenaConfig {
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
     pub datadir: PathBuf,
@@ -89,7 +102,7 @@ pub struct ArenaConfig {
     pub disk_usage: Option<DiskUsageLimits>,
 }
 
-impl ArenaConfig {
+impl NamedArenaConfig {
     pub fn new<P1, P2>(arena: Arena, root: P1, metadata: P2) -> Self
     where
         P1: AsRef<std::path::Path>,
@@ -97,11 +110,13 @@ impl ArenaConfig {
     {
         Self {
             arena,
-            datadir: root.as_ref().to_path_buf(),
-            workdir: metadata.as_ref().to_path_buf(),
-            max_parallel_hashers: None,
-            debounce: None,
-            disk_usage: None,
+            config: ArenaConfig {
+                datadir: root.as_ref().to_path_buf(),
+                workdir: metadata.as_ref().to_path_buf(),
+                max_parallel_hashers: None,
+                debounce: None,
+                disk_usage: None,
+            },
         }
     }
 }
@@ -377,24 +392,28 @@ mod tests {
                 db: PathBuf::from("/path/to/cache.db"),
             },
             arenas: vec![
-                ArenaConfig {
+                NamedArenaConfig {
                     arena: Arena::from("arena1"),
-                    workdir: PathBuf::from("/path/to/arena1"),
-                    datadir: PathBuf::from("/path/to/arena1/data"),
-                    max_parallel_hashers: Some(4),
-                    debounce: Some(HumanDuration::from_millis(500)),
-                    disk_usage: None,
+                    config: ArenaConfig {
+                        workdir: PathBuf::from("/path/to/arena1"),
+                        datadir: PathBuf::from("/path/to/arena1/data"),
+                        max_parallel_hashers: Some(4),
+                        debounce: Some(HumanDuration::from_millis(500)),
+                        disk_usage: None,
+                    },
                 },
-                ArenaConfig {
+                NamedArenaConfig {
                     arena: Arena::from("arena2"),
-                    workdir: PathBuf::from("/path/to/arena2"),
-                    datadir: PathBuf::from("/path/to/arena2/data"),
-                    max_parallel_hashers: None,
-                    debounce: None,
-                    disk_usage: Some(DiskUsageLimits {
-                        max: BytesOrPercent::Bytes(1073741824),
-                        leave: None,
-                    }),
+                    config: ArenaConfig {
+                        workdir: PathBuf::from("/path/to/arena2"),
+                        datadir: PathBuf::from("/path/to/arena2/data"),
+                        max_parallel_hashers: None,
+                        debounce: None,
+                        disk_usage: Some(DiskUsageLimits {
+                            max: BytesOrPercent::Bytes(1073741824),
+                            leave: None,
+                        }),
+                    },
                 },
             ],
         };

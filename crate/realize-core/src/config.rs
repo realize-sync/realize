@@ -73,8 +73,9 @@ mod tests {
                 },
                 storage: realize_storage::config::StorageConfig {
                     arenas: vec![
-                        realize_storage::config::ArenaConfig {
+                        realize_storage::config::NamedArenaConfig {
                             arena: Arena::from("arena1"),
+                            config: realize_storage::config::ArenaConfig {
                             datadir: PathBuf::from("/path/to/arena1/data"),
                             workdir: PathBuf::from("/path/to/arena1"),
                             max_parallel_hashers: Some(4),
@@ -83,6 +84,7 @@ mod tests {
                                 max: realize_storage::config::BytesOrPercent::Percent(50),
                                 leave: Some(realize_storage::config::BytesOrPercent::Bytes(1024 * 1024 * 1024)),
                             }),
+                            }
                         },
                     ],
                     cache: realize_storage::config::CacheConfig {

@@ -3,7 +3,7 @@ use assert_fs::prelude::*;
 use realize_core::config::Config;
 use realize_network::config::PeerConfig;
 use realize_network::unixsocket;
-use realize_storage::config::{ArenaConfig, CacheConfig};
+use realize_storage::config::{CacheConfig, NamedArenaConfig};
 use realize_types;
 use realize_types::{Arena, Peer};
 use std::env;
@@ -73,7 +73,7 @@ impl Fixture {
         };
 
         // Configure arena with required cache and optional local path
-        config.storage.arenas.push(ArenaConfig::new(
+        config.storage.arenas.push(NamedArenaConfig::new(
             arena,
             testdir.to_path_buf(),
             tempdir.child("testdir-metadata").to_path_buf(),

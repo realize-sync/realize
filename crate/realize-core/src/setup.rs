@@ -7,6 +7,7 @@ use crate::rpc::control::server::ControlServer;
 use anyhow::Context;
 use realize_network::{Networking, Server, unixsocket};
 use realize_storage::Storage;
+use realize_storage::config::NamedArenaConfig;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -163,9 +164,8 @@ async fn make_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Checks that all directories in the config file are accessible.
-fn check_dirs(arenas: &[realize_storage::config::ArenaConfig]) -> anyhow::Result<()> {
-    for config in arenas {
-        let arena = config.arena;
+fn check_dirs(arenas: &[realize_storage::config::NamedArenaConfig]) -> anyhow::Result<()> {
+    for NamedArenaConfig { arena, config } in arenas {
         let workdir = &config.workdir;
         let workdir_m = match config.workdir.metadata() {
             Ok(m) => m,
@@ -237,7 +237,7 @@ mod tests {
     use super::*;
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
-    use realize_storage::config::ArenaConfig;
+    use realize_storage::config::NamedArenaConfig;
     use realize_types::Arena;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -251,7 +251,7 @@ mod tests {
         datadir.create_dir_all()?;
         let workdir = tempdir.child("metadata");
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -273,7 +273,7 @@ mod tests {
         let datadir = tempdir.child("root");
         let workdir = tempdir.child("metadata");
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -297,7 +297,7 @@ mod tests {
         datadir.create_dir_all()?;
         workdir.create_dir_all()?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -321,7 +321,7 @@ mod tests {
         datadir.write_str("not a directory")?;
         workdir.create_dir_all()?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -351,7 +351,7 @@ mod tests {
         perms.set_mode(0o000); // No permissions
         fs::set_permissions(datadir.path(), perms)?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -381,7 +381,7 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         fs::set_permissions(datadir.path(), perms)?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -404,7 +404,7 @@ mod tests {
         workdir.create_dir_all()?;
         datadir.create_dir_all()?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),
@@ -433,7 +433,7 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         fs::set_permissions(workdir.path(), perms)?;
 
-        let arenas = vec![ArenaConfig::new(
+        let arenas = vec![NamedArenaConfig::new(
             arena,
             datadir.to_path_buf(),
             workdir.to_path_buf(),

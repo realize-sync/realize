@@ -1,5 +1,7 @@
+use crate::config::ArenaConfig;
+
 use super::Storage;
-use super::config::{ArenaConfig, CacheConfig, HumanDuration, StorageConfig};
+use super::config::{CacheConfig, HumanDuration, NamedArenaConfig, StorageConfig};
 use realize_types::Arena;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,15 +34,17 @@ where
             .into_iter()
             .map(|arena| {
                 let arena_datadir = arena_root(dir, arena);
-                ArenaConfig {
+                NamedArenaConfig {
                     arena,
-                    workdir: arena_datadir.parent().unwrap().to_path_buf(),
-                    datadir: arena_datadir,
+                    config: ArenaConfig {
+                        workdir: arena_datadir.parent().unwrap().to_path_buf(),
+                        datadir: arena_datadir,
 
-                    // Disabled in tests
-                    debounce: Some(HumanDuration(Duration::ZERO)),
-                    max_parallel_hashers: Some(0),
-                    disk_usage: None,
+                        // Disabled in tests
+                        debounce: Some(HumanDuration(Duration::ZERO)),
+                        max_parallel_hashers: Some(0),
+                        disk_usage: None,
+                    },
                 }
             })
             .collect(),
@@ -49,8 +53,8 @@ where
         },
     };
 
-    for arena_config in &config.arenas {
-        std::fs::create_dir_all(&arena_config.datadir)?;
+    for NamedArenaConfig { config, .. } in &config.arenas {
+        std::fs::create_dir_all(&config.datadir)?;
     }
 
     Ok(config)
