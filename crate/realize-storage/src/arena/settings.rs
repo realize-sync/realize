@@ -49,6 +49,16 @@ impl<'a> WritableOpenSettings<'a> {
             after_commit,
         }
     }
+
+    /// Load settings from the database.
+    ///
+    /// The settings returned by this call are guaranteed to match the transaction's,
+    /// which isn't necessarily the case when using [Settings::borrow].
+    pub(crate) fn load(&mut self) -> Result<SettingsTableEntry, StorageError> {
+        load(&mut self.table)
+    }
+
+    /// Modify disk usage configuration in the settings.
     pub(crate) fn configure_disk_usage(
         &mut self,
         config: &DiskUsageConfig,

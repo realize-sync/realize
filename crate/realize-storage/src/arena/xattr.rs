@@ -9,12 +9,15 @@ use crate::arena::fs::ArenaFsLoc;
 use crate::arena::mark::MarkExt;
 use crate::arena::tree::{TreeExt, TreeReadOperations};
 use crate::arena::types::FileAlternative;
+use crate::config::BytesOrPercent;
 use crate::{CacheStatus, FileRealm, Mark, StorageError, Version};
 
 const XATTR_MARK: &str = "realize.mark";
 const XATTR_STATUS: &str = "realize.status";
 const XATTR_VERSION: &str = "realize.version";
 const XATTR_VERSIONS: &str = "realize.versions";
+const XATTR_QUOTA_MAX: &str = "realize.quota.max";
+const XATTR_QUOTA_LEAVE: &str = "realize.quota.leave";
 
 pub(crate) fn list(
     db: &Arc<ArenaDatabase>,
@@ -25,7 +28,7 @@ pub(crate) fn list(
     let cache = txn.read_cache()?;
     let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
     if pathid == tree.root() {
-        return Ok(vec![]);
+        return Ok(vec![XATTR_QUOTA_MAX, XATTR_QUOTA_LEAVE]);
     }
     match cache
         .metadata(&tree, pathid)?
@@ -101,6 +104,26 @@ pub(crate) fn get(
         return Ok(format_versions(&alternatives));
     }
 
+    if xattr == XATTR_QUOTA_MAX || xattr == XATTR_QUOTA_LEAVE {
+        let txn = db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+        if pathid != tree.root() {
+            return Err(StorageError::NoSuchAttribute);
+        }
+        let disk_usage = db.settings().borrow().disk_usage.clone();
+        let val = if xattr == XATTR_QUOTA_MAX {
+            disk_usage.max
+        } else {
+            disk_usage.leave
+        };
+        return Ok(match val {
+            None => "".to_string(),
+            Some(bop) => bop.to_string(),
+        });
+    }
+
     Err(StorageError::NoSuchAttribute)
 }
 
@@ -158,6 +181,38 @@ pub(crate) fn set(
         return Ok(());
     }
 
+    if name == XATTR_QUOTA_MAX || name == XATTR_QUOTA_LEAVE {
+        let value = if value.is_empty() {
+            None
+        } else {
+            Some(
+                BytesOrPercent::parse(value.as_ref())
+                    .map_err(|_| StorageError::InvalidAttributeValue)?,
+            )
+        };
+
+        let txn = db.begin_write()?;
+        {
+            let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+            let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+            if pathid != tree.root() {
+                return Err(StorageError::NoSuchAttribute);
+            }
+
+            let mut settings = txn.write_settings()?;
+            let mut disk_usage = settings.load()?.disk_usage;
+            if name == XATTR_QUOTA_MAX {
+                disk_usage.max = value;
+            } else {
+                disk_usage.leave = value;
+            }
+            settings.configure_disk_usage(&disk_usage)?;
+        }
+        txn.commit()?;
+        return Ok(());
+    }
+
     Err(StorageError::NoSuchAttribute)
 }
 
@@ -200,18 +255,13 @@ fn format_alternative(alt: &FileAlternative) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Blob, Notification,
-        arena::{index, update},
-        utils::hash,
-    };
-
     use super::*;
-    use assert_fs::{
-        TempDir,
-        fixture::ChildPath,
-        prelude::{FileWriteStr, PathChild, PathCreateDir},
-    };
+    use crate::arena::index;
+    use crate::config::{BytesOrPercent, DiskUsageConfig};
+    use crate::{Blob, Notification, arena::update, utils::hash};
+    use assert_fs::TempDir;
+    use assert_fs::fixture::ChildPath;
+    use assert_fs::prelude::{FileWriteStr, PathChild, PathCreateDir};
     use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 
     struct Fixture {
@@ -348,7 +398,10 @@ mod tests {
     fn list_root_xattr() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        assert_eq!(0, super::list(&fixture.db, Path::root())?.len());
+        assert_unordered::assert_eq_unordered!(
+            vec!["realize.quota.max", "realize.quota.leave"],
+            super::list(&fixture.db, Path::root())?
+        );
 
         Ok(())
     }
@@ -579,6 +632,43 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
                 "{ret:?} on {path:?}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_and_set_quota() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        assert_eq!(
+            "",
+            super::get(&fixture.db, Path::root(), "realize.quota.max")?
+        );
+        assert_eq!(
+            "",
+            super::get(&fixture.db, Path::root(), "realize.quota.leave")?
+        );
+
+        super::set(
+            &fixture.db,
+            Path::root(),
+            "realize.quota.leave",
+            "15%".into(),
+        )?;
+        super::set(&fixture.db, Path::root(), "realize.quota.max", "20M".into())?;
+        assert_eq!(
+            DiskUsageConfig {
+                max: Some(BytesOrPercent::Bytes(20 * 1024 * 1024)),
+                leave: Some(BytesOrPercent::Percent(15))
+            },
+            fixture.db.settings().borrow().disk_usage
+        );
+
+        super::set(&fixture.db, Path::root(), "realize.quota.max", "".into())?;
+        super::set(&fixture.db, Path::root(), "realize.quota.leave", "".into())?;
+        assert_eq!(
+            DiskUsageConfig::default(),
+            fixture.db.settings().borrow().disk_usage
+        );
 
         Ok(())
     }

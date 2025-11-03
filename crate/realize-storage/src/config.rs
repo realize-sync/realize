@@ -167,8 +167,16 @@ pub enum BytesOrPercent {
 }
 
 impl BytesOrPercent {
+    /// Convert to a parsable string representation.
+    pub fn to_string(&self) -> String {
+        match self {
+            BytesOrPercent::Percent(p) => format!("{p}%"),
+            BytesOrPercent::Bytes(val) => format!("{val}"),
+        }
+    }
+
     /// Parse a string that can be either a percentage (e.g., "10%") or a human-readable size (e.g., "1.5G", "512M")
-    fn from_str(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         if s.ends_with('%') {
             let percent_str = &s[..s.len() - 1];
             let percent: u32 = percent_str
@@ -253,7 +261,7 @@ impl<'de> serde::Deserialize<'de> for BytesOrPercent {
             where
                 E: serde::de::Error,
             {
-                BytesOrPercent::from_str(v).map_err(E::custom)
+                BytesOrPercent::parse(v).map_err(E::custom)
             }
         }
 
@@ -478,85 +486,85 @@ mod tests {
     fn test_bytes_or_percent_from_str() {
         // Test percentage parsing
         assert_eq!(
-            BytesOrPercent::from_str("10%").unwrap(),
+            BytesOrPercent::parse("10%").unwrap(),
             BytesOrPercent::Percent(10)
         );
         assert_eq!(
-            BytesOrPercent::from_str("0%").unwrap(),
+            BytesOrPercent::parse("0%").unwrap(),
             BytesOrPercent::Percent(0)
         );
         assert_eq!(
-            BytesOrPercent::from_str("100%").unwrap(),
+            BytesOrPercent::parse("100%").unwrap(),
             BytesOrPercent::Percent(100)
         );
 
         // Test byte parsing (no unit)
         assert_eq!(
-            BytesOrPercent::from_str("1024").unwrap(),
+            BytesOrPercent::parse("1024").unwrap(),
             BytesOrPercent::Bytes(1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("0").unwrap(),
+            BytesOrPercent::parse("0").unwrap(),
             BytesOrPercent::Bytes(0)
         );
 
         // Test human-readable size parsing
         assert_eq!(
-            BytesOrPercent::from_str("1B").unwrap(),
+            BytesOrPercent::parse("1B").unwrap(),
             BytesOrPercent::Bytes(1)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1KB").unwrap(),
+            BytesOrPercent::parse("1KB").unwrap(),
             BytesOrPercent::Bytes(1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1K").unwrap(),
+            BytesOrPercent::parse("1K").unwrap(),
             BytesOrPercent::Bytes(1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1MB").unwrap(),
+            BytesOrPercent::parse("1MB").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1M").unwrap(),
+            BytesOrPercent::parse("1M").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1GB").unwrap(),
+            BytesOrPercent::parse("1GB").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024 * 1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1G").unwrap(),
+            BytesOrPercent::parse("1G").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024 * 1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1TB").unwrap(),
+            BytesOrPercent::parse("1TB").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024 * 1024 * 1024)
         );
         assert_eq!(
-            BytesOrPercent::from_str("1T").unwrap(),
+            BytesOrPercent::parse("1T").unwrap(),
             BytesOrPercent::Bytes(1024 * 1024 * 1024 * 1024)
         );
 
         // Test fractional values
         assert_eq!(
-            BytesOrPercent::from_str("1.5G").unwrap(),
+            BytesOrPercent::parse("1.5G").unwrap(),
             BytesOrPercent::Bytes(1610612736)
         );
         assert_eq!(
-            BytesOrPercent::from_str("0.5M").unwrap(),
+            BytesOrPercent::parse("0.5M").unwrap(),
             BytesOrPercent::Bytes(524288)
         );
         assert_eq!(
-            BytesOrPercent::from_str("2.5K").unwrap(),
+            BytesOrPercent::parse("2.5K").unwrap(),
             BytesOrPercent::Bytes(2560)
         );
 
         // Test error cases
-        assert!(BytesOrPercent::from_str("invalid").is_err());
-        assert!(BytesOrPercent::from_str("1.5X").is_err()); // Unknown unit
-        assert!(BytesOrPercent::from_str("10%invalid").is_err()); // Invalid percentage
-        assert!(BytesOrPercent::from_str("").is_err()); // Empty string
+        assert!(BytesOrPercent::parse("invalid").is_err());
+        assert!(BytesOrPercent::parse("1.5X").is_err()); // Unknown unit
+        assert!(BytesOrPercent::parse("10%invalid").is_err()); // Invalid percentage
+        assert!(BytesOrPercent::parse("").is_err()); // Empty string
     }
 
     #[test]
