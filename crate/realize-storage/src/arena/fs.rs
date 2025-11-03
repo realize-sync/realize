@@ -5,15 +5,16 @@ use super::peer::PeersReadOperations;
 use super::tree::TreeExt;
 use super::types::FileMetadata;
 use super::update;
-use crate::arena::mark::MarkExt;
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
+use crate::arena::xattr;
 use crate::global::fs::FileContent;
 use crate::types::Inode;
-use crate::{Blob, FileAlternative, FileRealm, Mark};
+use crate::{Blob, FileRealm};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path, Peer};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
@@ -148,6 +149,30 @@ impl ArenaFilesystem {
         cache
             .metadata(&tree, loc.into().into_tree_loc(&cache)?)?
             .ok_or(StorageError::NotFound)
+    }
+
+    pub(crate) fn list_xattrs(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+    ) -> Result<Vec<&'static str>, StorageError> {
+        xattr::list(&self.db, loc)
+    }
+
+    pub(crate) fn get_xattr(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+        xattr: &str,
+    ) -> Result<String, StorageError> {
+        xattr::get(&self.db, loc, xattr)
+    }
+
+    pub(crate) fn set_xattr(
+        &self,
+        loc: impl Into<ArenaFsLoc>,
+        xattr: &str,
+        value: Cow<'_, str>,
+    ) -> Result<(), StorageError> {
+        xattr::set(&self.db, loc, xattr, value)
     }
 
     pub(crate) fn readdir(
@@ -425,93 +450,6 @@ impl ArenaFilesystem {
 
         Ok(())
     }
-
-    pub(crate) fn get_mark(
-        &self,
-        loc: impl Into<ArenaFsLoc>,
-    ) -> Result<(Mark, bool), StorageError> {
-        let txn = self.db.begin_read()?;
-        let tree = txn.read_tree()?;
-        let cache = txn.read_cache()?;
-        let marks = txn.read_marks()?;
-        let loc = loc.into().into_tree_loc(&cache)?;
-
-        marks.get_full(&tree, loc)
-    }
-
-    pub(crate) fn set_mark(
-        &self,
-        loc: impl Into<ArenaFsLoc>,
-        mark: Mark,
-    ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut marks = txn.write_marks()?;
-            let mut tree = txn.write_tree()?;
-            let mut dirty = txn.write_dirty()?;
-            let cache = txn.read_cache()?;
-            let loc = loc.into().into_tree_loc(&cache)?;
-
-            marks.set(&mut tree, &mut dirty, loc, mark)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn clear_mark(&self, loc: impl Into<ArenaFsLoc>) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut marks = txn.write_marks()?;
-            let mut tree = txn.write_tree()?;
-            let mut dirty = txn.write_dirty()?;
-            let cache = txn.read_cache()?;
-            let loc = loc.into().into_tree_loc(&cache)?;
-
-            marks.clear(&mut tree, &mut dirty, loc)?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    pub(crate) fn list_alternatives(
-        &self,
-        loc: impl Into<ArenaFsLoc>,
-    ) -> Result<Vec<FileAlternative>, StorageError> {
-        let txn = self.db.begin_read()?;
-        let tree = txn.read_tree()?;
-        let cache = txn.read_cache()?;
-        let loc = loc.into().into_tree_loc(&cache)?;
-
-        cache.list_alternatives(&tree, loc)
-    }
-
-    /// Select an alternative version of the file, identified by its hash.
-    ///
-    /// The hash passed to this method should be one of the hashes
-    /// reported by [list_alternatives] for the same file.
-    ///
-    /// This is typically used to switch to another peer's version
-    /// when peers don't all agree on the version.
-    pub(crate) fn select_alternative(
-        &self,
-        loc: impl Into<ArenaFsLoc>,
-        goal: &realize_types::Hash,
-    ) -> Result<(), StorageError> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut tree = txn.write_tree()?;
-            let mut blobs = txn.write_blobs()?;
-            let mut history = txn.write_history()?;
-            let mut dirty = txn.write_dirty()?;
-            let mut cache = txn.write_cache()?;
-            let loc = loc.into().into_tree_loc(&cache)?;
-
-            cache.select_alternative(&mut tree, &mut blobs, &mut history, &mut dirty, loc, goal)?;
-        }
-        txn.commit()?;
-
-        Ok(())
-    }
 }
 
 pub(crate) enum ArenaFsLoc {
@@ -523,7 +461,7 @@ pub(crate) enum ArenaFsLoc {
 }
 
 impl ArenaFsLoc {
-    fn into_tree_loc(
+    pub(crate) fn into_tree_loc(
         self,
         cache: &impl CacheReadOperations,
     ) -> Result<TreeLoc<'static>, StorageError> {

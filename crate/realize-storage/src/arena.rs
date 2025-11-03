@@ -31,6 +31,7 @@ mod tree;
 pub mod types;
 mod update;
 pub mod watcher;
+mod xattr;
 
 /// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {

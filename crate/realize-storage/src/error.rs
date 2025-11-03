@@ -75,6 +75,12 @@ pub enum StorageError {
 
     #[error("specified version is invalid")]
     UnknownVersion,
+
+    #[error("no xattr with that name for this object")]
+    NoSuchAttribute,
+
+    #[error("invalid value for xattr")]
+    InvalidAttributeValue,
 }
 
 impl StorageError {
@@ -122,6 +128,8 @@ impl StorageError {
             StorageError::LocalFileMismatch => NotFound,
             StorageError::InvalidBlobState => InvalidData,
             StorageError::UnknownVersion => InvalidData,
+            StorageError::InvalidAttributeValue => InvalidData,
+            StorageError::NoSuchAttribute => Other,
         }
     }
 

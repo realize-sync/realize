@@ -2,13 +2,14 @@ use super::db::{GlobalDatabase, GlobalReadTransaction};
 use super::pathid_allocator::PathIdAllocator;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
-use crate::arena::types::{DirMetadata, FileAlternative, FileRealm};
+use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
-use crate::{Blob, FileMetadata, Inode, Mark, PathId, StorageError};
+use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
 use redb::ReadableTable;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -468,6 +469,72 @@ impl Filesystem {
         .await?
     }
 
+    pub async fn list_xattrs<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+    ) -> Result<Vec<&'static str>, StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
+                    let fs = this.arena_fs(arena)?;
+                    fs.list_xattrs(loc)
+                }
+                ResolvedLoc::Global(Some(_)) => Ok(vec![]),
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            }
+        })
+        .await?
+    }
+
+    pub async fn get_xattr<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+        xattr: &str,
+    ) -> Result<String, StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+        let xattr = xattr.to_string();
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
+                    let fs = this.arena_fs(arena)?;
+                    fs.get_xattr(loc, &xattr)
+                }
+                ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            }
+        })
+        .await?
+    }
+
+    pub async fn set_xattr<L: Into<FsLoc>>(
+        self: &Arc<Self>,
+        loc: L,
+        xattr: &str,
+        value: Cow<'_, str>,
+    ) -> Result<(), StorageError> {
+        let loc = loc.into();
+        let this = Arc::clone(self);
+        let xattr = xattr.to_string();
+        let value = value.into_owned();
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            match this.resolve_loc(&txn, loc)? {
+                ResolvedLoc::InArena(arena, loc) => {
+                    let fs = this.arena_fs(arena)?;
+                    fs.set_xattr(loc, &xattr, value.into())
+                }
+                ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
+                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            }
+        })
+        .await?
+    }
+
     pub async fn unlink<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
@@ -593,91 +660,6 @@ impl Filesystem {
             let (fs, loc) = this.resolve_arena_loc(loc)?;
 
             fs.create(options, loc)
-        })
-        .await?
-    }
-
-    /// Return the mark value and whether it was set directly on this inode
-    pub async fn get_mark<L: Into<FsLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-    ) -> Result<(Mark, bool), StorageError> {
-        let loc = loc.into();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
-
-            fs.get_mark(loc)
-        })
-        .await?
-    }
-
-    /// Set a mark on the specified location
-    pub async fn set_mark<L: Into<FsLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-        mark: Mark,
-    ) -> Result<(), StorageError> {
-        let loc = loc.into();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
-
-            fs.set_mark(loc, mark)
-        })
-        .await?
-    }
-
-    /// Clear a mark from the specified location
-    pub async fn clear_mark<L: Into<FsLoc>>(self: &Arc<Self>, loc: L) -> Result<(), StorageError> {
-        let loc = loc.into();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
-
-            fs.clear_mark(loc)
-        })
-        .await?
-    }
-
-    pub async fn list_alternatives<L: Into<FsLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-    ) -> Result<Vec<FileAlternative>, StorageError> {
-        let loc = loc.into();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
-
-            fs.list_alternatives(loc)
-        })
-        .await?
-    }
-
-    /// Select an alternative version of the file, identified by its hash.
-    ///
-    /// The hash passed to this method should be one of the hashes
-    /// reported by [list_alternatives] for the same file.
-    ///
-    /// This is typically used to switch to another peer's version
-    /// when peers don't all agree on the version.
-    pub async fn select_alternative<L: Into<FsLoc>>(
-        self: &Arc<Self>,
-        loc: L,
-        goal: &realize_types::Hash,
-    ) -> Result<(), StorageError> {
-        let loc = loc.into();
-        let goal = goal.clone();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
-
-            fs.select_alternative(loc, &goal)
         })
         .await?
     }

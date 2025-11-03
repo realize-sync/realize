@@ -11,7 +11,6 @@
 //! - `format`: Formatting utilities for xattr values
 
 mod error;
-mod format;
 mod handles;
 mod interface;
 mod operations;

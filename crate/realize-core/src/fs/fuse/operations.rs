@@ -4,7 +4,6 @@
 //! including InnerRealizeFs and all the filesystem operation implementations.
 
 use super::error::FuseError;
-use super::format;
 use super::handles::{FHMode, FHRegistry, FileHandle};
 use crate::fs::downloader::Downloader;
 use crate::fs::fuse::handles::ReadDirData;
@@ -15,10 +14,8 @@ use nix::sys::stat;
 use nix::sys::time::TimeSpec;
 use nix::unistd::{Gid, Uid};
 use realize_storage::{
-    CacheStatus, DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Mark,
-    Metadata, StorageError, Version,
+    DirMetadata, FileContent, FileMetadata, FileRealm, Filesystem, Inode, Metadata, StorageError,
 };
-use realize_types::Hash;
 use std::ffi::OsString;
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
@@ -26,11 +23,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio_util::bytes::BufMut;
-
-const XATTR_MARK: &str = "realize.mark";
-const XATTR_STATUS: &str = "realize.status";
-const XATTR_VERSION: &str = "realize.version";
-const XATTR_VERSIONS: &str = "realize.versions";
 
 pub(crate) struct InnerRealizeFs {
     fs: Arc<Filesystem>,
@@ -81,56 +73,17 @@ impl InnerRealizeFs {
     }
 
     pub(crate) async fn listxattr(&self, ino: Inode) -> Result<Vec<&'static str>, FuseError> {
-        if let Metadata::File(_) = self.fs.metadata(ino).await? {
-            return Ok(vec![
-                XATTR_MARK,
-                XATTR_STATUS,
-                XATTR_VERSION,
-                XATTR_VERSIONS,
-            ]);
-        }
-
-        Ok(vec![XATTR_MARK])
+        Ok(self.fs.list_xattrs(ino).await?)
     }
 
     pub(crate) async fn getxattr(&self, ino: Inode, name: OsString) -> Result<String, FuseError> {
-        if name == XATTR_MARK {
-            let (mark, direct) = self.fs.get_mark(ino).await?;
-            if direct {
-                return Ok(mark.to_string());
-            }
-            return Ok(format!("{} (derived)", mark));
-        }
+        let name = name.to_str().ok_or(FuseError::utf8())?;
 
-        if name == XATTR_STATUS {
-            return Ok(match self.fs.file_realm(ino).await? {
-                FileRealm::Local(_) => "local 100%".to_string(),
-                FileRealm::Remote(CacheStatus::Missing) => "remote 0%".to_string(),
-                FileRealm::Remote(CacheStatus::Complete) => "remote 100%".to_string(),
-                FileRealm::Remote(CacheStatus::Verified) => "remote 100% verified".to_string(),
-                FileRealm::Remote(CacheStatus::Partial(size, available_ranges)) => {
-                    format!(
-                        "remote {:0.0}%",
-                        (available_ranges.bytecount() as f64) / (size as f64) * 100.0
-                    )
-                }
-            });
+        match self.fs.get_xattr(ino, name).await {
+            Ok(res) => Ok(res),
+            Err(StorageError::NoSuchAttribute) => Err(Errno::ENOENT.into()),
+            Err(err) => Err(err.into()),
         }
-
-        if name == XATTR_VERSION {
-            let m = self.fs.file_metadata(ino).await?;
-            return Ok(match m.version {
-                Version::Modified(_) => "modified".to_string(),
-                Version::Indexed(hash) => hash.to_string(),
-            });
-        }
-
-        if name == XATTR_VERSIONS {
-            let alternatives = self.fs.list_alternatives(ino).await?;
-            return Ok(format::format_versions(&alternatives));
-        }
-
-        Err(Errno::ENODATA.into())
     }
 
     pub(crate) async fn setxattr(
@@ -139,44 +92,17 @@ impl InnerRealizeFs {
         name: OsString,
         value: Vec<u8>,
     ) -> Result<(), FuseError> {
-        if name == XATTR_MARK {
-            // Parse the mark value from the byte slice
-            let value_str = std::str::from_utf8(&value)
-                .map_err(|_| FuseError::utf8())?
-                .trim();
+        let name = name.to_str().ok_or(FuseError::utf8())?;
+        let value = std::str::from_utf8(&value)
+            .map_err(|_| FuseError::utf8())?
+            .trim();
 
-            if value_str.is_empty() {
-                // Clear the mark
-                self.fs.clear_mark(ino).await?;
-            } else {
-                // Parse and set the mark
-                let mark = Mark::parse(value_str).ok_or(FuseError::from(Errno::EINVAL))?;
-                self.fs.set_mark(ino, mark).await?;
-            }
-            return Ok(());
+        match self.fs.set_xattr(ino, name, value.into()).await {
+            Ok(_) => Ok(()),
+            Err(StorageError::NoSuchAttribute) => Err(Errno::ENOTSUP.into()),
+            Err(StorageError::UnknownVersion) => Err(Errno::ENOENT.into()),
+            Err(err) => Err(err.into()),
         }
-
-        if name == XATTR_VERSION {
-            let value_str = std::str::from_utf8(&value)
-                .map_err(|_| FuseError::from(Errno::EINVAL))?
-                .trim();
-
-            let hash = match Hash::from_base64(value_str) {
-                Some(hash) => hash,
-                None => return Err(FuseError::from(Errno::EINVAL)),
-            };
-
-            match self.fs.select_alternative(ino, &hash).await {
-                Ok(()) => return Ok(()),
-                Err(StorageError::UnknownVersion) => {
-                    return Err(FuseError::from(Errno::ENOENT));
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        // Other attributes are not supported for setting
-        Err(Errno::ENOTSUP.into())
     }
 
     pub(crate) async fn read(
