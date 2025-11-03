@@ -1,4 +1,4 @@
-use crate::config::{ArenaConfig, DiskUsageConfig, WatcherConfig};
+use crate::config::{ArenaConfig, WatcherConfig};
 
 use super::Storage;
 use super::config::{CacheConfig, HumanDuration, NamedArenaConfig, StorageConfig};
@@ -39,8 +39,6 @@ where
                     config: ArenaConfig {
                         workdir: arena_datadir.parent().unwrap().to_path_buf(),
                         datadir: arena_datadir,
-
-                        disk_usage: DiskUsageConfig::default(),
                     },
                 }
             })

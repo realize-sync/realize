@@ -98,15 +98,6 @@ pub struct ArenaConfig {
     ///
     /// This directory must be on the same directory as datadir, if specified.
     pub workdir: PathBuf,
-
-    /// Limits how much disk space will be used to store local copies
-    /// of remote data.
-    ///
-    /// Note that it might not be possible to enforce this limitation:
-    /// if the size of files to keep goes above that limit, those
-    /// files are kept anyways.
-    #[serde(default)]
-    pub disk_usage: DiskUsageConfig,
 }
 
 impl NamedArenaConfig {
@@ -120,14 +111,12 @@ impl NamedArenaConfig {
             config: ArenaConfig {
                 datadir: root.as_ref().to_path_buf(),
                 workdir: metadata.as_ref().to_path_buf(),
-                disk_usage: DiskUsageConfig::default(),
             },
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct DiskUsageConfig {
     /// Try to use at most that many bytes or percent of disk.
     ///
@@ -223,49 +212,6 @@ impl BytesOrPercent {
 
             Ok(BytesOrPercent::Bytes(bytes))
         }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for BytesOrPercent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct BytesOrPercentVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for BytesOrPercentVisitor {
-            type Value = BytesOrPercent;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a number, a string like '1.5G' or '10%'")
-            }
-
-            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(BytesOrPercent::Bytes(v))
-            }
-
-            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                if v < 0 {
-                    return Err(E::custom("negative values are not allowed"));
-                }
-                Ok(BytesOrPercent::Bytes(v as u64))
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                BytesOrPercent::parse(v).map_err(E::custom)
-            }
-        }
-
-        deserializer.deserialize_any(BytesOrPercentVisitor)
     }
 }
 
@@ -402,7 +348,6 @@ mod tests {
             name = "arena2"
             datadir = "/path/to/arena2/data"
             workdir = "/path/to/arena2"
-            disk_usage = { max = "1G" }
         "#;
 
         let config: StorageConfig = toml::from_str(toml_str).unwrap();
@@ -420,7 +365,6 @@ mod tests {
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena1"),
                         datadir: PathBuf::from("/path/to/arena1/data"),
-                        disk_usage: DiskUsageConfig::default(),
                     },
                 },
                 NamedArenaConfig {
@@ -428,10 +372,6 @@ mod tests {
                     config: ArenaConfig {
                         workdir: PathBuf::from("/path/to/arena2"),
                         datadir: PathBuf::from("/path/to/arena2/data"),
-                        disk_usage: DiskUsageConfig {
-                            max: Some(BytesOrPercent::Bytes(1073741824)),
-                            leave: None,
-                        },
                     },
                 },
             ],
@@ -441,49 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_disk_usage() {
-        #[derive(serde::Deserialize)]
-        struct ConfigWithDiskUsage {
-            disk_usage: DiskUsageConfig,
-        }
-        fn parse(str: &str) -> DiskUsageConfig {
-            toml::from_str::<ConfigWithDiskUsage>(&format!("disk_usage = {{{str}}}"))
-                .unwrap()
-                .disk_usage
-        }
-        assert_eq!(
-            parse(r#"max = 1610612736 "#),
-            DiskUsageConfig {
-                max: Some(BytesOrPercent::Bytes(1610612736)),
-                leave: None,
-            }
-        );
-        assert_eq!(parse(""), DiskUsageConfig::default());
-        assert_eq!(
-            parse(r#"max = "1.5G" "#),
-            DiskUsageConfig {
-                max: Some(BytesOrPercent::Bytes(1610612736)),
-                leave: None,
-            }
-        );
-        assert_eq!(
-            parse(r#"max = "10%" "#),
-            DiskUsageConfig {
-                max: Some(BytesOrPercent::Percent(10)),
-                leave: None,
-            }
-        );
-        assert_eq!(
-            parse(r#"max = "512M", leave = "5%" "#),
-            DiskUsageConfig {
-                max: Some(BytesOrPercent::Bytes(536870912)),
-                leave: Some(BytesOrPercent::Percent(5))
-            }
-        );
-    }
-
-    #[test]
-    fn test_bytes_or_percent_from_str() {
+    fn parse_bytes_or_percent() {
         // Test percentage parsing
         assert_eq!(
             BytesOrPercent::parse("10%").unwrap(),

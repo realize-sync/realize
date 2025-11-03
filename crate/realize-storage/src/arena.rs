@@ -97,13 +97,6 @@ impl ArenaStorage {
 
             async move { cleaner::run_loop(db, shutdown).await }
         });
-        // TODO: allow configuring disk usage dynamically
-        {
-            let txn = db.begin_write()?;
-            txn.write_settings()?
-                .configure_disk_usage(&arena_config.disk_usage)?;
-            txn.commit()?;
-        }
         tokio::spawn({
             let db = Arc::clone(&db);
             let shutdown = shutdown.clone();

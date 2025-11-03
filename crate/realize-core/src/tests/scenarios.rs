@@ -1,6 +1,5 @@
 use crate::consensus::churten::Churten;
 use crate::rpc::testing::{self, HouseholdFixture};
-use realize_storage::config::DiskUsageConfig;
 use realize_storage::utils::hash;
 use realize_storage::{CacheStatus, FileRealm, Mark, Version};
 use realize_types::Path;
@@ -13,12 +12,7 @@ async fn file_drop() -> anyhow::Result<()> {
     let a = HouseholdFixture::a();
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
-    let mut builder = HouseholdFixture::builder();
-    let config = builder.config_mut(a);
-    let arena_config = config.arena_config_mut(arena).unwrap();
-    arena_config.disk_usage = DiskUsageConfig::max_bytes(0);
-
-    let mut fixture = builder.setup().await?;
+    let mut fixture = HouseholdFixture::builder().setup().await?;
     fixture
         .with_two_peers()
         .await?
@@ -28,6 +22,13 @@ async fn file_drop() -> anyhow::Result<()> {
             storage_a.set_arena_mark(arena, Mark::Watch).await?;
             let storage_b = fixture.storage(b)?;
             storage_b.set_arena_mark(arena, Mark::Own).await?;
+
+            for peer in [a, b] {
+                fixture
+                    .cache(peer)?
+                    .set_xattr((arena, Path::root()), "realize.quota.max", "0".into())
+                    .await?;
+            }
 
             // write a file to a; it'll get downloaded by b then a's
             // copy will be deleted.
@@ -83,17 +84,20 @@ async fn link_to_own() -> anyhow::Result<()> {
     let a = HouseholdFixture::a();
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
-    let mut builder = HouseholdFixture::builder();
-    let config = builder.config_mut(a);
-    let arena_config = config.arena_config_mut(arena).unwrap();
-    arena_config.disk_usage = DiskUsageConfig::max_bytes(0);
-
-    let mut fixture = builder.setup().await?;
+    let mut fixture = HouseholdFixture::builder().setup().await?;
     fixture
         .with_two_peers()
         .await?
         .run(async |household_a, household_b| {
             testing::connect(&household_a, b).await?;
+
+            for peer in [a, b] {
+                fixture
+                    .cache(peer)?
+                    .set_xattr((arena, Path::root()), "realize.quota.max", "0".into())
+                    .await?;
+            }
+
             let work = Path::parse("work")?;
             let store = Path::parse("store")?;
             let storage_a = fixture.storage(a)?;
