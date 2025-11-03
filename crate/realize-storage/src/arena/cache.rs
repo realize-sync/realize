@@ -1692,7 +1692,6 @@ fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
             let (k, v) = entry?;
             let (_, layer) = k.value();
             let entry = v.value().parse()?;
-            log::debug!("{pathid:?} entry {entry:?}");
             if let CacheTableEntry::File(entry) = entry {
                 match layer {
                     Layer::Default => {
