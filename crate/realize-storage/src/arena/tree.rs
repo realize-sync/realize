@@ -54,7 +54,7 @@ impl Tree {
 
 pub(crate) struct ReadableOpenTree<T>
 where
-    T: ReadableTable<(PathId, &'static str), PathId>,
+    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
 {
     table: T,
     arena: Arena,
@@ -63,7 +63,7 @@ where
 
 impl<T> ReadableOpenTree<T>
 where
-    T: ReadableTable<(PathId, &'static str), PathId>,
+    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
 {
     pub(crate) fn new(table: T, tree: &Tree) -> Self {
         Self {
@@ -108,7 +108,7 @@ pub(crate) trait TreeReadOperations {
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
 where
-    T: ReadableTable<(PathId, &'static str), PathId>,
+    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
 {
     fn root(&self) -> PathId {
         PartialPathId::ROOT.with(self.prefix)
@@ -423,8 +423,8 @@ where
 pub(crate) struct WritableOpenTree<'a> {
     tag: Tag,
     before_commit: &'a BeforeCommit,
-    table: Table<'a, (PathId, &'static str), PathId>,
-    refcount_table: Table<'a, PathId, u32>,
+    table: Table<'a, (PartialPathId, &'static str), PartialPathId>,
+    refcount_table: Table<'a, PartialPathId, u32>,
     pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
     tree: &'a Tree,
 }
@@ -433,8 +433,8 @@ impl<'a> WritableOpenTree<'a> {
     pub(crate) fn new(
         tag: Tag,
         before_commit: &'a BeforeCommit,
-        tree_table: Table<'a, (PathId, &'static str), PathId>,
-        refcount_table: Table<'a, PathId, u32>,
+        tree_table: Table<'a, (PartialPathId, &'static str), PartialPathId>,
+        refcount_table: Table<'a, PartialPathId, u32>,
         pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
         tree: &'a Tree,
     ) -> Self {
@@ -478,7 +478,7 @@ impl<'a> WritableOpenTree<'a> {
             TreeLoc::PathIdAndName(pathid, name) => self.setup_name(pathid, name.as_ref())?,
         };
         if table.insert(key, value)?.is_none() {
-            self.incref(pathid)?;
+            self.incref(pathid.partial())?;
             return Ok(true);
         }
 
@@ -509,7 +509,7 @@ impl<'a> WritableOpenTree<'a> {
     {
         if let Some(pathid) = self.resolve(loc)? {
             if table.remove(key)?.is_some() {
-                self.decref(pathid)?;
+                self.decref(pathid.partial())?;
                 return Ok(true);
             }
         }
@@ -543,7 +543,7 @@ impl<'a> WritableOpenTree<'a> {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated pathid is lost, so it's
                 // not a no-op.
-                txn.write_tree()?.check_refcount(pathid)
+                txn.write_tree()?.check_refcount(pathid.partial())
             });
         }
 
@@ -572,7 +572,7 @@ impl<'a> WritableOpenTree<'a> {
                 // Check refcount and delete the entry if it reaches
                 // 0. Note that the allocated pathid is lost, so it's
                 // not a no-op.
-                txn.write_tree()?.check_refcount(pathid)
+                txn.write_tree()?.check_refcount(pathid.partial())
             });
         }
         Ok(pathid)
@@ -609,9 +609,9 @@ impl<'a> WritableOpenTree<'a> {
             Some(pathid) => Ok((pathid, false)),
             None => {
                 let new_pathid = self.allocate_pathid()?;
-                self.add_pathid(parent_pathid, new_pathid, name)?;
+                self.add_pathid(parent_pathid.partial(), new_pathid, name)?;
 
-                Ok((new_pathid, true))
+                Ok((new_pathid.with(self.tree.prefix), true))
             }
         }
     }
@@ -621,14 +621,14 @@ impl<'a> WritableOpenTree<'a> {
     /// This is called automatically by the insert methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn incref(&mut self, pathid: PathId) -> Result<(), StorageError> {
+    fn incref(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
             .get(pathid)?
             .map(|v| v.value())
             .unwrap_or(0);
         if refcount == 0 {
-            log::trace!("[{}] PathId {pathid} got its first reference", self.tag);
+            log::trace!("[{}] {pathid} got its first reference", self.tag);
         }
 
         refcount += 1;
@@ -642,7 +642,7 @@ impl<'a> WritableOpenTree<'a> {
     /// This is called automatically by the remove methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn decref(&mut self, pathid: PathId) -> Result<(), StorageError> {
+    fn decref(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
             .get(pathid)?
@@ -659,7 +659,7 @@ impl<'a> WritableOpenTree<'a> {
         Ok(())
     }
 
-    fn check_refcount(&mut self, pathid: PathId) -> Result<(), StorageError> {
+    fn check_refcount(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
         let refcount = self
             .refcount_table
             .get(pathid)?
@@ -679,9 +679,9 @@ impl<'a> WritableOpenTree<'a> {
     /// Remove mapping of `pathid` from its parent.
     ///
     /// This must only be called after checking the pathid refcount.
-    fn remove_mapping(&mut self, pathid: PathId) -> Result<(), StorageError> {
+    fn remove_mapping(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
         log::trace!(
-            "[{}] PathId {pathid} lost its last reference; Cleaning up.",
+            "[{}] {pathid} lost its last reference; Cleaning up.",
             self.tag
         );
         self.refcount_table.remove(pathid)?;
@@ -695,14 +695,14 @@ impl<'a> WritableOpenTree<'a> {
         Ok(())
     }
 
-    fn allocate_pathid(&mut self) -> Result<PathId, StorageError> {
-        Ok(pathid_allocator::allocate(&mut self.pathid_range_table)?.with(self.tree.prefix))
+    fn allocate_pathid(&mut self) -> Result<PartialPathId, StorageError> {
+        pathid_allocator::allocate(&mut self.pathid_range_table)
     }
 
     fn add_pathid(
         &mut self,
-        parent_pathid: PathId,
-        new_pathid: PathId,
+        parent_pathid: PartialPathId,
+        new_pathid: PartialPathId,
         name: &str,
     ) -> Result<(), StorageError> {
         self.table.insert((parent_pathid, name), new_pathid)?;
@@ -714,19 +714,22 @@ impl<'a> WritableOpenTree<'a> {
 }
 
 fn lookup(
-    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
     pathid: PathId,
     name: &str,
 ) -> Result<Option<PathId>, StorageError> {
-    Ok(tree_table.get((pathid, name))?.map(|v| v.value()))
+    Ok(tree_table
+        .get((pathid.partial(), name))?
+        .map(|v| v.value().with(pathid.prefix())))
 }
 
 fn name_in(
-    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
     parent_pathid: PathId,
     pathid: PathId,
 ) -> Result<Option<String>, StorageError> {
-    for v in tree_table.range(pathid_range(parent_pathid))? {
+    let pathid = pathid.partial();
+    for v in tree_table.range(pathid_range(parent_pathid.partial()))? {
         let v = v?;
         let (key, value) = v;
         if value.value() == pathid {
@@ -742,36 +745,47 @@ fn name_in(
 }
 
 fn parent(
-    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
     pathid: PathId,
 ) -> Result<Option<PathId>, StorageError> {
-    Ok(tree_table.get((pathid, ".."))?.map(|v| v.value()))
+    Ok(tree_table
+        .get((pathid.partial(), ".."))?
+        .map(|v| v.value().with(pathid.prefix())))
 }
 
 fn readdir(
-    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
     pathid: PathId,
 ) -> ReadDirIterator<'_> {
     let range = tree_table
-        .range(pathid_range(pathid))
+        .range(pathid_range(pathid.partial()))
         .map_err(|e| StorageError::from(e));
 
-    ReadDirIterator { iter: Some(range) }
+    ReadDirIterator {
+        iter: Some(range),
+        prefix: pathid.prefix(),
+    }
 }
 
 /// Iterator returned by [TreeReadOperations::readdir]
 pub(crate) struct ReadDirIterator<'a> {
-    iter: Option<Result<redb::Range<'a, (PathId, &'static str), PathId>, StorageError>>,
+    iter:
+        Option<Result<redb::Range<'a, (PartialPathId, &'static str), PartialPathId>, StorageError>>,
+    prefix: PathIdPrefix,
 }
 
 impl<'a> ReadDirIterator<'a> {
     pub(crate) fn empty() -> Self {
-        Self { iter: None }
+        Self {
+            iter: None,
+            prefix: PathIdPrefix::ZERO, // doesn't matter
+        }
     }
     /// Builds an iterator that will only return that error.
     pub(crate) fn failed(err: StorageError) -> Self {
         Self {
             iter: Some(Err(err)),
+            prefix: PathIdPrefix::ZERO, // doesn't matter
         }
     }
 }
@@ -793,7 +807,7 @@ impl<'a> Iterator for ReadDirIterator<'a> {
                             let name = v.0.value().1;
                             if name != "." && name != ".." {
                                 let pathid = v.1.value();
-                                return Some(Ok((name.to_string(), pathid)));
+                                return Some(Ok((name.to_string(), pathid.with(self.prefix))));
                             }
                         }
                     }
@@ -806,18 +820,18 @@ impl<'a> Iterator for ReadDirIterator<'a> {
 }
 
 fn get_pathid(
-    table: &impl redb::ReadableTable<(PathId, &'static str), PathId>,
+    table: &impl redb::ReadableTable<(PartialPathId, &'static str), PartialPathId>,
     parent_pathid: PathId,
     name: &str,
 ) -> Result<Option<PathId>, StorageError> {
-    match table.get((parent_pathid, name))? {
+    match table.get((parent_pathid.partial(), name))? {
         None => Ok(None),
-        Some(e) => Ok(Some(e.value())),
+        Some(e) => Ok(Some(e.value().with(parent_pathid.prefix()))),
     }
 }
 
 /// Builds a range that covers all entries for the given pathid.
-fn pathid_range(pathid: PathId) -> std::ops::Range<(PathId, &'static str)> {
+fn pathid_range(pathid: PartialPathId) -> std::ops::Range<(PartialPathId, &'static str)> {
     (pathid, "")..(pathid.plus(1), "")
 }
 
@@ -1169,25 +1183,25 @@ mod tests {
         let baz = tree.setup(&baz_path)?;
         let qux = tree.setup(&qux_path)?;
 
-        tree.incref(bar)?;
-        tree.incref(baz)?;
-        tree.incref(qux)?;
+        tree.incref(bar.partial())?;
+        tree.incref(baz.partial())?;
+        tree.incref(qux.partial())?;
 
         // decref qux deletes it, but not foo
-        tree.decref(qux)?;
+        tree.decref(qux.partial())?;
         assert!(tree.resolve(&foo_path)?.is_some());
         assert!(tree.resolve(&bar_path)?.is_some());
         assert!(tree.resolve(&baz_path)?.is_some());
         assert!(tree.resolve(&qux_path)?.is_none());
 
         // decref bar does not delete it, because it contains baz
-        tree.decref(bar)?;
+        tree.decref(bar.partial())?;
         assert!(tree.resolve(&foo_path)?.is_some());
         assert!(tree.resolve(&bar_path)?.is_some());
         assert!(tree.resolve(&baz_path)?.is_some());
 
         // decref baz deletes everything
-        tree.decref(baz)?;
+        tree.decref(baz.partial())?;
         assert!(tree.resolve(&foo_path)?.is_none());
         assert!(tree.resolve(&bar_path)?.is_none());
         assert!(tree.resolve(&baz_path)?.is_none());
@@ -1218,7 +1232,7 @@ mod tests {
             // refcount is incremented for qux, but not bar, so foo
             // and bar will be removed before committing the
             // transaction.
-            tree.incref(qux)?;
+            tree.incref(qux.partial())?;
         }
         txn.commit()?;
 
@@ -1258,7 +1272,7 @@ mod tests {
             // refcount is incremented for qux, but not bar, so foo
             // and bar will be removed before committing the
             // transaction.
-            tree.incref(qux)?;
+            tree.incref(qux.partial())?;
         }
         txn.commit()?;
 
@@ -1284,22 +1298,22 @@ mod tests {
         let baz = tree.setup(&baz_path)?;
         let bar = tree.resolve(&bar_path)?.unwrap();
 
-        tree.incref(baz)?;
-        tree.incref(bar)?;
-        tree.incref(bar)?;
-        tree.incref(bar)?;
+        tree.incref(baz.partial())?;
+        tree.incref(bar.partial())?;
+        tree.incref(bar.partial())?;
+        tree.incref(bar.partial())?;
 
         // decref baz deletes baz, but not bar
-        tree.decref(baz)?;
+        tree.decref(baz.partial())?;
         assert!(tree.resolve(&bar_path)?.is_some());
         assert!(tree.resolve(&baz_path)?.is_none());
 
         // now that baz is gone, it still takes 3 decref to delete bar
-        tree.decref(bar)?;
+        tree.decref(bar.partial())?;
         assert!(tree.resolve(&bar_path)?.is_some());
-        tree.decref(bar)?;
+        tree.decref(bar.partial())?;
         assert!(tree.resolve(&bar_path)?.is_some());
-        tree.decref(bar)?;
+        tree.decref(bar.partial())?;
         assert!(tree.resolve(&bar_path)?.is_none());
 
         Ok(())

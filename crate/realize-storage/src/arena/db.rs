@@ -41,14 +41,15 @@ const SETTINGS_TABLE: TableDefinition<(), Holder<SettingsTableEntry>> =
 ///
 /// Key: (pathid, name)
 /// Value: pathid
-pub(crate) const TREE_TABLE: TableDefinition<(PathId, &str), PathId> = TableDefinition::new("tree");
+pub(crate) const TREE_TABLE: TableDefinition<(PartialPathId, &str), PartialPathId> =
+    TableDefinition::new("tree");
 
 /// Refcount for tree nodes
 ///
 /// Key: pathid
 /// Value: u32 (refcount)
-pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PathId, u32> =
-    TableDefinition::new("tree.refcount");
+pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PartialPathId, u32> =
+    TableDefinition::new("tree_refcount");
 
 /// Track peer files.
 ///
