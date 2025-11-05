@@ -1,21 +1,19 @@
-use std::sync::Arc;
-
+use super::db::{GlobalReadTransaction, GlobalWriteTransaction};
+use crate::types::{PartialPathId, PathIdPrefix};
+use crate::{GlobalDatabase, PathId, StorageError};
 use bimap::BiMap;
 use realize_types::Arena;
 use redb::ReadableTable;
-
-use crate::{GlobalDatabase, PathId, StorageError};
-
-use super::db::{GlobalReadTransaction, GlobalWriteTransaction};
+use std::sync::Arc;
 
 /// Allocate pathid ranges and assign them to arenas.
 pub(crate) struct PathIdAllocator {
     db: Arc<GlobalDatabase>,
-    arena_roots: BiMap<Arena, PathId>,
+    prefixes: BiMap<Arena, PathIdPrefix>,
 }
 
 impl PathIdAllocator {
-    pub(crate) const ROOT_INODE: PathId = PathId(1);
+    pub(crate) const ROOT_INODE: PathId = PathId::ROOT;
 
     /// Create a new allocator, backed by the given global database.
     ///
@@ -27,7 +25,7 @@ impl PathIdAllocator {
     {
         let mut this = Self {
             db,
-            arena_roots: BiMap::new(),
+            prefixes: BiMap::new(),
         };
         for arena in arenas.into_iter() {
             this.add_arena(arena)?;
@@ -40,12 +38,14 @@ impl PathIdAllocator {
     ///
     /// The arena must have been added to this allocator.
     pub(crate) fn arena_root(&self, arena: Arena) -> Option<PathId> {
-        self.arena_roots.get_by_left(&arena).copied()
+        self.prefixes
+            .get_by_left(&arena)
+            .map(|p| PartialPathId::ROOT.with(*p))
     }
 
     /// Check whether [PathId] is an arena root.
     pub(crate) fn is_arena_root(&self, pathid: PathId) -> bool {
-        self.arena_roots.get_by_right(&pathid).is_some()
+        self.prefixes.get_by_right(&pathid.prefix()).is_some()
     }
 
     /// Allocate an pathid for an arena.
@@ -56,9 +56,7 @@ impl PathIdAllocator {
         current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
         arena: Arena,
     ) -> Result<PathId, StorageError> {
-        self.allocate_pathid(current_range_table, || {
-            self.allocate_pathid_range(arena, 10000)
-        })
+        self.allocate_pathid(current_range_table, || self.pathid_range_for_arena(arena))
     }
 
     /// Allocate a global pathid.
@@ -67,7 +65,7 @@ impl PathIdAllocator {
         txn: &GlobalWriteTransaction,
     ) -> Result<PathId, StorageError> {
         self.allocate_pathid(&mut txn.current_pathid_range_table()?, || {
-            do_alloc_pathid_range(&txn, Self::ROOT_INODE, 100)
+            Ok(pathid_range_with_prefix(PathIdPrefix::ZERO))
         })
     }
 
@@ -77,27 +75,16 @@ impl PathIdAllocator {
     /// these pathids are allocated from the global range.
     pub(crate) fn arena_for_pathid(
         &self,
-        txn: &GlobalReadTransaction,
+        _txn: &GlobalReadTransaction,
         pathid: PathId,
     ) -> Result<Option<Arena>, StorageError> {
-        if pathid == Self::ROOT_INODE {
+        let prefix = pathid.prefix();
+        if prefix == PathIdPrefix::ZERO {
             return Ok(None);
         }
-        if let Some(arena) = self.arena_roots.get_by_right(&pathid) {
+        if let Some(arena) = self.prefixes.get_by_right(&prefix) {
             return Ok(Some(*arena));
         }
-
-        let range_table = txn.pathid_range_allocation_table()?;
-        for entry in range_table.range(pathid..)? {
-            let (_, root) = entry?;
-            let root = root.value();
-            if root == Self::ROOT_INODE {
-                return Ok(None);
-            } else if let Some(arena) = self.arena_roots.get_by_right(&root) {
-                return Ok(Some(*arena));
-            }
-        }
-
         Err(StorageError::NotFound)
     }
 
@@ -106,90 +93,58 @@ impl PathIdAllocator {
         let txn = self.db.begin_write()?;
         {
             let mut arena_table = txn.arena_table()?;
-            let pathid = if let Some(v) = arena_table.get(arena.as_str())? {
-                v.value()
-            } else {
-                let pathid = self.allocate_global_pathid(&txn)?;
-                arena_table.insert(arena.as_str(), pathid)?;
-
-                pathid
-            };
-            self.arena_roots.insert(arena, pathid);
-            log::debug!("[{arena}]: Root pathid {pathid}");
+            let prefix = PathIdPrefix::from_u8(
+                self.prefixes
+                    .right_values()
+                    .map(|p| p.as_u8())
+                    .max()
+                    .unwrap_or(0)
+                    + 1,
+            );
+            self.prefixes.insert(arena, prefix);
+            let root = PartialPathId::ROOT.with(prefix);
+            arena_table.insert(arena.as_str(), root)?;
+            log::debug!("[{arena}]: prefix {prefix} root {root}");
         }
         txn.commit()?;
         Ok(())
     }
 
-    /// Allocate an pathid, using the given table and range allocation
-    /// function.
+    /// Allocate a newpathid, using the given table and range
+    /// allocation function.
     fn allocate_pathid(
         &self,
         current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
         alloc_pathid_range: impl FnOnce() -> Result<(PathId, PathId), StorageError>,
     ) -> Result<PathId, StorageError> {
-        let current_range = match current_range_table.get(())? {
-            Some(value) => {
-                let (current, end) = value.value();
-                Some((current, end))
-            }
-            None => None,
+        let (current, end) = match current_range_table.get(())? {
+            Some(value) => value.value(),
+            None => alloc_pathid_range()?,
         };
-        match current_range {
-            Some((current, end)) if (current.plus(1)) < end => {
-                // We have pathids available in the current range
-                let pathid = current.plus(1);
-                current_range_table.insert((), (pathid, end))?;
-                Ok(pathid)
-            }
-            _ => {
-                // Need to allocate a new range
-                let (start, end) = alloc_pathid_range()?;
-                let pathid = start;
-                current_range_table.insert((), (start, end))?;
-                Ok(pathid)
-            }
+        if current < end {
+            let pathid = current.plus(1);
+            current_range_table.insert((), (pathid, end))?;
+            return Ok(pathid);
         }
+
+        Err(StorageError::CannotAllocatePathId)
     }
 
-    fn allocate_pathid_range(
-        &self,
-        arena: Arena,
-        range_size: u64,
-    ) -> Result<(PathId, PathId), StorageError> {
-        let arena_root = self
-            .arena_root(arena)
+    fn pathid_range_for_arena(&self, arena: Arena) -> Result<(PathId, PathId), StorageError> {
+        let prefix = *self
+            .prefixes
+            .get_by_left(&arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))?;
-        let txn = self.db.begin_write()?;
-        let ret = do_alloc_pathid_range(&txn, arena_root, range_size)?;
 
-        log::debug!("[{arena}] Allocated pathid range: {ret:?}");
-        // If the transaction inside the arena cache fails to commit,
-        // the range is lost. TODO: find a way of avoiding such
-        // issues.
-        txn.commit()?;
-
-        Ok(ret)
+        Ok(pathid_range_with_prefix(prefix))
     }
 }
 
-fn do_alloc_pathid_range(
-    txn: &GlobalWriteTransaction,
-    assigned_root: PathId,
-    range_size: u64,
-) -> Result<(PathId, PathId), StorageError> {
-    let mut range_table = txn.pathid_range_allocation_table()?;
-
-    let last_end = range_table
-        .last()?
-        .map(|(key, _)| key.value())
-        .unwrap_or(PathId(1));
-
-    let new_range_start = last_end.plus(1);
-    let new_range_end = new_range_start.plus(range_size);
-    range_table.insert(new_range_end.minus(1), assigned_root)?;
-
-    Ok((new_range_start, new_range_end))
+fn pathid_range_with_prefix(prefix: PathIdPrefix) -> (PathId, PathId) {
+    (
+        PartialPathId::ROOT.with(prefix),
+        PartialPathId::MAX.with(prefix),
+    )
 }
 
 #[cfg(test)]
@@ -262,9 +217,14 @@ mod tests {
         let b = Arena::from("b");
         let fixture = Fixture::setup([a, b])?;
 
-        // Allocation starts at 2, since 1 is the root pathid
-        assert_eq!(Some(PathId(2)), fixture.allocator.arena_root(a));
-        assert_eq!(Some(PathId(3)), fixture.allocator.arena_root(b));
+        assert_eq!(
+            Some(PartialPathId::ROOT.with(PathIdPrefix::from_u8(1))),
+            fixture.allocator.arena_root(a)
+        );
+        assert_eq!(
+            Some(PartialPathId::ROOT.with(PathIdPrefix::from_u8(2))),
+            fixture.allocator.arena_root(b)
+        );
         assert!(
             fixture
                 .allocator
@@ -299,23 +259,63 @@ mod tests {
         let c = Arena::from("c");
         let fixture = Fixture::setup([a, b, c])?;
 
-        // After the arena root, allocate global pathids incrementally.
-        assert_eq!(Some(PathId(2)), fixture.allocator.arena_root(a));
-        assert_eq!(Some(PathId(3)), fixture.allocator.arena_root(b));
-        assert_eq!(Some(PathId(4)), fixture.allocator.arena_root(c));
-        assert_eq!(PathId(5), fixture.allocate_global_pathid()?);
-        assert_eq!(PathId(6), fixture.allocate_global_pathid()?);
+        let a_prefix = PathIdPrefix::from_u8(1);
+        let b_prefix = PathIdPrefix::from_u8(2);
+        let c_prefix = PathIdPrefix::from_u8(3);
 
-        // 1 is root, so everything starts at 2, 100 is allocated for
-        // global pathids, 10000 for each arena
-        assert_eq!(PathId(102), fixture.allocate_arena_pathid(a)?);
-        assert_eq!(PathId(103), fixture.allocate_arena_pathid(a)?);
+        assert_eq!(
+            Some(PartialPathId::ROOT.with(a_prefix)),
+            fixture.allocator.arena_root(a)
+        );
+        assert_eq!(
+            Some(PartialPathId::ROOT.with(b_prefix)),
+            fixture.allocator.arena_root(b)
+        );
+        assert_eq!(
+            Some(PartialPathId::ROOT.with(c_prefix)),
+            fixture.allocator.arena_root(c)
+        );
 
-        assert_eq!(PathId(10102), fixture.allocate_arena_pathid(b)?);
-        assert_eq!(PathId(10103), fixture.allocate_arena_pathid(b)?);
+        // 1 is root, so everything starts at 2
+        assert_eq!(
+            PartialPathId(2).with(a_prefix),
+            fixture.allocate_arena_pathid(a)?
+        );
+        assert_eq!(
+            PartialPathId(3).with(a_prefix),
+            fixture.allocate_arena_pathid(a)?
+        );
+        assert_eq!(
+            PartialPathId(4).with(a_prefix),
+            fixture.allocate_arena_pathid(a)?
+        );
 
-        assert_eq!(PathId(20102), fixture.allocate_arena_pathid(c)?);
-        assert_eq!(PathId(20103), fixture.allocate_arena_pathid(c)?);
+        assert_eq!(
+            PartialPathId(2).with(b_prefix),
+            fixture.allocate_arena_pathid(b)?
+        );
+        assert_eq!(
+            PartialPathId(3).with(b_prefix),
+            fixture.allocate_arena_pathid(b)?
+        );
+        assert_eq!(
+            PartialPathId(4).with(b_prefix),
+            fixture.allocate_arena_pathid(b)?
+        );
+
+        assert_eq!(
+            PartialPathId(2).with(c_prefix),
+            fixture.allocate_arena_pathid(c)?
+        );
+        assert_eq!(
+            PartialPathId(3).with(c_prefix),
+            fixture.allocate_arena_pathid(c)?
+        );
+        assert_eq!(
+            PartialPathId(4).with(c_prefix),
+            fixture.allocate_arena_pathid(c)?
+        );
+
         Ok(())
     }
 
@@ -366,7 +366,9 @@ mod tests {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_read()?;
 
-        let result = fixture.allocator.arena_for_pathid(&txn, PathId(999));
+        let result = fixture
+            .allocator
+            .arena_for_pathid(&txn, PartialPathId(999).with(PathIdPrefix::from_u8(99)));
 
         assert!(result.is_err());
         match result {
@@ -388,72 +390,6 @@ mod tests {
         assert_eq!(
             None,
             fixture.arena_for_pathid(fixture.allocate_global_pathid()?)?
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_arena_for_pathid_arenas() -> anyhow::Result<()> {
-        let a = Arena::from("a");
-        let b = Arena::from("b");
-        let c = Arena::from("c");
-        let fixture = Fixture::setup([a, b, c])?;
-
-        let first_in_a = fixture.allocate_arena_pathid(a)?;
-        let first_in_b = fixture.allocate_arena_pathid(b)?;
-        let first_in_c = fixture.allocate_arena_pathid(c)?;
-
-        // first in range
-        assert_eq!(Some(a), fixture.arena_for_pathid(first_in_a)?);
-        assert_eq!(Some(b), fixture.arena_for_pathid(first_in_b)?);
-        assert_eq!(Some(c), fixture.arena_for_pathid(first_in_c)?);
-
-        // inside the range
-        assert_eq!(Some(a), fixture.arena_for_pathid(first_in_a.plus(100))?);
-        assert_eq!(Some(b), fixture.arena_for_pathid(first_in_b.plus(100))?);
-        assert_eq!(Some(c), fixture.arena_for_pathid(first_in_c.plus(100))?);
-
-        // last in range
-        assert_eq!(None, fixture.arena_for_pathid(first_in_a.minus(1))?);
-        assert_eq!(Some(a), fixture.arena_for_pathid(first_in_b.minus(1))?);
-        assert_eq!(Some(b), fixture.arena_for_pathid(first_in_c.minus(1))?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_arena_allocate_to_exhaustion() -> anyhow::Result<()> {
-        let a = Arena::from("a");
-        let b = Arena::from("b");
-        let fixture = Fixture::setup([a, b])?;
-
-        let first_in_a = fixture.allocate_arena_pathid(a)?;
-        let first_in_b = fixture.allocate_arena_pathid(b)?;
-        let last_in_a = first_in_b.minus(1);
-
-        {
-            let txn = fixture.arena_db(a).begin_write()?;
-            {
-                let mut table = txn.current_pathid_range_table()?;
-                let allocator = &fixture.allocator;
-                while allocator.allocate_arena_pathid(&mut table, a)? < last_in_a {}
-            }
-            txn.commit()?;
-        }
-
-        let first_in_new_range = fixture.allocate_arena_pathid(a)?;
-        assert_eq!(first_in_b.plus(10000), first_in_new_range);
-        let last_in_b = first_in_new_range.minus(1);
-
-        assert_eq!(Some(a), fixture.arena_for_pathid(first_in_a)?);
-        assert_eq!(Some(a), fixture.arena_for_pathid(last_in_a)?);
-        assert_eq!(Some(b), fixture.arena_for_pathid(first_in_b)?);
-        assert_eq!(Some(b), fixture.arena_for_pathid(last_in_b)?);
-        assert_eq!(Some(a), fixture.arena_for_pathid(first_in_new_range)?);
-        assert_eq!(
-            Some(a),
-            fixture.arena_for_pathid(first_in_new_range.plus(100))?
         );
 
         Ok(())

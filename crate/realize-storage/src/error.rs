@@ -81,6 +81,9 @@ pub enum StorageError {
 
     #[error("invalid value for xattr")]
     InvalidAttributeValue,
+
+    #[error("no pathid available")]
+    CannotAllocatePathId,
 }
 
 impl StorageError {
@@ -130,6 +133,7 @@ impl StorageError {
             StorageError::UnknownVersion => InvalidData,
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
+            StorageError::CannotAllocatePathId => Other,
         }
     }
 
