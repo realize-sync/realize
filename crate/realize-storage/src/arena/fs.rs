@@ -10,9 +10,9 @@ use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
 use crate::arena::xattr;
 use crate::global::fs::FileContent;
-use crate::types::Inode;
-use crate::{Blob, FileRealm};
-use crate::{PathId, StorageError};
+use crate::types::{PartialInode, PartialPathId};
+use crate::{Blob, FileRealm, PathId};
+use crate::{Inode, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -38,24 +38,18 @@ impl ArenaFilesystem {
         blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
-        let allocator = crate::PathIdAllocator::new(crate::GlobalDatabase::new(
-            crate::utils::redb_utils::in_memory()?,
-        )?)?;
-        allocator.allocate_prefix(arena)?;
-        ArenaFilesystem::for_testing(arena, allocator, blob_dir, datadir)
+        ArenaFilesystem::for_testing(arena, blob_dir, datadir)
     }
 
     #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
-        allocator: Arc<crate::PathIdAllocator>,
         blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
         let db = ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
-            allocator.allocate_prefix(arena)?,
             blob_dir,
             datadir,
         )?;
@@ -75,7 +69,7 @@ impl ArenaFilesystem {
     pub(crate) fn lookup(
         &self,
         loc: impl Into<ArenaFsLoc>,
-    ) -> Result<(Inode, crate::arena::types::Metadata), StorageError> {
+    ) -> Result<(PartialInode, crate::arena::types::Metadata), StorageError> {
         let txn = self.db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
@@ -174,7 +168,7 @@ impl ArenaFilesystem {
     pub(crate) fn readdir(
         &self,
         loc: impl Into<ArenaFsLoc>,
-    ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
+    ) -> Result<Vec<(String, PartialInode, crate::arena::types::Metadata)>, StorageError> {
         let mut ret = vec![];
         let mut no_pathid = vec![];
         let dir_pathid;
@@ -253,7 +247,7 @@ impl ArenaFilesystem {
         &self,
         mut options: tokio::fs::OpenOptions,
         loc: impl Into<ArenaFsLoc>,
-    ) -> Result<(Inode, tokio::fs::File), StorageError> {
+    ) -> Result<(PartialInode, tokio::fs::File), StorageError> {
         let txn = self.db.begin_write()?;
         let file = {
             let mut tree = txn.write_tree()?;
@@ -301,7 +295,7 @@ impl ArenaFilesystem {
         &self,
         source: impl Into<ArenaFsLoc>,
         dest: impl Into<ArenaFsLoc>,
-    ) -> Result<(Inode, FileMetadata), StorageError> {
+    ) -> Result<(PartialInode, FileMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
@@ -419,7 +413,7 @@ impl ArenaFilesystem {
     pub(crate) fn mkdir(
         &self,
         loc: impl Into<ArenaFsLoc>,
-    ) -> Result<(Inode, DirMetadata), StorageError> {
+    ) -> Result<(PartialInode, DirMetadata), StorageError> {
         let txn = self.db.begin_write()?;
         let result = {
             let mut tree = txn.write_tree()?;
@@ -449,11 +443,11 @@ impl ArenaFilesystem {
 }
 
 pub(crate) enum ArenaFsLoc {
-    PathId(PathId),
-    Inode(Inode),
+    PathId(PartialPathId),
+    Inode(PartialInode),
     Path(Path),
-    PathIdAndName(PathId, String),
-    InodeAndName(Inode, String),
+    PathIdAndName(PartialPathId, String),
+    InodeAndName(PartialInode, String),
 }
 
 impl ArenaFsLoc {
@@ -472,14 +466,25 @@ impl ArenaFsLoc {
         })
     }
 }
+impl From<PartialPathId> for ArenaFsLoc {
+    fn from(value: PartialPathId) -> Self {
+        ArenaFsLoc::PathId(value)
+    }
+}
 impl From<PathId> for ArenaFsLoc {
     fn from(value: PathId) -> Self {
-        ArenaFsLoc::PathId(value)
+        ArenaFsLoc::PathId(value.partial())
     }
 }
 
 impl From<Inode> for ArenaFsLoc {
     fn from(value: Inode) -> Self {
+        ArenaFsLoc::Inode(value.partial())
+    }
+}
+
+impl From<PartialInode> for ArenaFsLoc {
+    fn from(value: PartialInode) -> Self {
         ArenaFsLoc::Inode(value)
     }
 }
@@ -496,36 +501,53 @@ impl From<&Path> for ArenaFsLoc {
     }
 }
 
-impl From<(PathId, &str)> for ArenaFsLoc {
-    fn from(value: (PathId, &str)) -> Self {
+impl From<(PartialPathId, &str)> for ArenaFsLoc {
+    fn from(value: (PartialPathId, &str)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
 
-impl From<(PathId, &String)> for ArenaFsLoc {
-    fn from(value: (PathId, &String)) -> Self {
+impl From<(PartialPathId, &String)> for ArenaFsLoc {
+    fn from(value: (PartialPathId, &String)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
-impl From<(PathId, String)> for ArenaFsLoc {
-    fn from(value: (PathId, String)) -> Self {
+impl From<(PartialPathId, String)> for ArenaFsLoc {
+    fn from(value: (PartialPathId, String)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1)
     }
 }
 
 impl From<(Inode, &str)> for ArenaFsLoc {
     fn from(value: (Inode, &str)) -> Self {
-        ArenaFsLoc::InodeAndName(value.0, value.1.to_string())
+        ArenaFsLoc::InodeAndName(value.0.partial(), value.1.to_string())
     }
 }
 
 impl From<(Inode, &String)> for ArenaFsLoc {
     fn from(value: (Inode, &String)) -> Self {
-        ArenaFsLoc::InodeAndName(value.0, value.1.to_string())
+        ArenaFsLoc::InodeAndName(value.0.partial(), value.1.to_string())
     }
 }
 impl From<(Inode, String)> for ArenaFsLoc {
     fn from(value: (Inode, String)) -> Self {
+        ArenaFsLoc::InodeAndName(value.0.partial(), value.1)
+    }
+}
+
+impl From<(PartialInode, &str)> for ArenaFsLoc {
+    fn from(value: (PartialInode, &str)) -> Self {
+        ArenaFsLoc::InodeAndName(value.0, value.1.to_string())
+    }
+}
+
+impl From<(PartialInode, &String)> for ArenaFsLoc {
+    fn from(value: (PartialInode, &String)) -> Self {
+        ArenaFsLoc::InodeAndName(value.0, value.1.to_string())
+    }
+}
+impl From<(PartialInode, String)> for ArenaFsLoc {
+    fn from(value: (PartialInode, String)) -> Self {
         ArenaFsLoc::InodeAndName(value.0, value.1)
     }
 }
@@ -666,7 +688,7 @@ mod tests {
         fixture.datadir.child("localdir/localfile").write_str(".")?;
 
         let (localdir_inode, localdir_m) = fixture.fs.lookup(Path::parse("localdir")?)?;
-        assert!(localdir_inode != Inode::ZERO);
+        assert!(localdir_inode != PartialInode::ZERO);
         assert!(localdir_m.is_dir());
         assert_eq!(
             localdir_m.mtime(),
@@ -674,7 +696,7 @@ mod tests {
         );
 
         let (inode, localfile_m) = fixture.fs.lookup((localdir_inode, "localfile"))?;
-        assert!(inode != Inode::ZERO);
+        assert!(inode != PartialInode::ZERO);
         assert!(localfile_m.is_file());
         assert_eq!(
             localfile_m.mtime(),

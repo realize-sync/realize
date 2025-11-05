@@ -49,13 +49,6 @@ impl Storage {
         let mut arena_storage = HashMap::new();
         let exclude = build_exclude(&config);
 
-        let globaldb = create_globaldb(&config.cache.db)
-            .await
-            .with_context(|| format!("global database {:?}", config.cache.db))?;
-        let allocator = PathIdAllocator::new(Arc::clone(&globaldb))?;
-        for arena in &config.arenas {
-            allocator.allocate_prefix(arena.arena)?;
-        }
         for NamedArenaConfig {
             arena,
             config: arena_config,
@@ -69,16 +62,18 @@ impl Storage {
                     arena_config,
                     &config.watcher,
                     &exclude.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
-                    &allocator,
                 )
                 .await
                 .with_context(|| format!("in arena {arena}"))?,
             );
         }
 
+        let globaldb = create_globaldb(&config.cache.db)
+            .await
+            .with_context(|| format!("global database {:?}", config.cache.db))?;
         let cache = Filesystem::with_db(
-            globaldb,
-            allocator,
+            Arc::clone(&globaldb),
+            PathIdAllocator::new(globaldb)?,
             arena_storage
                 .values()
                 .map(|s| Arc::clone(&s.fs))

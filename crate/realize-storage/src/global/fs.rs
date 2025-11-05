@@ -6,6 +6,7 @@ use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::pathid_allocator;
 use crate::global::types::PathTableEntry;
+use crate::types::{PartialPathId, PathIdPrefix};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
 use realize_types::{Arena, Path, Peer, UnixTime};
@@ -120,6 +121,12 @@ impl Filesystem {
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }
 
+    fn prefix(&self, arena: Arena) -> Result<PathIdPrefix, StorageError> {
+        self.allocator
+            .prefix(arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))
+    }
+
     /// Returns the FS for the given arena or fail.
     fn arena_fs(&self, arena: Arena) -> Result<&ArenaFilesystem, StorageError> {
         Ok(self.by_arena.get(&arena).ok_or(StorageError::NotFound)?)
@@ -158,7 +165,11 @@ impl Filesystem {
     ) -> Result<ResolvedLoc, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
             FsLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
-                Some(arena) => ResolvedLoc::InArena(arena, ArenaFsLoc::PathId(pathid)),
+                Some(arena) => ResolvedLoc::InArena(
+                    arena,
+                    pathid.prefix(),
+                    ArenaFsLoc::PathId(pathid.partial()),
+                ),
                 None => ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
                     Some(pathid)
                 } else {
@@ -167,7 +178,11 @@ impl Filesystem {
             },
             FsLoc::Inode(inode) => {
                 match self.arena_for_inode(txn, inode)? {
-                    Some(arena) => ResolvedLoc::InArena(arena, ArenaFsLoc::Inode(inode)),
+                    Some(arena) => ResolvedLoc::InArena(
+                        arena,
+                        inode.prefix(),
+                        ArenaFsLoc::Inode(inode.partial()),
+                    ),
                     None => {
                         // global inodes and pathids are identical
                         let pathid = PathId(inode.as_u64());
@@ -182,9 +197,11 @@ impl Filesystem {
             }
             FsLoc::PathIdAndName(pathid, name) => {
                 match self.allocator.arena_for_pathid(txn, pathid)? {
-                    Some(arena) => {
-                        ResolvedLoc::InArena(arena, ArenaFsLoc::PathIdAndName(pathid, name))
-                    }
+                    Some(arena) => ResolvedLoc::InArena(
+                        arena,
+                        pathid.prefix(),
+                        ArenaFsLoc::PathIdAndName(pathid.partial(), name),
+                    ),
                     None => ResolvedLoc::Global(match self.globals.get(&pathid) {
                         None => return Err(StorageError::NotFound),
                         Some(IntermediatePath { entries, .. }) => {
@@ -195,9 +212,11 @@ impl Filesystem {
             }
             FsLoc::InodeAndName(inode, name) => {
                 match self.arena_for_inode(txn, inode)? {
-                    Some(arena) => {
-                        ResolvedLoc::InArena(arena, ArenaFsLoc::InodeAndName(inode, name))
-                    }
+                    Some(arena) => ResolvedLoc::InArena(
+                        arena,
+                        inode.prefix(),
+                        ArenaFsLoc::InodeAndName(inode.partial(), name),
+                    ),
                     None => {
                         // global inodes and pathids are identical
                         let pathid = PathId(inode.as_u64());
@@ -211,7 +230,9 @@ impl Filesystem {
                     }
                 }
             }
-            FsLoc::Path(arena, path) => ResolvedLoc::InArena(arena, ArenaFsLoc::Path(path)),
+            FsLoc::Path(arena, path) => {
+                ResolvedLoc::InArena(arena, self.prefix(arena)?, ArenaFsLoc::Path(path))
+            }
         })
     }
 
@@ -219,22 +240,33 @@ impl Filesystem {
     fn resolve_arena_loc<L: Into<FsLoc>>(
         &self,
         loc: L,
-    ) -> Result<(&ArenaFilesystem, ArenaFsLoc), StorageError> {
+    ) -> Result<(&ArenaFilesystem, PathIdPrefix, ArenaFsLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
             FsLoc::PathId(pathid) => (
                 self.arena_fs_for_pathid(pathid)?,
-                ArenaFsLoc::PathId(pathid),
+                pathid.prefix(),
+                ArenaFsLoc::PathId(pathid.partial()),
             ),
-            FsLoc::Inode(inode) => (self.arena_fs_for_inode(inode)?, ArenaFsLoc::Inode(inode)),
+            FsLoc::Inode(inode) => (
+                self.arena_fs_for_inode(inode)?,
+                inode.prefix(),
+                ArenaFsLoc::Inode(inode.partial()),
+            ),
             FsLoc::PathIdAndName(pathid, name) => (
                 self.arena_fs_for_pathid(pathid)?,
-                ArenaFsLoc::PathIdAndName(pathid, name.into()),
+                pathid.prefix(),
+                ArenaFsLoc::PathIdAndName(pathid.partial(), name.into()),
             ),
             FsLoc::InodeAndName(inode, name) => (
                 self.arena_fs_for_inode(inode)?,
-                ArenaFsLoc::InodeAndName(inode, name.into()),
+                inode.prefix(),
+                ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
             ),
-            FsLoc::Path(arena, path) => (self.arena_fs(arena)?, ArenaFsLoc::Path(path)),
+            FsLoc::Path(arena, path) => (
+                self.arena_fs(arena)?,
+                self.prefix(arena)?,
+                ArenaFsLoc::Path(path),
+            ),
         })
     }
 
@@ -268,9 +300,11 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
-                    fs.lookup(loc)
+                    let (inode, metadata) = fs.lookup(loc)?;
+
+                    Ok((inode.with(prefix), metadata))
                 }
                 ResolvedLoc::Global(pathid) => {
                     if let Some(pathid) = pathid
@@ -279,7 +313,7 @@ impl Filesystem {
                         // For global directories, construct DirMetadata
                         if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
                             Ok((
-                                Inode(pathid.as_u64()),
+                                Inode::from(pathid),
                                 crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
                             ))
                         } else {
@@ -305,7 +339,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.dir_metadata(loc)
                 }
@@ -329,9 +363,14 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
-                    fs.readdir(loc)
+                    let vec = fs.readdir(loc)?;
+
+                    Ok(vec
+                        .into_iter()
+                        .map(|(n, inode, m)| (n, inode.with(prefix), m))
+                        .collect())
                 }
                 ResolvedLoc::Global(None) => Err(StorageError::NotFound),
                 ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
@@ -391,7 +430,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, _, loc) = this.resolve_arena_loc(loc)?;
             fs.file_realm(loc)
         })
         .await?
@@ -416,7 +455,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, _, loc) = this.resolve_arena_loc(loc)?;
             fs.file_content(loc)
         })
         .await?
@@ -430,7 +469,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, _, loc) = this.resolve_arena_loc(loc)?;
             fs.file_metadata(loc)
         })
         .await?
@@ -446,7 +485,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.metadata(loc)
                 }
@@ -475,7 +514,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.list_xattrs(loc)
                 }
@@ -497,7 +536,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.get_xattr(loc, &xattr)
                 }
@@ -521,7 +560,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.set_xattr(loc, &xattr, value.into())
                 }
@@ -539,7 +578,7 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let txn = this.db.begin_read()?;
             match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, loc) => {
+                ResolvedLoc::InArena(arena, _prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.unlink(loc)
                 }
@@ -566,14 +605,16 @@ impl Filesystem {
                 this.resolve_loc(&txn, dest)?,
             ) {
                 (
-                    ResolvedLoc::InArena(source_arena, source),
-                    ResolvedLoc::InArena(dest_arena, dest),
+                    ResolvedLoc::InArena(source_arena, prefix, source),
+                    ResolvedLoc::InArena(dest_arena, _, dest),
                 ) => {
                     if source_arena != dest_arena {
                         return Err(StorageError::CrossesDevices);
                     }
                     let fs = this.arena_fs(source_arena)?;
-                    fs.branch(source, dest)
+                    let (inode, m) = fs.branch(source, dest)?;
+
+                    Ok((inode.with(prefix), m))
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
@@ -599,8 +640,8 @@ impl Filesystem {
                 this.resolve_loc(&txn, dest)?,
             ) {
                 (
-                    ResolvedLoc::InArena(source_arena, source),
-                    ResolvedLoc::InArena(dest_arena, dest),
+                    ResolvedLoc::InArena(source_arena, _, source),
+                    ResolvedLoc::InArena(dest_arena, _, dest),
                 ) => {
                     if source_arena != dest_arena {
                         return Err(StorageError::CrossesDevices);
@@ -624,9 +665,11 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, prefix, loc) = this.resolve_arena_loc(loc)?;
 
-            fs.mkdir(loc)
+            let (inode, m) = fs.mkdir(loc)?;
+
+            Ok((inode.with(prefix), m))
         })
         .await?
     }
@@ -637,7 +680,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, _, loc) = this.resolve_arena_loc(loc)?;
 
             fs.rmdir(loc)
         })
@@ -654,9 +697,11 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let (fs, loc) = this.resolve_arena_loc(loc)?;
+            let (fs, prefix, loc) = this.resolve_arena_loc(loc)?;
 
-            fs.create(options, loc)
+            let (inode, file) = fs.create(options, loc)?;
+
+            Ok((inode.with(prefix), file))
         })
         .await?
     }
@@ -735,7 +780,7 @@ impl From<(Inode, String)> for FsLoc {
 
 enum ResolvedLoc {
     Global(Option<PathId>),
-    InArena(Arena, ArenaFsLoc),
+    InArena(Arena, PathIdPrefix, ArenaFsLoc),
 }
 
 #[derive(Debug, Clone)]
@@ -775,13 +820,11 @@ fn register(
     paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena = fs.arena();
-    let arena_root = allocator
-        .arena_root(arena)
-        .ok_or_else(|| StorageError::UnknownArena(arena))?;
-
     for existing in map.keys().map(|a| *a) {
         check_arena_compatibility(arena, existing)?;
     }
+    let prefix = allocator.allocate_prefix(arena)?;
+    let arena_root = PartialPathId::ROOT.with(prefix);
     add_arena_root(arena, arena_root, txn, path_table, paths)?;
     map.insert(fs.arena(), fs);
 
@@ -903,7 +946,6 @@ mod tests {
                 datadir.create_dir_all()?;
                 arena_fs.push(ArenaFilesystem::for_testing(
                     arena,
-                    Arc::clone(&allocator),
                     blob_dir.path(),
                     datadir.path(),
                 )?);

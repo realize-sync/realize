@@ -5,7 +5,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::{BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
 use crate::arena::db::Tag;
-use crate::types::PathId;
+use crate::types::PartialPathId;
 use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{RemoteAvailability, StorageError};
@@ -86,7 +86,7 @@ pub(crate) struct Blobs {
     _disk_usage_tx: watch::Receiver<DiskUsage>,
 
     /// Report blob accesses
-    accessed_tx: broadcast::Sender<PathId>,
+    accessed_tx: broadcast::Sender<PartialPathId>,
 
     registry: Arc<file::BlobFileRegistry>,
 }
@@ -120,7 +120,7 @@ impl Blobs {
     }
 
     /// Return a receiver that can receive report about blob accesses.
-    fn subscribe_accessed(&self) -> broadcast::Receiver<PathId> {
+    fn subscribe_accessed(&self) -> broadcast::Receiver<PartialPathId> {
         self.accessed_tx.subscribe()
     }
 
@@ -138,7 +138,7 @@ impl Blobs {
 
 pub(crate) struct ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     blob_table: T,
@@ -148,7 +148,7 @@ where
 
 impl<T, TQ> ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     pub(crate) fn new(blob_table: T, blob_lru_queue_table: TQ) -> Self {
@@ -163,7 +163,7 @@ pub(crate) struct WritableOpenBlob<'a> {
     tag: Tag,
     before_commit: &'a BeforeCommit,
 
-    blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
+    blob_table: Table<'a, PartialPathId, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
 
@@ -179,7 +179,7 @@ impl<'a> WritableOpenBlob<'a> {
         tag: Tag,
         blobs: &Blobs,
         before_commit: &'a BeforeCommit,
-        blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
+        blob_table: Table<'a, PartialPathId, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
     ) -> Self {
@@ -247,7 +247,7 @@ impl DiskUsage {
 /// Public information about the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobInfo {
-    pub(crate) pathid: PathId,
+    pub(crate) pathid: PartialPathId,
     pub(crate) size: u64,
     pub(crate) hash: Hash,
 
@@ -266,7 +266,7 @@ pub(crate) struct BlobInfo {
 }
 
 impl BlobInfo {
-    fn new(pathid: PathId, entry: BlobTableEntry) -> Self {
+    fn new(pathid: PartialPathId, entry: BlobTableEntry) -> Self {
         Self {
             pathid,
             size: entry.content_size,
@@ -300,15 +300,15 @@ pub(crate) trait BlobReadOperations {
     /// This call returns [StorageError::NotFound] if the blob doesn't
     /// exist on the database. Use [WritableOpenBlob::create] to
     /// create the blob entry.
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError>;
+    fn get_with_pathid(&self, pathid: PartialPathId) -> Result<Option<BlobInfo>, StorageError>;
 
     /// Returns a double-ended iterator over the given queue, starting at the head.
     #[allow(dead_code)] // TODO: make it test-only
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>>;
 
     /// Returns a double-ended iterator over the given queue, starting at the tail.
     #[allow(dead_code)] // TODO: make it test-only
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>>;
 
     /// Disk space used for storing local copies.
     ///
@@ -321,18 +321,18 @@ pub(crate) trait BlobReadOperations {
 
 impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
+    fn get_with_pathid(&self, pathid: PartialPathId) -> Result<Option<BlobInfo>, StorageError> {
         get_read_op(&self.blob_table, pathid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -342,15 +342,15 @@ where
 }
 
 impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
+    fn get_with_pathid(&self, pathid: PartialPathId) -> Result<Option<BlobInfo>, StorageError> {
         get_read_op(&self.blob_table, pathid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PartialPathId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -444,7 +444,7 @@ impl<'a> WritableOpenBlob<'a> {
         loc: L,
         hash: &Hash,
         size: u64,
-    ) -> Result<(PathId, PathBuf, BlobTableEntry), StorageError> {
+    ) -> Result<(PartialPathId, PathBuf, BlobTableEntry), StorageError> {
         let pathid = tree.setup(loc)?;
         let existing_entry = if let Some(e) = self.blob_table.get(pathid)? {
             Some(e.value().parse()?)
@@ -482,7 +482,11 @@ impl<'a> WritableOpenBlob<'a> {
         Ok((pathid, blob_path, entry))
     }
 
-    fn prepare_blob_file(&mut self, pathid: PathId, size: u64) -> Result<PathBuf, StorageError> {
+    fn prepare_blob_file(
+        &mut self,
+        pathid: PartialPathId,
+        size: u64,
+    ) -> Result<PathBuf, StorageError> {
         let blob_dir = self.subsystem.blob_dir.as_path();
         let blob_path = blob_dir.join(pathid.hex());
         if !blob_dir.exists() {
@@ -638,7 +642,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// at the front of its queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    fn mark_accessed(&mut self, pathid: PathId) -> Result<(), StorageError> {
+    fn mark_accessed(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
         let mut blob_entry = match self.blob_table.get(pathid)? {
             None => {
                 return Ok(());
@@ -806,7 +810,7 @@ impl<'a> WritableOpenBlob<'a> {
     fn add_to_queue_front(
         &mut self,
         queue_id: LruQueueId,
-        pathid: PathId,
+        pathid: PartialPathId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         let mut queue =
@@ -821,7 +825,7 @@ impl<'a> WritableOpenBlob<'a> {
     fn add_to_queue_front_update_entry(
         &mut self,
         queue_id: LruQueueId,
-        pathid: PathId,
+        pathid: PartialPathId,
         blob_entry: &mut BlobTableEntry,
         queue: &mut QueueTableEntry,
     ) -> Result<(), StorageError> {
@@ -917,7 +921,7 @@ impl<'a> WritableOpenBlob<'a> {
     fn remove_blob_entry(
         &mut self,
         tree: &mut WritableOpenTree<'_>,
-        pathid: PathId,
+        pathid: PartialPathId,
     ) -> Result<bool, StorageError> {
         if let Some(entry) = get_blob_entry(&self.blob_table, pathid)? {
             self.remove_from_queue(&entry)?;
@@ -931,7 +935,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// Move the blob to the front of its queue
     fn move_to_front(
         &mut self,
-        pathid: PathId,
+        pathid: PartialPathId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         if blob_entry.prev.is_none() {
@@ -951,18 +955,18 @@ impl<'a> WritableOpenBlob<'a> {
 #[allow(dead_code)]
 pub(crate) struct QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
 {
     blob_table: &'a T,
     err: Option<StorageError>,
-    next: Option<PathId>,
-    next_fn: fn(BlobTableEntry) -> Option<PathId>,
+    next: Option<PartialPathId>,
+    next_fn: fn(BlobTableEntry) -> Option<PartialPathId>,
 }
 
 #[allow(dead_code)]
 impl<'a, T> QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
 {
     fn head(
         blob_table: &'a T,
@@ -1003,9 +1007,9 @@ where
 
 impl<'a, T> Iterator for QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
 {
-    type Item = Result<PathId, StorageError>;
+    type Item = Result<PartialPathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.err.take() {
@@ -1035,7 +1039,7 @@ where
 fn choose_queue(
     tree: &mut WritableOpenTree<'_>,
     marks: &impl MarkReadOperations,
-    pathid: PathId,
+    pathid: PartialPathId,
 ) -> Result<LruQueueId, StorageError> {
     let queue = match marks.get(tree, pathid)? {
         Mark::Watch => LruQueueId::WorkingArea,
@@ -1076,8 +1080,8 @@ fn get_queue_must_exist(
 }
 
 fn get_blob_entry(
-    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blob_table: &impl redb::ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<Option<BlobTableEntry>, StorageError> {
     if let Some(entry) = blob_table.get(pathid)? {
         Ok(Some(entry.value().parse()?))
@@ -1087,8 +1091,8 @@ fn get_blob_entry(
 }
 
 fn follow_queue_link(
-    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blob_table: &impl redb::ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<BlobTableEntry, StorageError> {
     get_blob_entry(blob_table, pathid)?
         .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {pathid}")))
@@ -1445,8 +1449,8 @@ impl AsyncSeek for Blob {
 }
 
 fn get_read_op(
-    blob_table: &impl ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blob_table: &impl ReadableTable<PartialPathId, Holder<'static, BlobTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<Option<BlobInfo>, StorageError> {
     if let Some(e) = blob_table.get(pathid)? {
         Ok(Some(BlobInfo::new(pathid, e.value().parse()?)))
@@ -1482,7 +1486,7 @@ mod tests {
     use crate::arena::types::Version;
     use crate::arena::update;
     use crate::utils::hash;
-    use crate::{Mark, Notification, PathId};
+    use crate::{Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -1528,7 +1532,7 @@ mod tests {
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, pathid: PathId) -> std::path::PathBuf {
+        fn blob_path(&self, pathid: PartialPathId) -> std::path::PathBuf {
             self.tempdir
                 .child(format!("{}/blobs/{}", self.arena, pathid.hex()))
                 .to_path_buf()
@@ -1542,7 +1546,7 @@ mod tests {
             Ok(self.db.begin_write()?)
         }
 
-        fn get_blob_entry(&self, pathid: PathId) -> anyhow::Result<BlobTableEntry> {
+        fn get_blob_entry(&self, pathid: PartialPathId) -> anyhow::Result<BlobTableEntry> {
             let txn = self.begin_write()?;
             let blobs = txn.write_blobs()?;
             Ok(get_blob_entry(&blobs.blob_table, pathid)?.ok_or(StorageError::NotFound)?)
@@ -2506,7 +2510,7 @@ mod tests {
     async fn cleanup() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mut pathids = vec![PathId::ZERO; 4];
+        let mut pathids = vec![PartialPathId::ZERO; 4];
         let txn = fixture.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -2652,7 +2656,7 @@ mod tests {
         let blobs = txn.read_blobs()?;
 
         // Just test that the read transaction works correctly.
-        assert!(blobs.get_with_pathid(PathId(999))?.is_none());
+        assert!(blobs.get_with_pathid(PartialPathId(999))?.is_none());
 
         Ok(())
     }
@@ -2666,7 +2670,7 @@ mod tests {
         let mut mark = txn.write_marks()?;
 
         // Just test that the write transaction works correctly.
-        let blob_info = blobs.create(&mut tree, &mut mark, PathId(10), &test_hash(), 100)?;
+        let blob_info = blobs.create(&mut tree, &mut mark, PartialPathId(10), &test_hash(), 100)?;
         assert_eq!(blob_info.hash, test_hash());
         assert_eq!(blob_info.size, 100);
 
@@ -2686,7 +2690,7 @@ mod tests {
         assert_eq!(availability, CacheStatus::Missing);
 
         // Test with an pathid that doesn't exist
-        let availability = blobs.cache_status(&tree, PathId(99999))?;
+        let availability = blobs.cache_status(&tree, PartialPathId(99999))?;
         assert_eq!(availability, CacheStatus::Missing);
 
         Ok(())
@@ -2823,7 +2827,7 @@ mod tests {
         let tree = txn.read_tree()?;
 
         // Test with a non-existent pathid
-        let availability = blobs.cache_status(&tree, PathId(99999))?;
+        let availability = blobs.cache_status(&tree, PartialPathId(99999))?;
         assert_eq!(availability, CacheStatus::Missing);
 
         Ok(())
@@ -3091,7 +3095,7 @@ mod tests {
 
         for _ in 0..20 {
             drop(Blob::open(&fixture.db, pathids[0])?);
-            let _ = fixture.db.blobs().accessed_tx.send(PathId(999)); // invalid; should be ignored
+            let _ = fixture.db.blobs().accessed_tx.send(PartialPathId(999)); // invalid; should be ignored
             drop(Blob::open(&fixture.db, pathids[2])?);
             drop(Blob::open(&fixture.db, pathids[1])?);
         }
@@ -3101,7 +3105,7 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        let queue_order: Vec<PathId> = blobs
+        let queue_order: Vec<PartialPathId> = blobs
             .head(LruQueueId::WorkingArea)
             .collect::<Result<Vec<_>, StorageError>>()?;
         assert_eq!(vec![pathids[1], pathids[2], pathids[0]], queue_order);

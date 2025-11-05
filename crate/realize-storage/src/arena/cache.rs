@@ -5,6 +5,7 @@ use super::types::{
     CacheTableEntry, DirTableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
     IndexedFile, Layer, RemoteAvailability,
 };
+use crate::StorageError;
 use crate::arena::blob::BlobReadOperations;
 use crate::arena::db::Tag;
 use crate::arena::history::WritableOpenHistory;
@@ -12,10 +13,9 @@ use crate::arena::mark::MarkReadOperations;
 use crate::arena::tree::{self, TreeLoc};
 use crate::arena::types::{CacheEntryStatus, DirMetadata, FileAlternative, Version};
 use crate::global::types::PathAssignment;
-use crate::types::Inode;
+use crate::types::{PartialInode, PartialPathId};
 use crate::utils::holder::Holder;
 use crate::utils::inhibit::{self, Inhibit};
-use crate::{PathId, StorageError};
 use realize_types::{Hash, Path, Peer, UnixTime};
 use redb::{ReadableTable, Table};
 use std::collections::HashSet;
@@ -61,28 +61,34 @@ pub(crate) trait CacheReadOperations {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>>;
+    ) -> impl Iterator<Item = Result<(String, Option<PartialPathId>, crate::Metadata), StorageError>>;
 
     /// Get the default file entry for the given pathid.
-    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError>;
+    fn file_at_pathid(&self, pathid: PartialPathId)
+    -> Result<Option<FileTableEntry>, StorageError>;
 
     /// Get the default file entry for the given pathid; fail if the entry
     /// cannot be found or if it is a directory.
-    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError>;
+    fn file_at_pathid_or_err(&self, pathid: PartialPathId) -> Result<FileTableEntry, StorageError>;
 
-    /// Return the [Inode] appropriate for the given [PathId].
+    /// Return the [Inode] appropriate for the given [PartialPathId].
     #[allow(dead_code)]
-    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError>;
+    fn map_to_inode(&self, pathid: PartialPathId) -> Result<PartialInode, StorageError>;
 
-    /// Return the [PathId] appropriate for the given [Inode].
+    /// Return the [PartialPathId] appropriate for the given [Inode].
     #[allow(dead_code)]
-    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError>;
+    fn map_to_pathid(&self, inode: PartialInode) -> Result<PartialPathId, StorageError>;
 
     /// Get the indexed entry at the given pathid
-    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError>;
+    fn index_entry_at_pathid(
+        &self,
+        pathid: PartialPathId,
+    ) -> Result<Option<IndexedFile>, StorageError>;
 
     /// Return all indexed files in the index layer
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>>;
+    fn all_indexed(
+        &self,
+    ) -> impl Iterator<Item = Result<(PartialPathId, IndexedFile), StorageError>>;
 
     /// Return the datadir path.
     fn datadir(&self) -> &std::path::Path;
@@ -111,9 +117,9 @@ pub(crate) trait CacheReadOperations {
 /// A cache open for reading with a read transaction.
 pub(crate) struct ReadableOpenCache<'a, T, PN, NP>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    PN: ReadableTable<PathId, Inode>,
-    NP: ReadableTable<Inode, PathId>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PartialPathId, PartialInode>,
+    NP: ReadableTable<PartialInode, PartialPathId>,
 {
     table: T,
     #[allow(dead_code)]
@@ -125,9 +131,9 @@ where
 
 impl<'a, T, PN, NP> ReadableOpenCache<'a, T, PN, NP>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    PN: ReadableTable<PathId, Inode>,
-    NP: ReadableTable<Inode, PathId>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PartialPathId, PartialInode>,
+    NP: ReadableTable<PartialInode, PartialPathId>,
 {
     pub(crate) fn new(
         table: T,
@@ -146,9 +152,9 @@ where
 
 impl<'a, T, PN, NP> CacheReadOperations for ReadableOpenCache<'a, T, PN, NP>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    PN: ReadableTable<PathId, Inode>,
-    NP: ReadableTable<Inode, PathId>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    PN: ReadableTable<PartialPathId, PartialInode>,
+    NP: ReadableTable<PartialInode, PartialPathId>,
 {
     fn metadata<'b, L: Into<TreeLoc<'b>>>(
         &self,
@@ -188,7 +194,8 @@ where
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
+    ) -> impl Iterator<Item = Result<(String, Option<PartialPathId>, crate::Metadata), StorageError>>
+    {
         let loc = loc.into();
         ReadDirIterator::new(
             &self.table,
@@ -198,30 +205,38 @@ where
         )
     }
 
-    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+    fn file_at_pathid(
+        &self,
+        pathid: PartialPathId,
+    ) -> Result<Option<FileTableEntry>, StorageError> {
         default_file_entry(&self.table, pathid)
     }
 
-    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+    fn file_at_pathid_or_err(&self, pathid: PartialPathId) -> Result<FileTableEntry, StorageError> {
         default_file_entry_or_err(&self.table, pathid)
     }
 
-    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
+    fn map_to_inode(&self, pathid: PartialPathId) -> Result<PartialInode, StorageError> {
         map_to_inode(&self.pathid_to_inode, pathid)
     }
 
-    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
+    fn map_to_pathid(&self, inode: PartialInode) -> Result<PartialPathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 
-    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+    fn index_entry_at_pathid(
+        &self,
+        pathid: PartialPathId,
+    ) -> Result<Option<IndexedFile>, StorageError> {
         if let Some(e) = default_file_entry(&self.table, pathid)? {
             return Ok(e.into());
         }
         Ok(None)
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+    fn all_indexed(
+        &self,
+    ) -> impl Iterator<Item = Result<(PartialPathId, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -286,7 +301,8 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
-    ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
+    ) -> impl Iterator<Item = Result<(String, Option<PartialPathId>, crate::Metadata), StorageError>>
+    {
         let loc = loc.into();
         ReadDirIterator::new(
             &self.table,
@@ -296,30 +312,38 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         )
     }
 
-    fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
+    fn file_at_pathid(
+        &self,
+        pathid: PartialPathId,
+    ) -> Result<Option<FileTableEntry>, StorageError> {
         default_file_entry(&self.table, pathid)
     }
 
-    fn file_at_pathid_or_err(&self, pathid: PathId) -> Result<FileTableEntry, StorageError> {
+    fn file_at_pathid_or_err(&self, pathid: PartialPathId) -> Result<FileTableEntry, StorageError> {
         default_file_entry_or_err(&self.table, pathid)
     }
 
-    fn map_to_inode(&self, pathid: PathId) -> Result<Inode, StorageError> {
+    fn map_to_inode(&self, pathid: PartialPathId) -> Result<PartialInode, StorageError> {
         map_to_inode(&self.pathid_to_inode, pathid)
     }
 
-    fn map_to_pathid(&self, inode: Inode) -> Result<PathId, StorageError> {
+    fn map_to_pathid(&self, inode: PartialInode) -> Result<PartialPathId, StorageError> {
         map_to_pathid(&self.inode_to_pathid, inode)
     }
 
-    fn index_entry_at_pathid(&self, pathid: PathId) -> Result<Option<IndexedFile>, StorageError> {
+    fn index_entry_at_pathid(
+        &self,
+        pathid: PartialPathId,
+    ) -> Result<Option<IndexedFile>, StorageError> {
         if let Some(e) = default_file_entry(&self.table, pathid)? {
             return Ok(e.into());
         }
         Ok(None)
     }
 
-    fn all_indexed(&self) -> impl Iterator<Item = Result<(PathId, IndexedFile), StorageError>> {
+    fn all_indexed(
+        &self,
+    ) -> impl Iterator<Item = Result<(PartialPathId, IndexedFile), StorageError>> {
         AllIndexedIterator::new(&self.table)
     }
 
@@ -456,10 +480,10 @@ impl<T: CacheReadOperations> CacheExt for T {
 
 /// A cache open for writing with a write transaction.
 pub(crate) struct WritableOpenCache<'a> {
-    table: Table<'a, (PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid_to_inode: Table<'a, PathId, Inode>,
-    inode_to_pathid: Table<'a, Inode, PathId>,
-    pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
+    table: Table<'a, (PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid_to_inode: Table<'a, PartialPathId, PartialInode>,
+    inode_to_pathid: Table<'a, PartialInode, PartialPathId>,
+    pending_catchup_table: Table<'a, (&'static str, PartialPathId), ()>,
     tag: Tag,
     cache: &'a Cache,
     _guard: inhibit::Guard,
@@ -468,10 +492,10 @@ pub(crate) struct WritableOpenCache<'a> {
 impl<'a> WritableOpenCache<'a> {
     pub(crate) fn new(
         tag: Tag,
-        table: Table<'a, (PathId, Layer), Holder<CacheTableEntry>>,
-        pathid_to_inode: Table<'a, PathId, Inode>,
-        inode_to_pathid: Table<'a, Inode, PathId>,
-        pending_catchup_table: Table<'a, (&'static str, PathId), ()>,
+        table: Table<'a, (PartialPathId, Layer), Holder<CacheTableEntry>>,
+        pathid_to_inode: Table<'a, PartialPathId, PartialInode>,
+        inode_to_pathid: Table<'a, PartialInode, PartialPathId>,
+        pending_catchup_table: Table<'a, (&'static str, PartialPathId), ()>,
         cache: &'a Cache,
     ) -> Self {
         Self {
@@ -575,7 +599,7 @@ impl<'a> WritableOpenCache<'a> {
         source: L1,
         dest: L2,
         noreplace: bool,
-    ) -> Result<(PathId, PathId), StorageError> {
+    ) -> Result<(PartialPathId, PartialPathId), StorageError> {
         let source = source.into();
         let dest = dest.into();
         let source_pathid = tree.expect(source.borrow())?;
@@ -695,7 +719,7 @@ impl<'a> WritableOpenCache<'a> {
         dirty: &mut WritableOpenDirty,
         source: L1,
         dest: L2,
-    ) -> Result<(PathId, FileMetadata), StorageError> {
+    ) -> Result<(PartialPathId, FileMetadata), StorageError> {
         let source = source.into();
         let source_pathid = tree.expect(source.borrow())?;
         if source_pathid == tree.root() {
@@ -758,7 +782,7 @@ impl<'a> WritableOpenCache<'a> {
         &mut self,
         tree: &mut WritableOpenTree,
         loc: L,
-    ) -> Result<(PathId, DirMetadata), StorageError> {
+    ) -> Result<(PartialPathId, DirMetadata), StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         check_parent_is_dir(&self.table, tree, pathid)?;
@@ -955,7 +979,7 @@ impl<'a> WritableOpenCache<'a> {
     fn write_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
-        file_pathid: PathId,
+        file_pathid: PartialPathId,
         peer: Peer,
         entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
@@ -975,7 +999,7 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        pathid: PathId,
+        pathid: PartialPathId,
         new_entry: &FileTableEntry,
     ) -> Result<(), StorageError> {
         self.before_default_file_entry_change(tree, blobs, dirty, pathid)?;
@@ -1004,7 +1028,7 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        pathid: PathId,
+        pathid: PartialPathId,
     ) -> Result<(), StorageError> {
         blobs.delete(tree, pathid)?;
 
@@ -1020,7 +1044,7 @@ impl<'a> WritableOpenCache<'a> {
     fn rm_peer_file_entry(
         &mut self,
         tree: &mut WritableOpenTree,
-        pathid: PathId,
+        pathid: PartialPathId,
         peer: Peer,
     ) -> Result<(), StorageError> {
         // Remove the entry
@@ -1056,7 +1080,7 @@ impl<'a> WritableOpenCache<'a> {
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        pathid: PathId,
+        pathid: PartialPathId,
     ) -> Result<(), StorageError> {
         // We check the parent before removing, since the link to
         // parent might not exist anymore afterwards if the pathid is
@@ -1140,7 +1164,7 @@ impl<'a> WritableOpenCache<'a> {
         let peer_str = peer.as_str();
         let mut pathids = vec![];
         for elt in self.pending_catchup_table.extract_from_if(
-            (peer_str, PathId::ZERO)..=(peer_str, PathId::MAX),
+            (peer_str, PartialPathId::ZERO)..=(peer_str, PartialPathId::MAX),
             |_, _| true,
         )? {
             let elt = elt?;
@@ -1175,7 +1199,7 @@ impl<'a> WritableOpenCache<'a> {
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
         loc: L,
-    ) -> Result<PathId, StorageError> {
+    ) -> Result<PartialPathId, StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         let realpath = self.local_path(tree, loc)?;
@@ -1221,7 +1245,7 @@ impl<'a> WritableOpenCache<'a> {
         size: u64,
         mtime: UnixTime,
         hash: Hash,
-    ) -> Result<PathId, StorageError> {
+    ) -> Result<PartialPathId, StorageError> {
         let loc = loc.into();
         let pathid = tree.setup(loc.borrow())?;
         let path = tree.backtrack(loc.borrow())?;
@@ -1533,8 +1557,8 @@ impl Cache {
     /// Initialize the database. This should be called at startup, in the
     /// transaction that crates new tables.
     pub(crate) fn setup(
-        cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
-        root_pathid: PathId,
+        cache_table: &mut redb::Table<'_, (PartialPathId, Layer), Holder<CacheTableEntry>>,
+        root_pathid: PartialPathId,
         datadir: &std::path::Path,
     ) -> Result<Self, StorageError> {
         if cache_table.get((root_pathid, Layer::Default))?.is_none() {
@@ -1577,7 +1601,7 @@ impl Cache {
 
 /// Get metadata for a file or directory.
 fn metadata<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     datadir: &std::path::Path,
     loc: L,
@@ -1593,13 +1617,13 @@ fn metadata<'b, L: Into<TreeLoc<'b>>>(
 
 /// Builds a [crate::Metadata], if possible, by merging
 /// [std::fs::Metadata] and with a cache entry, identified by its
-/// [PathId].
+/// [PartialPathId].
 ///
 /// Either or both of the filesystem metadata or the cache entry may
 /// not exist.
 fn expand_metadata(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: Option<PathId>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: Option<PartialPathId>,
     real: Option<std::fs::Metadata>,
 ) -> Result<Option<crate::Metadata>, StorageError> {
     let cached = if let Some(pathid) = pathid {
@@ -1623,7 +1647,7 @@ fn expand_metadata(
 }
 
 fn file_realm<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     blobs: &impl BlobReadOperations,
     datadir: &std::path::Path,
@@ -1640,7 +1664,7 @@ fn file_realm<'b, L: Into<TreeLoc<'b>>>(
 
 /// Get file availability information for the given pathid.
 fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
     hash: &Hash,
@@ -1680,7 +1704,7 @@ fn remote_availability<'b, L: Into<TreeLoc<'b>>>(
 }
 
 fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
 ) -> Result<Vec<FileAlternative>, StorageError> {
@@ -1728,8 +1752,8 @@ fn list_alternatives<'b, L: Into<TreeLoc<'b>>>(
 }
 
 fn find_peer_entry(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
     hash: &Hash,
 ) -> Result<impl Iterator<Item = Result<(Peer, FileTableEntry), StorageError>>, StorageError> {
     Ok(cache_table
@@ -1751,7 +1775,7 @@ fn find_peer_entry(
 
 struct ReadDirIterator<'a, 'b, T>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
 {
     table: &'a T,
     iter: tree::ReadDirIterator<'b>,
@@ -1760,7 +1784,7 @@ where
 
 impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
 {
     fn new<'l, L: Into<TreeLoc<'l>>>(
         table: &'a T,
@@ -1808,9 +1832,9 @@ fn build_realentries(realpath: PathBuf) -> Result<(PathBuf, HashSet<String>), st
 
 impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
 where
-    T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    T: ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
 {
-    type Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>;
+    type Item = Result<(String, Option<PartialPathId>, crate::Metadata), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
@@ -1849,13 +1873,16 @@ where
 /// Iterator for all indexed files in the index layer
 struct AllIndexedIterator<'a> {
     iter: Option<
-        Result<redb::Range<'a, (PathId, Layer), Holder<'static, CacheTableEntry>>, StorageError>,
+        Result<
+            redb::Range<'a, (PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+            StorageError,
+        >,
     >,
 }
 
 impl<'a> AllIndexedIterator<'a> {
     fn new(
-        table: &'a impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+        table: &'a impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     ) -> Self {
         AllIndexedIterator {
             iter: Some(table.iter().map_err(StorageError::from)),
@@ -1864,7 +1891,7 @@ impl<'a> AllIndexedIterator<'a> {
 }
 
 impl<'a> Iterator for AllIndexedIterator<'a> {
-    type Item = Result<(PathId, IndexedFile), StorageError>;
+    type Item = Result<(PartialPathId, IndexedFile), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.iter {
@@ -1899,8 +1926,8 @@ impl<'a> Iterator for AllIndexedIterator<'a> {
 
 /// Get a [FileTableEntry] for a specific peer.
 fn peer_file_entry(
-    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl redb::ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
     peer: Option<Peer>,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     let key = peer
@@ -1916,8 +1943,8 @@ fn peer_file_entry(
 ///
 /// Returns None if the file cannot be found or if it is a directory.
 fn default_file_entry(
-    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl redb::ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<Option<FileTableEntry>, StorageError> {
     if let Some(CacheTableEntry::File(entry)) = default_entry(cache_table, pathid)? {
         return Ok(Some(entry));
@@ -1930,8 +1957,8 @@ fn default_file_entry(
 ///
 /// Returns None if the file cannot be found or if it is a directory.
 fn default_entry(
-    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl redb::ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<Option<CacheTableEntry>, StorageError> {
     if let Some(entry) = cache_table.get((pathid, Layer::Default))? {
         return Ok(Some(entry.value().parse()?));
@@ -1944,8 +1971,8 @@ fn default_entry(
 ///
 /// Fail if the file cannot be found or if it is a directory.
 fn default_file_entry_or_err(
-    cache_table: &impl redb::ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl redb::ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<FileTableEntry, StorageError> {
     default_entry(cache_table, pathid)?
         .ok_or(StorageError::NotFound)?
@@ -1961,9 +1988,9 @@ fn default_file_entry_or_err(
 ///
 /// Returns the updated and merged [DirTableEntry].
 fn write_dir_mtime(
-    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PartialPathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    pathid: PathId,
+    pathid: PartialPathId,
     mtime: UnixTime,
 ) -> Result<DirTableEntry, StorageError> {
     write_dir(
@@ -1985,9 +2012,9 @@ fn write_dir_mtime(
 ///
 /// Returns the updated and merged [DirTableEntry].
 fn write_dir_local(
-    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PartialPathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    pathid: PathId,
+    pathid: PartialPathId,
 ) -> Result<DirTableEntry, StorageError> {
     write_dir(
         cache_table,
@@ -2010,9 +2037,9 @@ fn write_dir_local(
 ///
 /// Returns the updated and merged [DirTableEntry].
 fn write_dir(
-    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PartialPathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    pathid: PathId,
+    pathid: PartialPathId,
     update: &DirTableEntry,
 ) -> Result<DirTableEntry, StorageError> {
     let entry = if let Some(existing) = default_entry(cache_table, pathid)? {
@@ -2041,9 +2068,9 @@ fn write_dir(
 }
 
 fn delete_empty_remote_dir(
-    cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
+    cache_table: &mut redb::Table<'_, (PartialPathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
-    pathid: PathId,
+    pathid: PartialPathId,
 ) -> Result<(), StorageError> {
     if let Some(existing) = default_entry(cache_table, pathid)? {
         let parent = tree.parent(pathid)?;
@@ -2064,9 +2091,9 @@ fn delete_empty_remote_dir(
 }
 
 fn unmark_peer_file(
-    pending_catchup_table: &mut Table<'_, (&'static str, PathId), ()>,
+    pending_catchup_table: &mut Table<'_, (&'static str, PartialPathId), ()>,
     peer: Peer,
-    pathid: PathId,
+    pathid: PartialPathId,
 ) -> Result<(), StorageError> {
     pending_catchup_table.remove((peer.as_str(), pathid))?;
 
@@ -2076,8 +2103,8 @@ fn unmark_peer_file(
 /// Check whether the given pathid exists in the cache and whether it
 /// is a file or a directory.
 fn pathid_assignment(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<Option<PathAssignment>, StorageError> {
     match cache_table.get((pathid, Layer::Default))? {
         Some(e) => match e.value().parse()? {
@@ -2092,9 +2119,9 @@ fn pathid_assignment(
 /// just before creating a file entry, to reproduce the strict behavior
 /// of filesystems.
 fn check_parent_is_dir(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
-    pathid: PathId,
+    pathid: PartialPathId,
 ) -> Result<(), StorageError> {
     if let Some(parent) = tree.parent(pathid)? {
         check_is_dir(cache_table, parent)?;
@@ -2105,8 +2132,8 @@ fn check_parent_is_dir(
 
 /// Make sure the given pathid exists and is a directory.
 fn check_is_dir(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
-    pathid: PathId,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
+    pathid: PartialPathId,
 ) -> Result<(), StorageError> {
     match pathid_assignment(cache_table, pathid)? {
         None => Err(StorageError::NotFound),
@@ -2117,26 +2144,26 @@ fn check_is_dir(
 
 #[allow(dead_code)]
 fn map_to_inode(
-    pathid_to_inode: &impl ReadableTable<PathId, Inode>,
-    pathid: PathId,
-) -> Result<Inode, StorageError> {
+    pathid_to_inode: &impl ReadableTable<PartialPathId, PartialInode>,
+    pathid: PartialPathId,
+) -> Result<PartialInode, StorageError> {
     if let Some(inode) = pathid_to_inode.get(pathid)? {
         return Ok(inode.value());
     }
 
-    Ok(Inode(pathid.as_u64()))
+    Ok(pathid.into())
 }
 
 #[allow(dead_code)]
 fn map_to_pathid(
-    inode_to_pathid: &impl ReadableTable<Inode, PathId>,
-    inode: Inode,
-) -> Result<PathId, StorageError> {
+    inode_to_pathid: &impl ReadableTable<PartialInode, PartialPathId>,
+    inode: PartialInode,
+) -> Result<PartialPathId, StorageError> {
     if let Some(pathid) = inode_to_pathid.get(inode)? {
         return Ok(pathid.value());
     }
 
-    Ok(PathId(inode.as_u64()))
+    Ok(inode.into())
 }
 
 fn local_path<'b, L: Into<TreeLoc<'b>>>(
@@ -2148,7 +2175,7 @@ fn local_path<'b, L: Into<TreeLoc<'b>>>(
 }
 
 fn entry_status<'b, L: Into<TreeLoc<'b>>>(
-    cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
+    cache_table: &impl ReadableTable<(PartialPathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
     loc: L,
 ) -> Result<CacheEntryStatus, StorageError> {
@@ -2178,6 +2205,7 @@ fn entry_status<'b, L: Into<TreeLoc<'b>>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StorageError;
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
@@ -2188,7 +2216,6 @@ mod tests {
     use crate::arena::{index, update};
     use crate::utils::hash;
     use crate::{CacheStatus, FileMetadata};
-    use crate::{PathId, StorageError};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -2306,7 +2333,7 @@ mod tests {
         fn lookup<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<(PathId, crate::Metadata), StorageError> {
+        ) -> Result<(PartialPathId, crate::Metadata), StorageError> {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2323,7 +2350,7 @@ mod tests {
         fn readdir<'b, L: Into<TreeLoc<'b>>>(
             &self,
             loc: L,
-        ) -> Result<Vec<(String, Option<PathId>, crate::Metadata)>, StorageError> {
+        ) -> Result<Vec<(String, Option<PartialPathId>, crate::Metadata)>, StorageError> {
             let txn = self.db.begin_read()?;
             let tree = txn.read_tree()?;
             let cache = txn.read_cache()?;
@@ -2387,7 +2414,7 @@ mod tests {
             Ok(())
         }
 
-        fn dirty_pathids(&self) -> Result<HashSet<PathId>, StorageError> {
+        fn dirty_pathids(&self) -> Result<HashSet<PartialPathId>, StorageError> {
             let txn = self.db.begin_read()?;
             let dirty = txn.read_dirty()?;
 
@@ -2472,7 +2499,7 @@ mod tests {
 
     fn dirty_pathids(
         dirty: &impl crate::arena::dirty::DirtyReadOperations,
-    ) -> Result<HashSet<PathId>, StorageError> {
+    ) -> Result<HashSet<PartialPathId>, StorageError> {
         let mut start = 0;
         let mut ret = HashSet::new();
         while let Some((pathid, counter)) = dirty.next_dirty(start)? {
@@ -2541,9 +2568,9 @@ mod tests {
 
         fixture.add_to_cache(&c_path, 100, mtime)?;
 
-        let a: PathId;
-        let b: PathId;
-        let c: PathId;
+        let a: PartialPathId;
+        let b: PartialPathId;
+        let c: PartialPathId;
         {
             let txn = fixture.db.begin_read()?;
             let tree = txn.read_tree()?;
@@ -2958,7 +2985,7 @@ mod tests {
             Err(StorageError::NotFound)
         ));
 
-        // PathId should still be resolvable, because some peers still have it.
+        // PartialPathId should still be resolvable, because some peers still have it.
         let txn = fixture.db.begin_read()?;
         let tree = txn.read_tree()?;
         assert!(tree.resolve(&file_path)?.is_some());
@@ -3366,7 +3393,7 @@ mod tests {
             entries
                 .iter()
                 .map(|(n, pathid, _)| (n.as_str(), *pathid.as_ref().unwrap()))
-                .collect::<Vec<(&str, PathId)>>()
+                .collect::<Vec<(&str, PartialPathId)>>()
         );
 
         Ok(())
@@ -3796,7 +3823,7 @@ mod tests {
                 old_hash: Hash([1u8; 32]),
             },
         )?;
-        let pathid: PathId;
+        let pathid: PartialPathId;
         {
             let txn = fixture.db.begin_read()?;
             let cache = txn.read_cache()?;
@@ -4218,7 +4245,7 @@ mod tests {
 
         let got = cache
             .all_indexed()
-            .collect::<Result<HashMap<PathId, IndexedFile>, _>>()?;
+            .collect::<Result<HashMap<PartialPathId, IndexedFile>, _>>()?;
         let expect = HashMap::from([
             (tree.resolve(path1)?.unwrap(), indexed_file1),
             (tree.resolve(path2)?.unwrap(), indexed_file2),
@@ -4942,7 +4969,7 @@ mod tests {
         }
 
         // Test error cases
-        let nonexistent_pathid = PathId(99999);
+        let nonexistent_pathid = PartialPathId(99999);
         let result = cache.metadata(&tree, nonexistent_pathid);
         assert!(matches!(result, Ok(None)), "result.ok:{:?}", result.ok());
 
@@ -5003,7 +5030,7 @@ mod tests {
         }
 
         // Test error cases
-        let nonexistent_pathid = PathId(99999);
+        let nonexistent_pathid = PartialPathId(99999);
         let result = fixture.metadata(nonexistent_pathid);
         assert!(matches!(result, Err(StorageError::NotFound)));
 
@@ -5070,20 +5097,24 @@ mod tests {
 
         // inodes are swapped
         assert_eq!(
-            Inode(source_pathid.as_u64()),
-            cache.map_to_inode(dest_pathid)?
+            source_pathid.as_u64(),
+            cache.map_to_inode(dest_pathid)?.as_u64()
         );
         assert_eq!(
-            Inode(dest_pathid.as_u64()),
-            cache.map_to_inode(source_pathid)?
+            dest_pathid.as_u64(),
+            cache.map_to_inode(source_pathid)?.as_u64()
         );
         assert_eq!(
-            source_pathid,
-            cache.map_to_pathid(Inode(dest_pathid.as_u64()))?
+            source_pathid.as_u64(),
+            cache
+                .map_to_pathid(PartialInode(dest_pathid.as_u64()))?
+                .as_u64()
         );
         assert_eq!(
-            dest_pathid,
-            cache.map_to_pathid(Inode(source_pathid.as_u64()))?
+            dest_pathid.as_u64(),
+            cache
+                .map_to_pathid(PartialInode(source_pathid.as_u64()))?
+                .as_u64()
         );
 
         // history entry was added
@@ -5249,11 +5280,11 @@ mod tests {
 
         // inodes are swapped
         assert_eq!(
-            Inode(source_pathid.as_u64()),
+            PartialInode::from(source_pathid),
             cache.map_to_inode(dest_pathid)?
         );
         assert_eq!(
-            Inode(dest_pathid.as_u64()),
+            PartialInode::from(dest_pathid),
             cache.map_to_inode(source_pathid)?
         );
 
@@ -5697,20 +5728,20 @@ mod tests {
         // Directory inode should be swapped - at least for the top
         // directories.
         assert_eq!(
-            Inode(source_dir_pathid.as_u64()),
+            PartialInode::from(source_dir_pathid),
             cache.map_to_inode(dest_dir_pathid)?
         );
         assert_eq!(
-            Inode(dest_dir_pathid.as_u64()),
+            PartialInode::from(dest_dir_pathid),
             cache.map_to_inode(source_dir_pathid)?
         );
         assert_eq!(
             source_dir_pathid,
-            cache.map_to_pathid(Inode(dest_dir_pathid.as_u64()))?
+            cache.map_to_pathid(PartialInode::from(dest_dir_pathid))?
         );
         assert_eq!(
             dest_dir_pathid,
-            cache.map_to_pathid(Inode(source_dir_pathid.as_u64()))?
+            cache.map_to_pathid(PartialInode::from(source_dir_pathid))?
         );
 
         assert_unordered::assert_eq_unordered!(

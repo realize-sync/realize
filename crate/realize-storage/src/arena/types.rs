@@ -1,6 +1,6 @@
 use crate::StorageError;
 use crate::config::{BytesOrPercent, DiskUsageConfig};
-use crate::types::PathId;
+use crate::types::PartialPathId;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -111,7 +111,7 @@ pub use blob_capnp::LruQueueId;
 
 /// Layer enum for cache table keys.
 ///
-/// Used in combination with PathId to form cache table keys.
+/// Used in combination with PartialPathId to form cache table keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Layer {
     /// The default entry, containing an entry for a local file or a cached entry from one of the remote layers.
@@ -184,10 +184,10 @@ impl Key for Layer {
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
-    /// First node in the queue (PathId)
-    pub head: Option<PathId>,
-    /// Last node in the queue (PathId)
-    pub tail: Option<PathId>,
+    /// First node in the queue (PartialPathId)
+    pub head: Option<PartialPathId>,
+    /// Last node in the queue (PartialPathId)
+    pub tail: Option<PartialPathId>,
     /// Total disk usage in bytes
     pub disk_usage: u64,
 }
@@ -206,14 +206,14 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 
         let head_value = reader.get_head();
         let head = if head_value != 0 {
-            Some(PathId(head_value))
+            Some(PartialPathId(head_value))
         } else {
             None
         };
 
         let tail_value = reader.get_tail();
         let tail = if tail_value != 0 {
-            Some(PathId(tail_value))
+            Some(PartialPathId(tail_value))
         } else {
             None
         };
@@ -257,11 +257,11 @@ pub struct BlobTableEntry {
     /// Queue ID enum
     pub queue: LruQueueId,
 
-    /// Next blob in the queue (PathId)
-    pub next: Option<PathId>,
+    /// Next blob in the queue (PartialPathId)
+    pub next: Option<PartialPathId>,
 
-    /// Previous blob in the queue (PathId)
-    pub prev: Option<PathId>,
+    /// Previous blob in the queue (PartialPathId)
+    pub prev: Option<PartialPathId>,
 
     /// Disk usage in bytes
     pub disk_usage: u64,
@@ -282,14 +282,14 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let content_hash = parse_hash(reader.get_content_hash()?)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
-            Some(PathId(next_value))
+            Some(PartialPathId(next_value))
         } else {
             None
         };
 
         let prev_value = reader.get_prev();
         let prev = if prev_value != 0 {
-            Some(PathId(prev_value))
+            Some(PartialPathId(prev_value))
         } else {
             None
         };
@@ -709,7 +709,7 @@ pub enum FileEntryKind {
     /// This is a file from another peer branched locally from
     /// another. The file may or may not have been branched on the
     /// local peers.
-    Branched(PathId),
+    Branched(PartialPathId),
 }
 
 impl FileEntryKind {
@@ -1003,7 +1003,7 @@ fn fill_file_table_entry(
         }
         FileEntryKind::RemoteFile => {}
         FileEntryKind::Branched(pathid) => {
-            builder.set_branched_from(PathId::from_optional(Some(pathid)));
+            builder.set_branched_from(PartialPathId::from_optional(Some(pathid)));
         }
     }
 }
@@ -1017,7 +1017,7 @@ fn parse_file_table_entry(
         FileEntryKind::SpecialFile
     } else if msg.get_local() {
         FileEntryKind::LocalFile
-    } else if let Some(pathid) = PathId::as_optional(msg.get_branched_from()) {
+    } else if let Some(pathid) = PartialPathId::as_optional(msg.get_branched_from()) {
         FileEntryKind::Branched(pathid)
     } else {
         FileEntryKind::RemoteFile
@@ -1585,8 +1585,8 @@ mod tests {
             content_size: 100,
             verified: false,
             queue: LruQueueId::WorkingArea,
-            next: Some(PathId(0x0101010101010101)),
-            prev: Some(PathId(0x0202020202020202)),
+            next: Some(PartialPathId(0x0101010101010101)),
+            prev: Some(PartialPathId(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -1617,8 +1617,8 @@ mod tests {
     #[test]
     fn convert_queue_table_entry() -> anyhow::Result<()> {
         let entry = QueueTableEntry {
-            head: Some(PathId(0x0101010101010101)),
-            tail: Some(PathId(0x0202020202020202)),
+            head: Some(PartialPathId(0x0101010101010101)),
+            tail: Some(PartialPathId(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -1684,7 +1684,7 @@ mod tests {
             size: 300,
             mtime: UnixTime::from_secs(1234567892),
             version: Version::Indexed(Hash([3u8; 32])),
-            kind: FileEntryKind::Branched(PathId(42)),
+            kind: FileEntryKind::Branched(PartialPathId(42)),
         };
 
         let bytes = branched_entry.to_bytes()?;
@@ -1721,7 +1721,7 @@ mod tests {
             size: 300,
             mtime: UnixTime::from_secs(1234567892),
             version: Version::Indexed(Hash([3u8; 32])),
-            kind: FileEntryKind::Branched(PathId(42)),
+            kind: FileEntryKind::Branched(PartialPathId(42)),
         };
         assert!(!branched_entry.is_local());
         assert!(branched_entry.is_remote());
@@ -1808,7 +1808,7 @@ mod tests {
             size: 200,
             mtime: UnixTime::from_secs(1234567890),
             version: Version::Indexed(Hash([0xa1u8; 32])),
-            kind: FileEntryKind::Branched(PathId(123)),
+            kind: FileEntryKind::Branched(PartialPathId(123)),
         };
 
         assert_eq!(

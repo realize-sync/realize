@@ -11,10 +11,9 @@ use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, HistoryTableEntry, MarkTableEntry,
     PeerTableEntry, QueueTableEntry,
 };
-use crate::PathId;
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
-use crate::types::{Inode, PartialPathId, PathIdPrefix};
+use crate::types::{PartialInode, PartialPathId};
 use crate::utils::holder::Holder;
 use realize_types::Arena;
 use redb::TableDefinition;
@@ -60,9 +59,9 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PartialPathId, u32> =
 /// An pathid available in no peers should be remove from all
 /// directories.
 ///
-/// Key: (PathId, Layer) (layer, pathid)
+/// Key: (PartialPathId, Layer) (layer, pathid)
 /// Value: CacheTableEntry
-const CACHE_TABLE: TableDefinition<(PathId, Layer), Holder<CacheTableEntry>> =
+const CACHE_TABLE: TableDefinition<(PartialPathId, Layer), Holder<CacheTableEntry>> =
     TableDefinition::new("cache.file");
 
 /// Track peer files that might have been deleted remotely.
@@ -74,7 +73,7 @@ const CACHE_TABLE: TableDefinition<(PathId, Layer), Holder<CacheTableEntry>> =
 ///
 /// Key: (peer, file pathid)
 /// Value: ()
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PathId), ()> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PartialPathId), ()> =
     TableDefinition::new("acache.pending_catchup");
 
 /// Track Peer UUIDs.
@@ -98,12 +97,13 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("aca
 ///
 /// Key: BlodId
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<PathId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<PartialPathId, Holder<BlobTableEntry>> =
+    TableDefinition::new("blob");
 
 /// Track the next blob ID to be allocated.
 ///
 /// Key: () (unit key)
-/// Value: PathId (next ID to allocate)
+/// Value: PartialPathId (next ID to allocate)
 
 /// Track LRU queue for blobs.
 ///
@@ -118,7 +118,7 @@ const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
 /// arena.
 ///
 /// Key: ()
-/// Value: (PathId, PathId) (last pathid allocated, end of range)
+/// Value: (PartialPathId, PartialPathId) (last pathid allocated, end of range)
 pub(crate) const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
     TableDefinition::new("pathid_range");
 
@@ -126,7 +126,8 @@ pub(crate) const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, Partial
 ///
 /// Key: &str (path)
 /// Value: Holder<MarkTableEntry>
-const MARK_TABLE: TableDefinition<PathId, Holder<MarkTableEntry>> = TableDefinition::new("mark");
+const MARK_TABLE: TableDefinition<PartialPathId, Holder<MarkTableEntry>> =
+    TableDefinition::new("mark");
 
 /// Path marked dirty, indexed by path.
 ///
@@ -136,13 +137,13 @@ const MARK_TABLE: TableDefinition<PathId, Holder<MarkTableEntry>> = TableDefinit
 ///
 /// Key: &str (path)
 /// Value: dirty counter (key of DIRTY_LOG_TABLE)
-const DIRTY_TABLE: TableDefinition<PathId, u64> = TableDefinition::new("dirty");
+const DIRTY_TABLE: TableDefinition<PartialPathId, u64> = TableDefinition::new("dirty");
 
 /// Path marked dirty, indexed by an increasing counter.
 ///
 /// Key: u64 (increasing counter)
 /// Value: &str (path)
-const DIRTY_LOG_TABLE: TableDefinition<u64, PathId> = TableDefinition::new("dirty_log");
+const DIRTY_LOG_TABLE: TableDefinition<u64, PartialPathId> = TableDefinition::new("dirty_log");
 
 /// Highest counter value for DIRTY_LOG_TABLE.
 ///
@@ -157,15 +158,16 @@ const DIRTY_COUNTER_TABLE: TableDefinition<(), u64> = TableDefinition::new("dirt
 const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
     TableDefinition::new("failed_job");
 
-/// Maps [Inode] to [PathId].
+/// Maps partial inode value to [PartialPathId].
 ///
 /// In most cases, pathids are converted to inodes directly. In some cases, however
 /// a mapping is required which is what this table and its reverse provide.
-const INODE_TO_PATHID_TABLE: TableDefinition<Inode, PathId> =
+const INODE_TO_PATHID_TABLE: TableDefinition<PartialInode, PartialPathId> =
     TableDefinition::new("inode_to_pathid");
 
-/// Maps [PathId] to [Inode]; the reverse of [INODE_TO_PATHID_TABLE];
-const PATHID_TO_INODE_TABLE: TableDefinition<PathId, Inode> =
+/// Maps [PartialPathId] to a partial inode value (that is, without
+/// ipath prefix); the reverse of [INODE_TO_PATHID_TABLE];
+const PATHID_TO_INODE_TABLE: TableDefinition<PartialPathId, PartialInode> =
     TableDefinition::new("pathid_to_inode");
 
 pub(crate) struct ArenaDatabase {
@@ -195,7 +197,6 @@ impl ArenaDatabase {
         Ok(ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
-            PathIdPrefix::from_u8(1),
             blob_dir,
             datadir,
         )?)
@@ -204,11 +205,10 @@ impl ArenaDatabase {
     pub fn new(
         db: redb::Database,
         arena: Arena,
-        prefix: PathIdPrefix,
         blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
     ) -> Result<Arc<Self>, StorageError> {
-        let tree = Tree::new(arena, prefix);
+        let tree = Tree::new(arena);
         let cache: Cache;
         let dirty: Dirty;
         let history: History;
@@ -723,7 +723,6 @@ impl BeforeCommit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PathIdPrefix;
     use assert_fs::TempDir;
     use realize_types::Arena;
     use redb::{ReadOnlyTable, ReadableTable};
@@ -849,27 +848,14 @@ mod tests {
         let blob_dir = tempdir.join("blobs");
         let datadir = tempdir.join("data");
         let arena = Arena::from("myarena");
-        let prefix = PathIdPrefix::from_u8(1);
-        let db = ArenaDatabase::new(
-            redb::Database::create(&dbpath)?,
-            arena,
-            prefix,
-            &blob_dir,
-            &datadir,
-        )?;
+        let db = ArenaDatabase::new(redb::Database::create(&dbpath)?, arena, &blob_dir, &datadir)?;
         let uuid = db.uuid().clone();
         assert!(!uuid.is_nil());
         assert_eq!(db.settings().borrow().uuid, *db.uuid());
 
         drop(db);
 
-        let db = ArenaDatabase::new(
-            redb::Database::create(&dbpath)?,
-            arena,
-            prefix,
-            &blob_dir,
-            &datadir,
-        )?;
+        let db = ArenaDatabase::new(redb::Database::create(&dbpath)?, arena, &blob_dir, &datadir)?;
         assert_eq!(uuid, *db.uuid());
         assert_eq!(db.settings().borrow().uuid, *db.uuid());
 

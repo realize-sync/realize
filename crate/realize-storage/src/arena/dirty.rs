@@ -1,8 +1,8 @@
 use super::db::AfterCommit;
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations};
 use super::types::{FailedJobTableEntry, RetryJob};
-use crate::PathId;
 use crate::arena::db::Tag;
+use crate::types::PartialPathId;
 use crate::{JobId, StorageError, utils::holder::Holder};
 use realize_types::UnixTime;
 use redb::{ReadableTable, Table};
@@ -15,7 +15,9 @@ pub(crate) struct Dirty {
 }
 
 impl Dirty {
-    pub(crate) fn setup(log_table: &impl ReadableTable<u64, PathId>) -> Result<Self, StorageError> {
+    pub(crate) fn setup(
+        log_table: &impl ReadableTable<u64, PartialPathId>,
+    ) -> Result<Self, StorageError> {
         let last_counter = last_counter(log_table)?;
         let (watch_tx, watch_rx) = watch::channel(last_counter);
 
@@ -31,8 +33,8 @@ impl Dirty {
 
 pub(crate) struct ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<PathId, u64>,
-    LT: ReadableTable<u64, PathId>,
+    DT: ReadableTable<PartialPathId, u64>,
+    LT: ReadableTable<u64, PartialPathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     table: DT,
@@ -42,8 +44,8 @@ where
 
 impl<DT, LT, FT> ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<PathId, u64>,
-    LT: ReadableTable<u64, PathId>,
+    DT: ReadableTable<PartialPathId, u64>,
+    LT: ReadableTable<u64, PartialPathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
     pub(crate) fn new(dirty_table: DT, log_table: LT, failed_job_table: FT) -> Self {
@@ -59,8 +61,8 @@ pub(crate) struct WritableOpenDirty<'a> {
     tag: Tag,
     after_commit: &'a AfterCommit,
     dirty: &'a Dirty,
-    table: Table<'a, PathId, u64>,
-    log_table: Table<'a, u64, PathId>,
+    table: Table<'a, PartialPathId, u64>,
+    log_table: Table<'a, u64, PartialPathId>,
     failed_job_table: Table<'a, u64, Holder<'static, FailedJobTableEntry>>,
     counter_table: Table<'a, (), u64>,
 }
@@ -70,8 +72,8 @@ impl<'a> WritableOpenDirty<'a> {
         tag: Tag,
         after_commit: &'a AfterCommit,
         dirty: &'a Dirty,
-        dirty_table: Table<'a, PathId, u64>,
-        log_table: Table<'a, u64, PathId>,
+        dirty_table: Table<'a, PartialPathId, u64>,
+        log_table: Table<'a, u64, PartialPathId>,
         failed_job_table: Table<'a, u64, Holder<FailedJobTableEntry>>,
         counter_table: Table<'a, (), u64>,
     ) -> Self {
@@ -88,11 +90,11 @@ impl<'a> WritableOpenDirty<'a> {
 }
 
 pub(crate) trait DirtyReadOperations {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError>;
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PartialPathId, u64)>, StorageError>;
     #[allow(dead_code)] // for testing
     fn last_counter(&self) -> Result<u64, StorageError>;
-    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError>;
-    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError>;
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PartialPathId>, StorageError>;
+    fn get_counter(&self, pathid: PartialPathId) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
     fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError>;
     fn get_earliest_backoff(
@@ -103,11 +105,11 @@ pub(crate) trait DirtyReadOperations {
 
 impl<DT, LT, FT> DirtyReadOperations for ReadableOpenDirty<DT, LT, FT>
 where
-    DT: ReadableTable<PathId, u64>,
-    LT: ReadableTable<u64, PathId>,
+    DT: ReadableTable<PartialPathId, u64>,
+    LT: ReadableTable<u64, PartialPathId>,
     FT: ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
 {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError> {
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PartialPathId, u64)>, StorageError> {
         next_dirty(&self.log_table, start_counter)
     }
 
@@ -115,11 +117,11 @@ where
         last_counter(&self.log_table)
     }
 
-    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PartialPathId>, StorageError> {
         get_pathid_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError> {
+    fn get_counter(&self, pathid: PartialPathId) -> Result<Option<u64>, StorageError> {
         get_counter(&self.table, pathid)
     }
 
@@ -140,7 +142,7 @@ where
 }
 
 impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
-    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError> {
+    fn next_dirty(&self, start_counter: u64) -> Result<Option<(PartialPathId, u64)>, StorageError> {
         next_dirty(&self.log_table, start_counter)
     }
 
@@ -148,11 +150,11 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         last_counter(&self.log_table)
     }
 
-    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
+    fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PartialPathId>, StorageError> {
         get_pathid_for_counter(&self.log_table, counter)
     }
 
-    fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError> {
+    fn get_counter(&self, pathid: PartialPathId) -> Result<Option<u64>, StorageError> {
         get_counter(&self.table, pathid)
     }
 
@@ -294,7 +296,7 @@ impl<'a> WritableOpenDirty<'a> {
     /// This does nothing if the path is already dirty.
     pub(crate) fn mark_dirty(
         &mut self,
-        pathid: PathId,
+        pathid: PartialPathId,
         reason: &'static str,
     ) -> Result<(), StorageError> {
         let last_counter = self.counter_table.get(())?.map(|e| e.value()).unwrap_or(0);
@@ -318,9 +320,9 @@ impl<'a> WritableOpenDirty<'a> {
 }
 
 fn next_dirty(
-    log_table: &impl ReadableTable<u64, PathId>,
+    log_table: &impl ReadableTable<u64, PartialPathId>,
     start_counter: u64,
-) -> Result<Option<(PathId, u64)>, StorageError> {
+) -> Result<Option<(PartialPathId, u64)>, StorageError> {
     if let Some(entry) = (log_table.range(start_counter..)?).next() {
         let (key, value) = entry?;
         let counter = key.value();
@@ -330,14 +332,14 @@ fn next_dirty(
     Ok(None)
 }
 
-fn last_counter(log_table: &impl ReadableTable<u64, PathId>) -> Result<u64, StorageError> {
+fn last_counter(log_table: &impl ReadableTable<u64, PartialPathId>) -> Result<u64, StorageError> {
     Ok(log_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
 fn get_pathid_for_counter(
-    log_table: &impl ReadableTable<u64, PathId>,
+    log_table: &impl ReadableTable<u64, PartialPathId>,
     counter: u64,
-) -> Result<Option<PathId>, StorageError> {
+) -> Result<Option<PartialPathId>, StorageError> {
     if let Some(v) = log_table.get(counter)? {
         Ok(Some(v.value()))
     } else {
@@ -346,8 +348,8 @@ fn get_pathid_for_counter(
 }
 
 fn get_counter(
-    table: &impl ReadableTable<PathId, u64>,
-    pathid: PathId,
+    table: &impl ReadableTable<PartialPathId, u64>,
+    pathid: PartialPathId,
 ) -> Result<Option<u64>, StorageError> {
     if let Some(entry) = table.get(pathid)? {
         Ok(Some(entry.value()))
@@ -447,7 +449,7 @@ mod tests {
         }
     }
 
-    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(PathId, u64)>, StorageError> {
+    fn all(dirty: &impl DirtyReadOperations) -> Result<Vec<(PartialPathId, u64)>, StorageError> {
         let mut start = 0;
         let mut vec = vec![];
         while let Some((pathid, counter)) = dirty.next_dirty(start)? {
@@ -458,7 +460,9 @@ mod tests {
         Ok(vec)
     }
 
-    fn all_pathids(dirty: &impl DirtyReadOperations) -> Result<HashSet<PathId>, StorageError> {
+    fn all_pathids(
+        dirty: &impl DirtyReadOperations,
+    ) -> Result<HashSet<PartialPathId>, StorageError> {
         Ok(all(dirty)?.into_iter().map(|(i, _)| i).collect())
     }
 
@@ -502,7 +506,7 @@ mod tests {
         let txn = fixture.db.begin_write()?;
         let mut dirty = txn.write_dirty()?;
 
-        dirty.mark_dirty(PathId(1), "test")?;
+        dirty.mark_dirty(PartialPathId(1), "test")?;
 
         Ok(())
     }
@@ -694,7 +698,7 @@ mod tests {
         assert_eq!(result, Some(1));
 
         // Get counter for non-existent path
-        let result = dirty.get_counter(PathId(999))?;
+        let result = dirty.get_counter(PartialPathId(999))?;
         assert_eq!(result, None);
 
         Ok(())

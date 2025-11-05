@@ -4,7 +4,7 @@ use redb::{Key, TypeName, Value};
 pub struct PathIdPrefix(u8);
 
 impl PathIdPrefix {
-    const MASK: u64 = 0x00ffffffffffffff;
+    pub(crate) const MASK: u64 = 0x00ffffffffffffff;
     pub const ZERO: PathIdPrefix = PathIdPrefix(0);
 
     pub fn from_u8(val: u8) -> PathIdPrefix {
@@ -69,10 +69,6 @@ impl PathId {
         PathIdPrefix((self.0 >> 56) as u8)
     }
 
-    pub fn has_prefix(&self, prefix: PathIdPrefix) -> bool {
-        (self.0 & !PathIdPrefix::MASK) == prefix.as_u64()
-    }
-
     pub fn plus(&self, val: u64) -> PathId {
         PathId(self.0 + val)
     }
@@ -103,6 +99,12 @@ impl PathId {
 
     pub fn from_optional(pathid: Option<PathId>) -> u64 {
         pathid.map(|i| i.0).unwrap_or(0)
+    }
+}
+
+impl From<Inode> for PathId {
+    fn from(value: Inode) -> Self {
+        PathId(value.as_u64())
     }
 }
 
@@ -229,16 +231,22 @@ impl PartialPathId {
         format!("{:016x}", self.0)
     }
 
-    pub fn as_optional(pathid: u64) -> Option<PathId> {
+    pub fn as_optional(pathid: u64) -> Option<PartialPathId> {
         if pathid == 0 {
             None
         } else {
-            Some(PathId(pathid))
+            Some(PartialPathId(pathid))
         }
     }
 
-    pub fn from_optional(pathid: Option<PathId>) -> u64 {
+    pub fn from_optional(pathid: Option<PartialPathId>) -> u64 {
         pathid.map(|i| i.0).unwrap_or(0)
+    }
+}
+
+impl From<PartialInode> for PartialPathId {
+    fn from(value: PartialInode) -> Self {
+        PartialPathId(value.as_u64())
     }
 }
 
@@ -334,8 +342,16 @@ impl Inode {
     pub const MAX: Inode = Inode(u64::MAX);
 
     /// Create a new Inode from a u64 value.
-    pub fn new(value: u64) -> Self {
-        Self(value)
+    pub fn new(prefix: PathIdPrefix, partial: PartialInode) -> Self {
+        Self(prefix.as_u64() | (partial.as_u64() & PathIdPrefix::MASK))
+    }
+
+    pub fn partial(&self) -> PartialInode {
+        PartialInode(self.0 & PathIdPrefix::MASK)
+    }
+
+    pub fn prefix(&self) -> PathIdPrefix {
+        PathIdPrefix((self.0 >> 56) as u8)
     }
 
     /// Get the underlying u64 value.
@@ -361,6 +377,12 @@ impl Inode {
     /// order is the same as the numeric order.
     pub fn hex(&self) -> String {
         format!("{:016x}", self.0)
+    }
+}
+
+impl From<PathId> for Inode {
+    fn from(value: PathId) -> Self {
+        Inode(value.as_u64())
     }
 }
 
@@ -435,6 +457,97 @@ impl Value for Inode {
 
     fn type_name() -> TypeName {
         TypeName::new("Inode")
+    }
+}
+
+/// A newtype wrapper around u64 representing an PartialInode number.
+///
+/// This type can be used as a key or value in redb database schemas.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PartialInode(pub u64);
+
+impl PartialInode {
+    pub const ZERO: PartialInode = PartialInode(0);
+    pub const MAX: PartialInode = PartialInode(u64::MAX);
+
+    pub fn with(&self, prefix: PathIdPrefix) -> Inode {
+        Inode::new(prefix, *self)
+    }
+
+    pub fn plus(&self, val: u64) -> PartialInode {
+        PartialInode(self.0 + val)
+    }
+
+    pub fn minus(&self, val: u64) -> PartialInode {
+        PartialInode(self.0 - val)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+
+    /// Return a hexadecimal representation for PartialInodes.
+    ///
+    /// This representation uses leading 0, so the lexicographical
+    /// order is the same as the numeric order.
+    pub fn hex(&self) -> String {
+        format!("{:016x}", self.0)
+    }
+}
+
+impl From<PartialPathId> for PartialInode {
+    fn from(value: PartialPathId) -> Self {
+        PartialInode(value.as_u64())
+    }
+}
+
+impl std::fmt::Display for PartialInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:x}", self.0)
+    }
+}
+impl std::fmt::Debug for PartialInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartialInode(0x{:x})", self.0)
+    }
+}
+
+impl Key for PartialInode {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        let value1 = u64::from_le_bytes(data1.try_into().unwrap_or([0; 8]));
+        let value2 = u64::from_le_bytes(data2.try_into().unwrap_or([0; 8]));
+        value1.cmp(&value2)
+    }
+}
+
+impl Value for PartialInode {
+    type SelfType<'a> = PartialInode;
+    type AsBytes<'a>
+        = [u8; 8]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(8)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> PartialInode
+    where
+        Self: 'a,
+    {
+        PartialInode(<u64>::from_le_bytes(data.try_into().unwrap_or([0; 8])))
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; 8]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value.0.to_le_bytes()
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("PartialInode")
     }
 }
 
@@ -528,6 +641,18 @@ mod tests {
         let full = partial.with(prefix);
         assert_eq!(0x1200000000000133, full.as_u64());
         assert_eq!(full, prefix.and(partial));
+        assert_eq!(partial, full.partial());
+        assert_eq!(prefix, full.prefix());
+    }
+
+    #[test]
+    fn partial_and_full_inode() {
+        let prefix = PathIdPrefix(0x12);
+        let partial = PartialInode(0x133);
+        let full = partial.with(prefix);
+        assert_eq!(0x1200000000000133, full.as_u64());
+        assert_eq!(partial, full.partial());
+        assert_eq!(prefix, full.prefix());
     }
 
     #[test]

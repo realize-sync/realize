@@ -6,8 +6,8 @@ use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::CacheStatus;
 use crate::arena::tree::TreeReadOperations;
-use crate::types::JobId;
-use crate::{Mark, PathId, StorageError};
+use crate::types::{JobId, PartialPathId};
+use crate::{Mark, StorageError};
 use realize_types::{Hash, Path, UnixTime};
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,22 +50,22 @@ pub(crate) enum StorageJob {
     /// If the cache already has a newer version, the indexed file is
     /// just dropped.
     Unrealize {
-        pathid: PathId,
+        pathid: PartialPathId,
         indexed_hash: Hash,
     },
 
     /// Realize the given file with `counter`, moving `Hash` from
     /// cache to the index, currently containing nothing or `Hash`.
     Realize {
-        pathid: PathId,
+        pathid: PartialPathId,
         hash: Hash,
     },
 
     /// Move the blob to the protected queue.
-    ProtectBlob(PathId),
+    ProtectBlob(PartialPathId),
 
     /// Move the blob to the unprotected queue.
-    UnprotectBlob(PathId),
+    UnprotectBlob(PartialPathId),
 }
 
 impl StorageJob {
@@ -431,7 +431,7 @@ impl Engine {
         &self,
         txn: &ArenaReadTransaction,
         tree: &impl TreeReadOperations,
-        pathid: PathId,
+        pathid: PartialPathId,
     ) -> Result<Option<StorageJob>, StorageError> {
         let cache = txn.read_cache()?;
         let blobs = txn.read_blobs()?;
@@ -604,9 +604,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::Blob;
-    use crate::GlobalDatabase;
     use crate::Notification;
-    use crate::PathIdAllocator;
     use crate::arena::fs::ArenaFilesystem;
     use crate::arena::index;
     use crate::arena::mark;
@@ -644,14 +642,7 @@ mod tests {
             let datadir = tempdir.path().join("data");
             std::fs::create_dir_all(&datadir)?;
 
-            let allocator = PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
-            let db = ArenaDatabase::new(
-                redb_utils::in_memory()?,
-                arena,
-                allocator.allocate_prefix(arena)?,
-                &blob_dir,
-                &datadir,
-            )?;
+            let db = ArenaDatabase::new(redb_utils::in_memory()?, arena, &blob_dir, &datadir)?;
             let acache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
             let engine = Engine::new(Arc::clone(&db), |attempt| {
                 if attempt < 3 {
@@ -774,7 +765,7 @@ mod tests {
             Ok(())
         }
 
-        fn pathid(&self, path: &Path) -> anyhow::Result<PathId> {
+        fn pathid(&self, path: &Path) -> anyhow::Result<PartialPathId> {
             let txn = self.db.begin_read()?;
 
             Ok(txn.read_tree()?.expect(path)?)
