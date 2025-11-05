@@ -52,10 +52,10 @@ impl Storage {
         let globaldb = create_globaldb(&config.cache.db)
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
-        let allocator = PathIdAllocator::new(
-            Arc::clone(&globaldb),
-            config.arenas.iter().map(|a| a.arena).collect::<Vec<_>>(),
-        )?;
+        let allocator = PathIdAllocator::new(Arc::clone(&globaldb))?;
+        for arena in &config.arenas {
+            allocator.allocate_prefix(arena.arena)?;
+        }
         for NamedArenaConfig {
             arena,
             config: arena_config,

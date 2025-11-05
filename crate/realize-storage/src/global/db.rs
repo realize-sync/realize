@@ -1,7 +1,7 @@
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
 use crate::{PathId, StorageError};
-use redb::{Table, TableDefinition};
+use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::sync::Arc;
 
 /// Track current pathid range for each arena.
@@ -64,7 +64,9 @@ impl GlobalDatabase {
     }
 
     pub fn begin_read(&self) -> Result<GlobalReadTransaction, StorageError> {
-        Ok(GlobalReadTransaction {})
+        Ok(GlobalReadTransaction {
+            inner: self.db.begin_read()?,
+        })
     }
 }
 
@@ -102,6 +104,12 @@ impl GlobalWriteTransaction {
     }
 }
 
-pub struct GlobalReadTransaction {}
+pub struct GlobalReadTransaction {
+    inner: redb::ReadTransaction,
+}
 
-impl GlobalReadTransaction {}
+impl GlobalReadTransaction {
+    pub fn arena_table(&self) -> Result<ReadOnlyTable<&'static str, PathId>, StorageError> {
+        Ok(self.inner.open_table(ARENA_TABLE)?)
+    }
+}

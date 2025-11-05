@@ -896,7 +896,10 @@ mod tests {
 
             let arenas = arenas.into_iter().collect::<Vec<_>>();
             let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let allocator = PathIdAllocator::new(Arc::clone(&db), arenas.clone())?;
+            let allocator = PathIdAllocator::new(Arc::clone(&db))?;
+            for arena in &arenas {
+                allocator.allocate_prefix(*arena)?;
+            }
             let mut arena_fs = vec![];
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));

@@ -191,15 +191,11 @@ impl ArenaDatabase {
         blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Arc<Self>> {
-        ArenaDatabase::for_testing(
-            arena,
-            crate::PathIdAllocator::new(
-                crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
-                [arena],
-            )?,
-            blob_dir,
-            datadir,
-        )
+        let allocator = crate::PathIdAllocator::new(crate::GlobalDatabase::new(
+            crate::utils::redb_utils::in_memory()?,
+        )?)?;
+        allocator.allocate_prefix(arena)?;
+        ArenaDatabase::for_testing(arena, allocator, blob_dir, datadir)
     }
 
     #[cfg(test)]
@@ -867,8 +863,8 @@ mod tests {
         let blob_dir = tempdir.join("blobs");
         let datadir = tempdir.join("data");
         let arena = Arena::from("myarena");
-        let allocator =
-            PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?, [arena])?;
+        let allocator = PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
+        allocator.allocate_prefix(arena)?;
         let db = ArenaDatabase::new(
             redb::Database::create(&dbpath)?,
             arena,

@@ -4,12 +4,12 @@ use crate::{GlobalDatabase, PathId, StorageError};
 use bimap::BiMap;
 use realize_types::Arena;
 use redb::ReadableTable;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Allocate pathid ranges and assign them to arenas.
 pub(crate) struct PathIdAllocator {
     db: Arc<GlobalDatabase>,
-    prefixes: BiMap<Arena, PathIdPrefix>,
+    prefixes: RwLock<BiMap<Arena, PathIdPrefix>>,
 }
 
 impl PathIdAllocator {
@@ -19,19 +19,19 @@ impl PathIdAllocator {
     ///
     /// An arena root is allocated for all arenas in `arenas` and
     /// stored in the database for next time..
-    pub(crate) fn new<T>(db: Arc<GlobalDatabase>, arenas: T) -> Result<Arc<Self>, StorageError>
-    where
-        T: IntoIterator<Item = Arena>,
-    {
-        let mut this = Self {
-            db,
-            prefixes: BiMap::new(),
-        };
-        for arena in arenas.into_iter() {
-            this.add_arena(arena)?;
+    pub(crate) fn new(db: Arc<GlobalDatabase>) -> Result<Arc<Self>, StorageError> {
+        let txn = db.begin_read()?;
+        let table = txn.arena_table()?;
+        let mut prefixes = BiMap::new();
+        for value in table.iter()? {
+            let (arena, pathid) = value?;
+            prefixes.insert(Arena::from(arena.value()), pathid.value().prefix());
         }
 
-        Ok(Arc::new(this))
+        Ok(Arc::new(Self {
+            db,
+            prefixes: RwLock::new(prefixes),
+        }))
     }
 
     /// Return the root pathid of the given arena.
@@ -39,16 +39,33 @@ impl PathIdAllocator {
     /// The arena must have been added to this allocator.
     pub(crate) fn arena_root(&self, arena: Arena) -> Option<PathId> {
         self.prefixes
+            .read()
+            .unwrap()
             .get_by_left(&arena)
             .map(|p| PartialPathId::ROOT.with(*p))
     }
 
-    /// Check whether [PathId] is an arena root.
-    pub(crate) fn is_arena_root(&self, pathid: PathId) -> bool {
-        self.prefixes.get_by_right(&pathid.prefix()).is_some()
+    /// Return the prefix of the given arena.
+    ///
+    /// The arena must have been added to this allocator.
+    pub(crate) fn prefix(&self, arena: Arena) -> Option<PathIdPrefix> {
+        self.prefixes
+            .read()
+            .unwrap()
+            .get_by_left(&arena)
+            .map(|p| *p)
     }
 
-    /// Allocate an pathid for an arena.
+    /// Check whether [PathId] is the root of a known arena.
+    pub(crate) fn is_arena_root(&self, pathid: PathId) -> bool {
+        self.prefixes
+            .read()
+            .unwrap()
+            .get_by_right(&pathid.prefix())
+            .is_some()
+    }
+
+    /// Allocate a pathid for an arena.
     ///
     /// `current_range_table` must be an opened table within the arena database.
     pub(crate) fn allocate_arena_pathid(
@@ -56,7 +73,11 @@ impl PathIdAllocator {
         current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
         arena: Arena,
     ) -> Result<PathId, StorageError> {
-        self.allocate_pathid(current_range_table, || self.pathid_range_for_arena(arena))
+        allocate_pathid(
+            current_range_table,
+            self.prefix(arena)
+                .ok_or_else(|| StorageError::UnknownArena(arena))?,
+        )
     }
 
     /// Allocate a global pathid.
@@ -64,9 +85,7 @@ impl PathIdAllocator {
         &self,
         txn: &GlobalWriteTransaction,
     ) -> Result<PathId, StorageError> {
-        self.allocate_pathid(&mut txn.current_pathid_range_table()?, || {
-            Ok(pathid_range_with_prefix(PathIdPrefix::ZERO))
-        })
+        allocate_pathid(&mut txn.current_pathid_range_table()?, PathIdPrefix::ZERO)
     }
 
     /// Maps pathids to arenas.
@@ -82,69 +101,67 @@ impl PathIdAllocator {
         if prefix == PathIdPrefix::ZERO {
             return Ok(None);
         }
-        if let Some(arena) = self.prefixes.get_by_right(&prefix) {
+        if let Some(arena) = self.prefixes.read().unwrap().get_by_right(&prefix) {
             return Ok(Some(*arena));
         }
         Err(StorageError::NotFound)
     }
 
     /// Retrieve or allocate the arena root for the given arena.
-    fn add_arena(&mut self, arena: Arena) -> Result<(), StorageError> {
+    pub(crate) fn allocate_prefix(&self, arena: Arena) -> Result<PathIdPrefix, StorageError> {
+        if let Some(prefix) = self.prefix(arena) {
+            return Ok(prefix);
+        }
+        let prefix: PathIdPrefix;
         let txn = self.db.begin_write()?;
         {
             let mut arena_table = txn.arena_table()?;
-            let prefix = PathIdPrefix::from_u8(
-                self.prefixes
-                    .right_values()
-                    .map(|p| p.as_u8())
-                    .max()
-                    .unwrap_or(0)
-                    + 1,
-            );
-            self.prefixes.insert(arena, prefix);
-            let root = PartialPathId::ROOT.with(prefix);
-            arena_table.insert(arena.as_str(), root)?;
-            log::debug!("[{arena}]: prefix {prefix} root {root}");
+            // Check again, as the database is the source of truth and
+            // it could can be temporarily inconsistent with
+            // self.prefix.
+            if let Some(existing) = arena_table.get(arena.as_str())? {
+                let pathid = existing.value();
+                prefix = pathid.prefix();
+            } else {
+                let mut max_prefix = 0u8;
+                for value in arena_table.iter()? {
+                    let (_, pathid) = value?;
+                    max_prefix = std::cmp::max(max_prefix, pathid.value().prefix().as_u8());
+                }
+                prefix = PathIdPrefix::from_u8(max_prefix + 1);
+                let root = PartialPathId::ROOT.with(prefix);
+                arena_table.insert(arena.as_str(), root)?;
+                log::debug!("[{arena}]: prefix {prefix} root {root}");
+            }
         }
         txn.commit()?;
-        Ok(())
-    }
 
-    /// Allocate a newpathid, using the given table and range
-    /// allocation function.
-    fn allocate_pathid(
-        &self,
-        current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
-        alloc_pathid_range: impl FnOnce() -> Result<(PathId, PathId), StorageError>,
-    ) -> Result<PathId, StorageError> {
-        let (current, end) = match current_range_table.get(())? {
-            Some(value) => value.value(),
-            None => alloc_pathid_range()?,
-        };
-        if current < end {
-            let pathid = current.plus(1);
-            current_range_table.insert((), (pathid, end))?;
-            return Ok(pathid);
-        }
+        self.prefixes.write().unwrap().insert(arena, prefix);
 
-        Err(StorageError::CannotAllocatePathId)
-    }
-
-    fn pathid_range_for_arena(&self, arena: Arena) -> Result<(PathId, PathId), StorageError> {
-        let prefix = *self
-            .prefixes
-            .get_by_left(&arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))?;
-
-        Ok(pathid_range_with_prefix(prefix))
+        Ok(prefix)
     }
 }
 
-fn pathid_range_with_prefix(prefix: PathIdPrefix) -> (PathId, PathId) {
-    (
-        PartialPathId::ROOT.with(prefix),
-        PartialPathId::MAX.with(prefix),
-    )
+/// Allocate a new pathid, using the given table and prefix.
+/// allocation function.
+pub(crate) fn allocate_pathid(
+    current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
+    prefix: PathIdPrefix,
+) -> Result<PathId, StorageError> {
+    let (current, end) = match current_range_table.get(())? {
+        Some(value) => value.value(),
+        None => (
+            PartialPathId::ROOT.with(prefix),
+            PartialPathId::MAX.with(prefix),
+        ),
+    };
+    if current < end {
+        let pathid = current.plus(1);
+        current_range_table.insert((), (pathid, end))?;
+        return Ok(pathid);
+    }
+
+    Err(StorageError::CannotAllocatePathId)
 }
 
 #[cfg(test)]
@@ -169,7 +186,10 @@ mod tests {
             let _ = env_logger::try_init();
             let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
             let arenas = arenas.into_iter().collect::<Vec<_>>();
-            let allocator = PathIdAllocator::new(Arc::clone(&db), arenas.clone())?;
+            let allocator = PathIdAllocator::new(Arc::clone(&db))?;
+            for arena in &arenas {
+                allocator.allocate_prefix(*arena)?;
+            }
 
             let mut arena_dbs = HashMap::new();
             for arena in arenas {

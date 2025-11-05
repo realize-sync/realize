@@ -38,15 +38,11 @@ impl ArenaFilesystem {
         blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
-        ArenaFilesystem::for_testing(
-            arena,
-            crate::PathIdAllocator::new(
-                crate::GlobalDatabase::new(crate::utils::redb_utils::in_memory()?)?,
-                [arena],
-            )?,
-            blob_dir,
-            datadir,
-        )
+        let allocator = crate::PathIdAllocator::new(crate::GlobalDatabase::new(
+            crate::utils::redb_utils::in_memory()?,
+        )?)?;
+        allocator.allocate_prefix(arena)?;
+        ArenaFilesystem::for_testing(arena, allocator, blob_dir, datadir)
     }
 
     #[cfg(test)]
