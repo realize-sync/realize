@@ -425,7 +425,7 @@ pub(crate) struct WritableOpenTree<'a> {
     before_commit: &'a BeforeCommit,
     table: Table<'a, (PathId, &'static str), PathId>,
     refcount_table: Table<'a, PathId, u32>,
-    current_pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
+    pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
     tree: &'a Tree,
 }
 
@@ -435,7 +435,7 @@ impl<'a> WritableOpenTree<'a> {
         before_commit: &'a BeforeCommit,
         tree_table: Table<'a, (PathId, &'static str), PathId>,
         refcount_table: Table<'a, PathId, u32>,
-        current_pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
+        pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
         tree: &'a Tree,
     ) -> Self {
         Self {
@@ -443,7 +443,7 @@ impl<'a> WritableOpenTree<'a> {
             before_commit,
             table: tree_table,
             refcount_table,
-            current_pathid_range_table,
+            pathid_range_table,
             tree,
         }
     }
@@ -696,7 +696,7 @@ impl<'a> WritableOpenTree<'a> {
     }
 
     fn allocate_pathid(&mut self) -> Result<PathId, StorageError> {
-        pathid_allocator::allocate(&mut self.current_pathid_range_table, self.tree.prefix)
+        Ok(pathid_allocator::allocate(&mut self.pathid_range_table)?.with(self.tree.prefix))
     }
 
     fn add_pathid(

@@ -1,4 +1,5 @@
 use crate::global::types::PathTableEntry;
+use crate::types::PartialPathId;
 use crate::utils::holder::Holder;
 use crate::{PathId, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
@@ -11,8 +12,8 @@ use std::sync::Arc;
 ///
 /// Key: ()
 /// Value: (PathId, PathId) (last pathid allocated, end of range)
-const CURRENT_PATHID_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
-    TableDefinition::new("acache.current_pathid_range");
+const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
+    TableDefinition::new("pathid_range");
 
 /// Maps arena to their root directory pathid.
 ///
@@ -49,7 +50,7 @@ impl GlobalDatabase {
             // Create tables so they can safely be queried in read
             // transactions in an empty database.
             txn.open_table(ARENA_TABLE)?;
-            txn.open_table(CURRENT_PATHID_RANGE_TABLE)?;
+            txn.open_table(PATHID_RANGE_TABLE)?;
             txn.open_table(PATH_TABLE)?;
         }
         txn.commit()?;
@@ -91,10 +92,10 @@ impl GlobalWriteTransaction {
         Ok(self.inner.open_table(ARENA_TABLE)?)
     }
 
-    pub fn current_pathid_range_table<'txn>(
+    pub fn pathid_range_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, (), (PathId, PathId)>, StorageError> {
-        Ok(self.inner.open_table(CURRENT_PATHID_RANGE_TABLE)?)
+    ) -> Result<Table<'txn, (), (PartialPathId, PartialPathId)>, StorageError> {
+        Ok(self.inner.open_table(PATHID_RANGE_TABLE)?)
     }
 
     pub fn path_table<'txn>(

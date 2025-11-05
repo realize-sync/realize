@@ -119,21 +119,17 @@ impl PathIdAllocator {
 
 /// Allocate a new pathid in [GlobalDatabase].
 pub(crate) fn allocate_global_pathid(txn: &GlobalWriteTransaction) -> Result<PathId, StorageError> {
-    allocate(&mut txn.current_pathid_range_table()?, PathIdPrefix::ZERO)
+    Ok(allocate(&mut txn.pathid_range_table()?)?.with(PathIdPrefix::ZERO))
 }
 
 /// Allocate a new pathid, using the given table and prefix.
 /// allocation function.
 pub(crate) fn allocate(
-    current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
-    prefix: PathIdPrefix,
-) -> Result<PathId, StorageError> {
+    current_range_table: &mut redb::Table<'_, (), (PartialPathId, PartialPathId)>,
+) -> Result<PartialPathId, StorageError> {
     let (current, end) = match current_range_table.get(())? {
         Some(value) => value.value(),
-        None => (
-            PartialPathId::ROOT.with(prefix),
-            PartialPathId::MAX.with(prefix),
-        ),
+        None => (PartialPathId::ROOT, PartialPathId::MAX),
     };
     if current < end {
         let pathid = current.plus(1);
@@ -187,10 +183,8 @@ mod tests {
 
         fn allocate_arena_pathid(&self, arena: Arena) -> Result<PathId, StorageError> {
             let txn = self.arena_db(arena).begin_write()?;
-            let pathid = super::allocate(
-                &mut txn.current_pathid_range_table()?,
-                self.allocator.prefix(arena).unwrap(),
-            )?;
+            let pathid = super::allocate(&mut txn.pathid_range_table()?)?
+                .with(self.allocator.prefix(arena).unwrap());
             txn.commit()?;
 
             Ok(pathid)
@@ -381,27 +375,14 @@ mod tests {
     fn arena_pathid_exhaustion() -> anyhow::Result<()> {
         let arena = Arena::from("arena");
         let fixture = Fixture::setup([arena])?;
-        let prefix = PathIdPrefix::from_u8(3);
         let txn = fixture.arena_db(arena).begin_write()?;
         {
-            let mut table = txn.current_pathid_range_table()?;
-            table.insert(
-                (),
-                (
-                    PartialPathId::MAX.minus(2).with(prefix),
-                    PartialPathId::MAX.with(prefix),
-                ),
-            )?;
-            assert_eq!(
-                PartialPathId::MAX.minus(1).with(prefix),
-                allocate(&mut table, prefix)?
-            );
-            assert_eq!(
-                PartialPathId::MAX.with(prefix),
-                allocate(&mut table, prefix)?
-            );
+            let mut table = txn.pathid_range_table()?;
+            table.insert((), (PartialPathId::MAX.minus(2), PartialPathId::MAX))?;
+            assert_eq!(PartialPathId::MAX.minus(1), allocate(&mut table)?);
+            assert_eq!(PartialPathId::MAX, allocate(&mut table)?);
             assert!(matches!(
-                allocate(&mut table, prefix),
+                allocate(&mut table),
                 Err(StorageError::PathIdSpaceExhausted)
             ));
         }

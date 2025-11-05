@@ -14,7 +14,7 @@ use super::types::{
 use crate::PathId;
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
-use crate::types::{Inode, PathIdPrefix};
+use crate::types::{Inode, PartialPathId, PathIdPrefix};
 use crate::utils::holder::Holder;
 use realize_types::Arena;
 use redb::TableDefinition;
@@ -118,8 +118,8 @@ const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
 ///
 /// Key: ()
 /// Value: (PathId, PathId) (last pathid allocated, end of range)
-pub(crate) const CURRENT_PATHID_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
-    TableDefinition::new("acache.current_pathid_range");
+pub(crate) const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
+    TableDefinition::new("pathid_range");
 
 /// Mark table for storing file marks within an Arena.
 ///
@@ -227,7 +227,7 @@ impl ArenaDatabase {
             txn.open_table(PENDING_CATCHUP_TABLE)?;
             txn.open_table(PEER_TABLE)?;
             txn.open_table(NOTIFICATION_TABLE)?;
-            txn.open_table(CURRENT_PATHID_RANGE_TABLE)?;
+            txn.open_table(PATHID_RANGE_TABLE)?;
             txn.open_table(BLOB_TABLE)?;
             let blob_lru_queue_table = txn.open_table(BLOB_LRU_QUEUE_TABLE)?;
             txn.open_table(MARK_TABLE)?;
@@ -464,7 +464,7 @@ impl<'db> ArenaWriteTransaction<'db> {
                 .open_table(TREE_TABLE)
                 .map_err(|e| StorageError::open_table(e, Location::caller()))?,
             self.inner.open_table(TREE_REFCOUNT_TABLE)?,
-            self.inner.open_table(CURRENT_PATHID_RANGE_TABLE)?,
+            self.inner.open_table(PATHID_RANGE_TABLE)?,
             &self.subsystems.tree,
         ))
     }
