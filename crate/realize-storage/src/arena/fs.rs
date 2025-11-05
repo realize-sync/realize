@@ -55,7 +55,7 @@ impl ArenaFilesystem {
         let db = ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
-            allocator,
+            allocator.allocate_prefix(arena)?,
             blob_dir,
             datadir,
         )?;

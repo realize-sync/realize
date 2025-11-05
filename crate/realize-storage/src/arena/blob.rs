@@ -1516,8 +1516,7 @@ mod tests {
             blob_dir.create_dir_all()?;
             let datadir = tempdir.child(format!("{arena}/data"));
             datadir.create_dir_all()?;
-            let db =
-                ArenaDatabase::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
+            let db = ArenaDatabase::for_testing(arena, blob_dir.path(), datadir.path())?;
 
             Ok(Self {
                 arena,

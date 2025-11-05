@@ -56,7 +56,7 @@ impl ArenaStorage {
         let db = ArenaDatabase::new(
             redb_utils::open(&dbpath).await?,
             arena,
-            Arc::clone(allocator),
+            allocator.allocate_prefix(arena)?,
             &arena_config.workdir.join("blobs"),
             datadir,
         )

@@ -268,7 +268,7 @@ mod tests {
             let blob_dir = tempdir.path().join("blobs");
             let root = tempdir.child("root");
             root.create_dir_all()?;
-            let db = ArenaDatabase::for_testing_single_arena(arena, &blob_dir, &root)?;
+            let db = ArenaDatabase::for_testing(arena, &blob_dir, &root)?;
             let cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
 
             let engine = Engine::new(Arc::clone(&db), |attempt| {

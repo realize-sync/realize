@@ -13,8 +13,6 @@ pub(crate) struct PathIdAllocator {
 }
 
 impl PathIdAllocator {
-    pub(crate) const ROOT_INODE: PathId = PathId::ROOT;
-
     /// Create a new allocator, backed by the given global database.
     ///
     /// An arena root is allocated for all arenas in `arenas` and
@@ -63,29 +61,6 @@ impl PathIdAllocator {
             .unwrap()
             .get_by_right(&pathid.prefix())
             .is_some()
-    }
-
-    /// Allocate a pathid for an arena.
-    ///
-    /// `current_range_table` must be an opened table within the arena database.
-    pub(crate) fn allocate_arena_pathid(
-        &self,
-        current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
-        arena: Arena,
-    ) -> Result<PathId, StorageError> {
-        allocate_pathid(
-            current_range_table,
-            self.prefix(arena)
-                .ok_or_else(|| StorageError::UnknownArena(arena))?,
-        )
-    }
-
-    /// Allocate a global pathid.
-    pub(crate) fn allocate_global_pathid(
-        &self,
-        txn: &GlobalWriteTransaction,
-    ) -> Result<PathId, StorageError> {
-        allocate_pathid(&mut txn.current_pathid_range_table()?, PathIdPrefix::ZERO)
     }
 
     /// Maps pathids to arenas.
@@ -142,9 +117,14 @@ impl PathIdAllocator {
     }
 }
 
+/// Allocate a new pathid in [GlobalDatabase].
+pub(crate) fn allocate_global_pathid(txn: &GlobalWriteTransaction) -> Result<PathId, StorageError> {
+    allocate(&mut txn.current_pathid_range_table()?, PathIdPrefix::ZERO)
+}
+
 /// Allocate a new pathid, using the given table and prefix.
 /// allocation function.
-pub(crate) fn allocate_pathid(
+pub(crate) fn allocate(
     current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
     prefix: PathIdPrefix,
 ) -> Result<PathId, StorageError> {
@@ -209,9 +189,10 @@ mod tests {
 
         fn allocate_arena_pathid(&self, arena: Arena) -> Result<PathId, StorageError> {
             let txn = self.arena_db(arena).begin_write()?;
-            let pathid = self
-                .allocator
-                .allocate_arena_pathid(&mut txn.current_pathid_range_table()?, arena)?;
+            let pathid = super::allocate(
+                &mut txn.current_pathid_range_table()?,
+                self.allocator.prefix(arena).unwrap(),
+            )?;
             txn.commit()?;
 
             Ok(pathid)
@@ -219,7 +200,7 @@ mod tests {
 
         fn allocate_global_pathid(&self) -> Result<PathId, StorageError> {
             let txn = self.db.begin_write()?;
-            let pathid = self.allocator.allocate_global_pathid(&txn)?;
+            let pathid = allocate_global_pathid(&txn)?;
             txn.commit()?;
 
             Ok(pathid)
@@ -260,8 +241,8 @@ mod tests {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_write()?;
 
-        let pathid1 = fixture.allocator.allocate_global_pathid(&txn)?;
-        let pathid2 = fixture.allocator.allocate_global_pathid(&txn)?;
+        let pathid1 = allocate_global_pathid(&txn)?;
+        let pathid2 = allocate_global_pathid(&txn)?;
 
         // First allocation should be 2 (since 1 is ROOT_INODE)
         assert_eq!(PathId(2), pathid1);
@@ -340,28 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_arena_pathid_unknown_arena() -> anyhow::Result<()> {
-        let fixture = Fixture::setup([])?;
-
-        let arena = Arena::from("unknown");
-        let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-        let txn = db.begin_write()?;
-        let res = fixture
-            .allocator
-            .allocate_arena_pathid(&mut txn.current_pathid_range_table()?, arena);
-        assert!(matches!(res, Err(StorageError::UnknownArena(a)) if a == arena));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_arena_for_pathid_root() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_read()?;
 
-        let result = fixture
-            .allocator
-            .arena_for_pathid(&txn, PathIdAllocator::ROOT_INODE)?;
+        let result = fixture.allocator.arena_for_pathid(&txn, PathId::ROOT)?;
         assert_eq!(None, result);
 
         Ok(())

@@ -645,11 +645,10 @@ mod tests {
             std::fs::create_dir_all(&datadir)?;
 
             let allocator = PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
-            allocator.allocate_prefix(arena)?;
             let db = ArenaDatabase::new(
                 redb_utils::in_memory()?,
                 arena,
-                allocator,
+                allocator.allocate_prefix(arena)?,
                 &blob_dir,
                 &datadir,
             )?;

@@ -11,11 +11,11 @@ use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, HistoryTableEntry, MarkTableEntry,
     PeerTableEntry, QueueTableEntry,
 };
+use crate::PathId;
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
-use crate::types::Inode;
+use crate::types::{Inode, PathIdPrefix};
 use crate::utils::holder::Holder;
-use crate::{PathId, PathIdAllocator};
 use realize_types::Arena;
 use redb::TableDefinition;
 use std::cell::RefCell;
@@ -186,29 +186,15 @@ struct Subsystems {
 
 impl ArenaDatabase {
     #[cfg(test)]
-    pub fn for_testing_single_arena(
-        arena: realize_types::Arena,
-        blob_dir: impl AsRef<std::path::Path>,
-        datadir: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<Arc<Self>> {
-        let allocator = crate::PathIdAllocator::new(crate::GlobalDatabase::new(
-            crate::utils::redb_utils::in_memory()?,
-        )?)?;
-        allocator.allocate_prefix(arena)?;
-        ArenaDatabase::for_testing(arena, allocator, blob_dir, datadir)
-    }
-
-    #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
-        allocator: Arc<crate::PathIdAllocator>,
         blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
     ) -> anyhow::Result<Arc<Self>> {
         Ok(ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
-            allocator,
+            PathIdPrefix::from_u8(1),
             blob_dir,
             datadir,
         )?)
@@ -217,11 +203,11 @@ impl ArenaDatabase {
     pub fn new(
         db: redb::Database,
         arena: Arena,
-        allocator: Arc<PathIdAllocator>,
+        prefix: PathIdPrefix,
         blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
     ) -> Result<Arc<Self>, StorageError> {
-        let tree = Tree::new(arena, allocator)?;
+        let tree = Tree::new(arena, prefix);
         let cache: Cache;
         let dirty: Dirty;
         let history: History;
@@ -735,9 +721,8 @@ impl BeforeCommit {
 
 #[cfg(test)]
 mod tests {
-    use crate::{GlobalDatabase, utils::redb_utils};
-
     use super::*;
+    use crate::types::PathIdPrefix;
     use assert_fs::TempDir;
     use realize_types::Arena;
     use redb::{ReadOnlyTable, ReadableTable};
@@ -752,7 +737,7 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let db = ArenaDatabase::for_testing_single_arena(
+            let db = ArenaDatabase::for_testing(
                 Arena::from("myarena"),
                 std::path::Path::new("/dev/null"),
                 std::path::Path::new("/dev/null"),
@@ -863,12 +848,11 @@ mod tests {
         let blob_dir = tempdir.join("blobs");
         let datadir = tempdir.join("data");
         let arena = Arena::from("myarena");
-        let allocator = PathIdAllocator::new(GlobalDatabase::new(redb_utils::in_memory()?)?)?;
-        allocator.allocate_prefix(arena)?;
+        let prefix = PathIdPrefix::from_u8(1);
         let db = ArenaDatabase::new(
             redb::Database::create(&dbpath)?,
             arena,
-            Arc::clone(&allocator),
+            prefix,
             &blob_dir,
             &datadir,
         )?;
@@ -881,7 +865,7 @@ mod tests {
         let db = ArenaDatabase::new(
             redb::Database::create(&dbpath)?,
             arena,
-            Arc::clone(&allocator),
+            prefix,
             &blob_dir,
             &datadir,
         )?;

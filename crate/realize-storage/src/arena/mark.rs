@@ -278,7 +278,7 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::for_testing_single_arena(
+            let db = ArenaDatabase::for_testing(
                 arena,
                 std::path::Path::new("/dev/null"),
                 std::path::Path::new("/dev/null"),

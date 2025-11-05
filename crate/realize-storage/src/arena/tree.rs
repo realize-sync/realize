@@ -1,12 +1,12 @@
 use super::db::BeforeCommit;
-use crate::PathIdAllocator;
 use crate::arena::db::Tag;
+use crate::global::pathid_allocator;
+use crate::types::{PartialPathId, PathIdPrefix};
 use crate::{PathId, StorageError};
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
 use std::borrow::{Borrow, Cow};
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// A tree stored on a [ArenaDatabase].
 ///
@@ -39,24 +39,16 @@ use std::sync::Arc;
 /// ```
 pub(crate) struct Tree {
     arena: Arena,
-    root: PathId,
-    allocator: Arc<PathIdAllocator>,
+    prefix: PathIdPrefix,
 }
 
 impl Tree {
-    pub(crate) fn new(arena: Arena, allocator: Arc<PathIdAllocator>) -> Result<Self, StorageError> {
-        let root = allocator
-            .arena_root(arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))?;
-        Ok(Self {
-            arena,
-            root,
-            allocator,
-        })
+    pub(crate) fn new(arena: Arena, prefix: PathIdPrefix) -> Self {
+        Self { arena, prefix }
     }
 
     pub(crate) fn root(&self) -> PathId {
-        self.root
+        PartialPathId::ROOT.with(self.prefix)
     }
 }
 
@@ -65,8 +57,8 @@ where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
     table: T,
-    root: PathId,
     arena: Arena,
+    prefix: PathIdPrefix,
 }
 
 impl<T> ReadableOpenTree<T>
@@ -76,8 +68,8 @@ where
     pub(crate) fn new(table: T, tree: &Tree) -> Self {
         Self {
             table,
-            root: tree.root,
             arena: tree.arena,
+            prefix: tree.prefix,
         }
     }
 }
@@ -119,7 +111,7 @@ where
     T: ReadableTable<(PathId, &'static str), PathId>,
 {
     fn root(&self) -> PathId {
-        self.root
+        PartialPathId::ROOT.with(self.prefix)
     }
     fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
         lookup(&self.table, pathid, name)
@@ -144,7 +136,7 @@ where
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
     fn root(&self) -> PathId {
-        self.tree.root
+        PartialPathId::ROOT.with(self.tree.prefix)
     }
     fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
         lookup(&self.table, pathid, name)
@@ -595,7 +587,7 @@ impl<'a> WritableOpenTree<'a> {
     /// Return (pathid, added), with added true if the leaf pathid is new.
     fn add_path(&mut self, path: &Path) -> Result<(PathId, bool), StorageError> {
         let path = path.as_ref();
-        let mut current = (self.tree.root, false);
+        let mut current = (self.root(), false);
         for component in path.components() {
             current = self.add_name(current.0, component)?;
         }
@@ -704,9 +696,7 @@ impl<'a> WritableOpenTree<'a> {
     }
 
     fn allocate_pathid(&mut self) -> Result<PathId, StorageError> {
-        self.tree
-            .allocator
-            .allocate_arena_pathid(&mut self.current_pathid_range_table, self.tree.arena)
+        pathid_allocator::allocate(&mut self.current_pathid_range_table, self.tree.prefix)
     }
 
     fn add_pathid(
@@ -878,7 +868,7 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::for_testing_single_arena(
+            let db = ArenaDatabase::for_testing(
                 arena,
                 std::path::Path::new("/dev/null"),
                 std::path::Path::new("/dev/null"),

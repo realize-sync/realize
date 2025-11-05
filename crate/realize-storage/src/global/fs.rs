@@ -4,6 +4,7 @@ use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
+use crate::global::pathid_allocator;
 use crate::global::types::PathTableEntry;
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
@@ -55,9 +56,6 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
-    /// PathId of the root dir.
-    pub const ROOT_DIR: PathId = PathIdAllocator::ROOT_INODE;
-
     /// Create a new Filesystems with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
@@ -75,10 +73,9 @@ impl Filesystem {
                 let mut path_table = txn.path_table()?;
 
                 // Make sure root is setup, even if there are no arenas.
-                let root_mtime =
-                    get_or_add_path_entry(&txn, &mut path_table, &allocator, "")?.mtime;
+                let root_mtime = get_or_add_path_entry(&txn, &mut path_table, "")?.mtime;
                 globals.insert(
-                    PathIdAllocator::ROOT_INODE,
+                    PathId::ROOT,
                     IntermediatePath {
                         entries: HashMap::new(),
                         mtime: root_mtime,
@@ -785,7 +782,7 @@ fn register(
     for existing in map.keys().map(|a| *a) {
         check_arena_compatibility(arena, existing)?;
     }
-    add_arena_root(arena, arena_root, txn, path_table, allocator, paths)?;
+    add_arena_root(arena, arena_root, txn, path_table, paths)?;
     map.insert(fs.arena(), fs);
 
     Ok(())
@@ -796,7 +793,6 @@ fn add_arena_root(
     arena_root: PathId,
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<PathIdAllocator>,
     paths: &mut HashMap<PathId, IntermediatePath>,
 ) -> anyhow::Result<()> {
     let arena_path = Path::parse(arena.as_str())?;
@@ -809,7 +805,7 @@ fn add_arena_root(
     let mut current_pathid = arena_root;
     let mut current_name = names.next().unwrap();
     for dirname in names {
-        let entry = get_or_add_path_entry(txn, path_table, allocator, dirname)?;
+        let entry = get_or_add_path_entry(txn, path_table, dirname)?;
         add_intermediate_path_entry(
             entry.pathid,
             entry.mtime,
@@ -827,16 +823,15 @@ fn add_arena_root(
 fn get_or_add_path_entry(
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<'_, &'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<PathIdAllocator>,
     dirname: &str,
 ) -> Result<PathTableEntry, anyhow::Error> {
     let entry = if let Some(e) = path_table.get(dirname)? {
         e.value().parse()?
     } else {
         let entry_pathid = if dirname == "" {
-            PathIdAllocator::ROOT_INODE
+            PathId::ROOT
         } else {
-            allocator.allocate_global_pathid(&txn)?
+            pathid_allocator::allocate_global_pathid(&txn)?
         };
         let entry = PathTableEntry {
             pathid: entry_pathid,
@@ -996,7 +991,7 @@ mod tests {
         let fs = &fixture.fs;
 
         assert!(matches!(
-            fs.lookup((Filesystem::ROOT_DIR, "nonexistent")).await,
+            fs.lookup((PathId::ROOT, "nonexistent")).await,
             Err(StorageError::NotFound),
         ));
 
@@ -1075,13 +1070,13 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
         let fs = &fixture.fs;
 
-        let res = fs.unlink((Filesystem::ROOT_DIR, "doesnotexist")).await;
+        let res = fs.unlink((PathId::ROOT, "doesnotexist")).await;
         assert!(matches!(res, Err(StorageError::NotFound)), "{res:?}");
         assert!(matches!(
-            fs.unlink((Filesystem::ROOT_DIR, "arenas")).await,
+            fs.unlink((PathId::ROOT, "arenas")).await,
             Err(StorageError::IsADirectory)
         ));
-        let (arenas_pathid, _) = fs.lookup((Filesystem::ROOT_DIR, "arenas")).await?;
+        let (arenas_pathid, _) = fs.lookup((PathId::ROOT, "arenas")).await?;
         assert!(matches!(
             fs.unlink((arenas_pathid, "1")).await,
             Err(StorageError::IsADirectory)
@@ -1104,10 +1099,8 @@ mod tests {
         let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
         let fs = &fixture.fs;
 
-        let arenas_dir = fs.lookup((Filesystem::ROOT_DIR, "arenas")).await?.0;
-        let res = fs
-            .branch(arenas_dir, (Filesystem::ROOT_DIR, "test_arena2"))
-            .await;
+        let arenas_dir = fs.lookup((PathId::ROOT, "arenas")).await?.0;
+        let res = fs.branch(arenas_dir, (PathId::ROOT, "test_arena2")).await;
         assert!(matches!(res, Err(StorageError::IsADirectory)), "{res:?}");
 
         assert!(matches!(
