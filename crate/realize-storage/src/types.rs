@@ -209,12 +209,12 @@ impl PartialPathId {
         self.0
     }
 
-    pub fn plus(&self, val: u64) -> PathId {
-        PathId(self.0 + val)
+    pub fn plus(&self, val: u64) -> PartialPathId {
+        PartialPathId(self.0 + val)
     }
 
-    pub fn minus(&self, val: u64) -> PathId {
-        PathId(self.0 - val)
+    pub fn minus(&self, val: u64) -> PartialPathId {
+        PartialPathId(self.0 - val)
     }
 
     pub fn as_u64(&self) -> u64 {

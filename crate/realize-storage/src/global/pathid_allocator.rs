@@ -141,16 +141,14 @@ pub(crate) fn allocate(
         return Ok(pathid);
     }
 
-    Err(StorageError::CannotAllocatePathId)
+    Err(StorageError::PathIdSpaceExhausted)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
-    use crate::utils::redb_utils;
-
     use super::*;
+    use crate::utils::redb_utils;
+    use std::collections::HashMap;
 
     struct Fixture {
         db: Arc<GlobalDatabase>,
@@ -237,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_global_pathid() -> anyhow::Result<()> {
+    fn allocate_pathid_global() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_write()?;
 
@@ -254,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allocate_pathid() -> anyhow::Result<()> {
+    fn allocate_pathid() -> anyhow::Result<()> {
         let a = Arena::from("a");
         let b = Arena::from("b");
         let c = Arena::from("c");
@@ -321,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_for_pathid_root() -> anyhow::Result<()> {
+    fn arena_for_pathid_root() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_read()?;
 
@@ -332,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_for_pathid_arena_root() -> anyhow::Result<()> {
+    fn arena_for_pathid_arena_root() -> anyhow::Result<()> {
         let arena = Arena::from("test");
         let fixture = Fixture::setup([arena])?;
         let txn = fixture.db.begin_read()?;
@@ -346,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_for_pathid_not_found() -> anyhow::Result<()> {
+    fn arena_for_pathid_not_found() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
         let txn = fixture.db.begin_read()?;
 
@@ -364,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_arena_for_pathid_global() -> anyhow::Result<()> {
+    fn arena_for_pathid_global() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
 
         assert_eq!(
@@ -375,6 +373,39 @@ mod tests {
             None,
             fixture.arena_for_pathid(fixture.allocate_global_pathid()?)?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn arena_pathid_exhaustion() -> anyhow::Result<()> {
+        let arena = Arena::from("arena");
+        let fixture = Fixture::setup([arena])?;
+        let prefix = PathIdPrefix::from_u8(3);
+        let txn = fixture.arena_db(arena).begin_write()?;
+        {
+            let mut table = txn.current_pathid_range_table()?;
+            table.insert(
+                (),
+                (
+                    PartialPathId::MAX.minus(2).with(prefix),
+                    PartialPathId::MAX.with(prefix),
+                ),
+            )?;
+            assert_eq!(
+                PartialPathId::MAX.minus(1).with(prefix),
+                allocate(&mut table, prefix)?
+            );
+            assert_eq!(
+                PartialPathId::MAX.with(prefix),
+                allocate(&mut table, prefix)?
+            );
+            assert!(matches!(
+                allocate(&mut table, prefix),
+                Err(StorageError::PathIdSpaceExhausted)
+            ));
+        }
+        txn.commit()?;
 
         Ok(())
     }

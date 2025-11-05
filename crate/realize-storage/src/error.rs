@@ -83,7 +83,7 @@ pub enum StorageError {
     InvalidAttributeValue,
 
     #[error("no pathid available")]
-    CannotAllocatePathId,
+    PathIdSpaceExhausted,
 }
 
 impl StorageError {
@@ -133,7 +133,7 @@ impl StorageError {
             StorageError::UnknownVersion => InvalidData,
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
-            StorageError::CannotAllocatePathId => Other,
+            StorageError::PathIdSpaceExhausted => Other,
         }
     }
 
