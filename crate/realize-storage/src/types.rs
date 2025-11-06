@@ -340,6 +340,7 @@ pub struct Inode(pub u64);
 impl Inode {
     pub const ZERO: Inode = Inode(0);
     pub const MAX: Inode = Inode(u64::MAX);
+    pub const ROOT: Inode = Inode(1);
 
     /// Create a new Inode from a u64 value.
     pub fn new(prefix: PathIdPrefix, partial: PartialInode) -> Self {

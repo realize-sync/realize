@@ -119,9 +119,10 @@ async fn link_to_own() -> anyhow::Result<()> {
             // B: branch work/foo -> store/foo (on the filesystem)
             fixture.wait_for_file_in_cache(b, "work/foo", &hash).await?;
             let cache_b = fixture.cache(b)?;
-            let (store_pathid, _) = cache_b.mkdir((cache_b.arena_root(arena)?, "store")).await?;
+            let (arena_inode, _) = cache_b.lookup((arena, Path::root())).await?;
+            let (store_inode, _) = cache_b.mkdir((arena_inode, "store")).await?;
             cache_b
-                .branch((arena, &Path::parse("work/foo")?), (store_pathid, "foo"))
+                .branch((arena, &Path::parse("work/foo")?), (store_inode, "foo"))
                 .await?;
 
             let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());

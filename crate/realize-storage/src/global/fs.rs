@@ -164,18 +164,6 @@ impl Filesystem {
         loc: L,
     ) -> Result<ResolvedLoc, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            FsLoc::PathId(pathid) => match self.allocator.arena_for_pathid(txn, pathid)? {
-                Some(arena) => ResolvedLoc::InArena(
-                    arena,
-                    pathid.prefix(),
-                    ArenaFsLoc::PathId(pathid.partial()),
-                ),
-                None => ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
-                    Some(pathid)
-                } else {
-                    None
-                }),
-            },
             FsLoc::Inode(inode) => {
                 match self.arena_for_inode(txn, inode)? {
                     Some(arena) => ResolvedLoc::InArena(
@@ -193,21 +181,6 @@ impl Filesystem {
                             None
                         })
                     }
-                }
-            }
-            FsLoc::PathIdAndName(pathid, name) => {
-                match self.allocator.arena_for_pathid(txn, pathid)? {
-                    Some(arena) => ResolvedLoc::InArena(
-                        arena,
-                        pathid.prefix(),
-                        ArenaFsLoc::PathIdAndName(pathid.partial(), name),
-                    ),
-                    None => ResolvedLoc::Global(match self.globals.get(&pathid) {
-                        None => return Err(StorageError::NotFound),
-                        Some(IntermediatePath { entries, .. }) => {
-                            entries.get(&name).map(|pathid| *pathid)
-                        }
-                    }),
                 }
             }
             FsLoc::InodeAndName(inode, name) => {
@@ -242,20 +215,10 @@ impl Filesystem {
         loc: L,
     ) -> Result<(&ArenaFilesystem, PathIdPrefix, ArenaFsLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            FsLoc::PathId(pathid) => (
-                self.arena_fs_for_pathid(pathid)?,
-                pathid.prefix(),
-                ArenaFsLoc::PathId(pathid.partial()),
-            ),
             FsLoc::Inode(inode) => (
                 self.arena_fs_for_inode(inode)?,
                 inode.prefix(),
                 ArenaFsLoc::Inode(inode.partial()),
-            ),
-            FsLoc::PathIdAndName(pathid, name) => (
-                self.arena_fs_for_pathid(pathid)?,
-                pathid.prefix(),
-                ArenaFsLoc::PathIdAndName(pathid.partial(), name.into()),
             ),
             FsLoc::InodeAndName(inode, name) => (
                 self.arena_fs_for_inode(inode)?,
@@ -270,17 +233,16 @@ impl Filesystem {
         })
     }
 
-    /// Cover the special case of a PathIdAndName where name points to an arena root.
+    /// Cover the special case of a InodeAndName where name points to an arena root.
     fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
         if let Some((pathid, name)) = match &loc {
-            FsLoc::PathIdAndName(pathid, name) => Some((*pathid, name)),
             FsLoc::InodeAndName(inode, name) => Some((PathId(inode.as_u64()), name)),
             _ => None,
         } {
             if let Some(IntermediatePath { entries, .. }) = self.globals.get(&pathid) {
                 if let Some(pathid) = entries.get(name) {
                     if self.allocator.is_arena_root(*pathid) {
-                        return FsLoc::PathId(*pathid);
+                        return FsLoc::Inode(Inode::from(*pathid));
                     }
                 }
             }
@@ -713,17 +675,9 @@ impl Filesystem {
 /// also be a [PathId] and a name to specify a child of a known
 /// directory.
 pub enum FsLoc {
-    PathId(PathId),
     Inode(Inode),
     Path(Arena, Path),
-    PathIdAndName(PathId, String),
     InodeAndName(Inode, String),
-}
-
-impl From<PathId> for FsLoc {
-    fn from(value: PathId) -> Self {
-        FsLoc::PathId(value)
-    }
 }
 
 impl From<Inode> for FsLoc {
@@ -741,23 +695,6 @@ impl From<(Arena, Path)> for FsLoc {
 impl From<(Arena, &Path)> for FsLoc {
     fn from(value: (Arena, &Path)) -> Self {
         FsLoc::Path(value.0, value.1.clone())
-    }
-}
-
-impl From<(PathId, &str)> for FsLoc {
-    fn from(value: (PathId, &str)) -> Self {
-        FsLoc::PathIdAndName(value.0, value.1.to_string())
-    }
-}
-
-impl From<(PathId, &String)> for FsLoc {
-    fn from(value: (PathId, &String)) -> Self {
-        FsLoc::PathIdAndName(value.0, value.1.clone())
-    }
-}
-impl From<(PathId, String)> for FsLoc {
-    fn from(value: (PathId, String)) -> Self {
-        FsLoc::PathIdAndName(value.0, value.1)
     }
 }
 
@@ -963,7 +900,7 @@ mod tests {
     async fn empty_fs_readdir() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        assert!(fixture.fs.readdir(PathId(1)).await?.is_empty());
+        assert!(fixture.fs.readdir(Inode::ROOT).await?.is_empty());
 
         Ok(())
     }
@@ -972,7 +909,7 @@ mod tests {
     async fn empty_fs_metadata() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        let m = fixture.fs.dir_metadata(PathId(1)).await?;
+        let m = fixture.fs.dir_metadata(Inode::ROOT).await?;
         assert_eq!(0o555, m.mode);
         assert_ne!(UnixTime::ZERO, m.mtime);
 
@@ -984,11 +921,11 @@ mod tests {
         let arena = Arena::from("documents/letters");
         let fixture = Fixture::setup_with_arena(arena).await?;
 
-        let root_m = fixture.fs.dir_metadata(PathId(1)).await?;
+        let root_m = fixture.fs.dir_metadata(Inode::ROOT).await?;
         assert_eq!(0o555, root_m.mode);
         assert_ne!(UnixTime::ZERO, root_m.mtime);
 
-        let (documents, _) = fixture.fs.lookup((PathId(1), "documents")).await?;
+        let (documents, _) = fixture.fs.lookup((Inode::ROOT, "documents")).await?;
         let documents_m = fixture.fs.dir_metadata(documents).await?;
         assert_eq!(0o555, documents_m.mode);
         assert_ne!(UnixTime::ZERO, documents_m.mtime);
@@ -1012,10 +949,10 @@ mod tests {
 
         let fs = &fixture.fs;
 
-        let (arenas, metadata) = fs.lookup((PathId(1), "arenas")).await.unwrap();
+        let (arenas, metadata) = fs.lookup((Inode::ROOT, "arenas")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
-        let (_, metadata) = fs.lookup((PathId(1), "other")).await.unwrap();
+        let (_, metadata) = fs.lookup((Inode::ROOT, "other")).await.unwrap();
         assert!(matches!(metadata, crate::arena::types::Metadata::Dir(_)));
 
         let (_, metadata) = fs.lookup((arenas, "test1")).await.unwrap();
@@ -1033,7 +970,7 @@ mod tests {
         let fs = &fixture.fs;
 
         assert!(matches!(
-            fs.lookup((PathId::ROOT, "nonexistent")).await,
+            fs.lookup((Inode::ROOT, "nonexistent")).await,
             Err(StorageError::NotFound),
         ));
 
@@ -1050,7 +987,7 @@ mod tests {
         .await?;
 
         let fs = &fixture.fs;
-        let entries = fs.readdir(PathId(1)).await?;
+        let entries = fs.readdir(Inode::ROOT).await?;
         assert_eq!(entries.len(), 2);
 
         let mut names: Vec<String> = entries.iter().map(|(name, _, _)| name.clone()).collect();
@@ -1068,7 +1005,7 @@ mod tests {
             }
         }
 
-        let (arenas, _) = fs.lookup((PathId(1), "arenas")).await?;
+        let (arenas, _) = fs.lookup((Inode::ROOT, "arenas")).await?;
         let entries = fs.readdir(arenas).await?;
         assert_eq!(entries.len(), 2);
 
@@ -1088,17 +1025,17 @@ mod tests {
         }
 
         assert!(
-            fs.readdir(fs.arena_root(Arena::from("arenas/test1"))?)
+            fs.readdir((Arena::from("arenas/test1"), Path::root()))
                 .await?
                 .is_empty()
         );
         assert!(
-            fs.readdir(fs.arena_root(Arena::from("arenas/test2"))?)
+            fs.readdir((Arena::from("arenas/test2"), Path::root()))
                 .await?
                 .is_empty()
         );
         assert!(
-            fs.readdir(fs.arena_root(Arena::from("other"))?)
+            fs.readdir((Arena::from("other"), Path::root()))
                 .await?
                 .is_empty()
         );
@@ -1112,22 +1049,22 @@ mod tests {
         let fixture = Fixture::setup_with_arena(arena).await?;
         let fs = &fixture.fs;
 
-        let res = fs.unlink((PathId::ROOT, "doesnotexist")).await;
+        let res = fs.unlink((Inode::ROOT, "doesnotexist")).await;
         assert!(matches!(res, Err(StorageError::NotFound)), "{res:?}");
         assert!(matches!(
-            fs.unlink((PathId::ROOT, "arenas")).await,
+            fs.unlink((Inode::ROOT, "arenas")).await,
             Err(StorageError::IsADirectory)
         ));
-        let (arenas_pathid, _) = fs.lookup((PathId::ROOT, "arenas")).await?;
+        let (arenas_inode, _) = fs.lookup((Inode::ROOT, "arenas")).await?;
         assert!(matches!(
-            fs.unlink((arenas_pathid, "1")).await,
+            fs.unlink((arenas_inode, "1")).await,
             Err(StorageError::IsADirectory)
         ));
 
         // This just checks that the call is dispatched down to the
         // arena fs.
         assert!(matches!(
-            fs.unlink((fs.arena_root(arena)?, "doesnotexist")).await,
+            fs.unlink((arena, Path::parse("doesnotexist")?)).await,
             Err(StorageError::NotFound)
         ));
 
@@ -1141,14 +1078,14 @@ mod tests {
         let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
         let fs = &fixture.fs;
 
-        let arenas_dir = fs.lookup((PathId::ROOT, "arenas")).await?.0;
-        let res = fs.branch(arenas_dir, (PathId::ROOT, "test_arena2")).await;
+        let arenas_dir = fs.lookup((Inode::ROOT, "arenas")).await?.0;
+        let res = fs.branch(arenas_dir, (Inode::ROOT, "test_arena2")).await;
         assert!(matches!(res, Err(StorageError::IsADirectory)), "{res:?}");
 
         assert!(matches!(
             fs.branch(
-                fs.arena_root(arena1)?,
-                (fs.arena_root(arena2)?, "test_arena2")
+                (arena1, Path::root()),
+                (arena2, Path::parse("test_arena2")?)
             )
             .await,
             Err(StorageError::CrossesDevices)
