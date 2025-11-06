@@ -212,6 +212,10 @@ impl PartialPathId {
         PathId::new(prefix, *self)
     }
 
+    pub fn is_partial_root(&self) -> bool {
+        *self == PartialPathId::ROOT
+    }
+
     /// Get the underlying u64 value.
     pub fn value(&self) -> u64 {
         self.0
@@ -353,10 +357,17 @@ impl Inode {
         Self(prefix.as_u64() | (partial.as_u64() & PathIdPrefix::MASK))
     }
 
+    /// Check whether the corresponding [PartialInode] is a root.
+    pub fn is_partial_root(&self) -> bool {
+        self.partial() == PartialInode::ROOT
+    }
+
+    /// Return the [PartialInode] that's part of this inode.
     pub fn partial(&self) -> PartialInode {
         PartialInode(self.0 & PathIdPrefix::MASK)
     }
 
+    /// Return the inode prefix
     pub fn prefix(&self) -> PathIdPrefix {
         PathIdPrefix((self.0 >> 56) as u8)
     }
@@ -482,9 +493,14 @@ pub struct PartialInode(pub u64);
 impl PartialInode {
     pub const ZERO: PartialInode = PartialInode(0);
     pub const MAX: PartialInode = PartialInode(u64::MAX);
+    pub const ROOT: PartialInode = PartialInode(1);
 
     pub fn with(&self, prefix: PathIdPrefix) -> Inode {
         Inode::new(prefix, *self)
+    }
+
+    pub fn is_partial_root(&self) -> bool {
+        *self == PartialInode::ROOT
     }
 
     pub fn plus(&self, val: u64) -> PartialInode {

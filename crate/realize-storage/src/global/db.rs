@@ -1,7 +1,7 @@
 use crate::global::types::PathTableEntry;
 use crate::types::PartialPathId;
 use crate::utils::holder::Holder;
-use crate::{PathId, StorageError};
+use crate::{Inode, PathId, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::sync::Arc;
 
@@ -16,9 +16,6 @@ const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
     TableDefinition::new("pathid_range");
 
 /// Maps arena to their root directory pathid.
-///
-/// Arenas in this table can also be accessed as subdirectories of the
-/// root directory (1).
 ///
 /// Key: arena name
 /// Value: root pathid of arena
@@ -36,8 +33,7 @@ const ARENA_TABLE: TableDefinition<&str, PathId> = TableDefinition::new("cache.a
 ///
 /// Key: &str (path or "" for root)
 /// Value: PathTableEntry (pathid  and mtime)
-const PATH_TABLE: TableDefinition<&str, Holder<PathTableEntry>> =
-    TableDefinition::new("cache.path");
+const PATH_TABLE: TableDefinition<Inode, Holder<PathTableEntry>> = TableDefinition::new("path");
 
 pub(crate) struct GlobalDatabase {
     db: redb::Database,
@@ -100,7 +96,7 @@ impl GlobalWriteTransaction {
 
     pub fn path_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, &'static str, Holder<'static, PathTableEntry>>, StorageError> {
+    ) -> Result<Table<'txn, Inode, Holder<'static, PathTableEntry>>, StorageError> {
         Ok(self.inner.open_table(PATH_TABLE)?)
     }
 }

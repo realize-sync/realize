@@ -88,7 +88,7 @@ impl PathIdAllocator {
             prefix = PathIdPrefix::from_u8(max_prefix + 1);
             let root = PartialPathId::ROOT.with(prefix);
             arena_table.insert(arena.as_str(), root)?;
-            log::debug!("[{arena}]: prefix {prefix} root {root}");
+            log::debug!("[{arena}]: prefix {prefix}");
         }
 
         self.prefixes.write().unwrap().insert(arena, prefix);

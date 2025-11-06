@@ -6,10 +6,10 @@ use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::pathid_allocator;
 use crate::global::types::PathTableEntry;
-use crate::types::{PartialPathId, PathIdPrefix};
+use crate::types::{PartialInode, PathIdPrefix};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
-use realize_types::{Arena, Path, Peer, UnixTime};
+use realize_types::{Arena, Path, Peer};
 use redb::ReadableTable;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -48,18 +48,17 @@ impl FileContent {
 /// A view on remote and local files.
 pub struct Filesystem {
     allocator: Arc<PathIdAllocator>,
-
     by_arena: HashMap<Arena, Arc<ArenaFilesystem>>,
 
-    /// PathIds to intermediate paths, before arenas, includes root.
-    globals: HashMap<PathId, IntermediatePath>,
+    /// An in-memory copy of PATH_TABLE.
+    globals: HashMap<Inode, PathTableEntry>,
 }
 
 impl Filesystem {
     /// Create a new Filesystems with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
-        by_arena: T,
+        all_fs: T,
     ) -> Result<Arc<Self>, anyhow::Error>
     where
         T: IntoIterator<Item = Arc<ArenaFilesystem>> + Send + 'static,
@@ -67,38 +66,36 @@ impl Filesystem {
         task::spawn_blocking(move || {
             let allocator = PathIdAllocator::setup(&db)?;
 
-            let mut map = HashMap::new();
+            let mut by_arena = HashMap::new();
             let mut globals = HashMap::new();
             let txn = db.begin_write()?;
             {
                 let mut path_table = txn.path_table()?;
 
-                // Make sure root is setup, even if there are no arenas.
-                let root_mtime = get_or_add_path_entry(&txn, &mut path_table, "")?.mtime;
-                globals.insert(
-                    PathId::ROOT,
-                    IntermediatePath {
-                        entries: HashMap::new(),
-                        mtime: root_mtime,
-                    },
-                );
+                if path_table.get(Inode::ROOT)?.is_none() {
+                    path_table.insert(Inode::ROOT, Holder::with_content(PathTableEntry::new())?)?;
+                }
 
-                for fs in by_arena.into_iter() {
-                    register(
-                        fs,
-                        &txn,
-                        &mut path_table,
-                        &allocator,
-                        &mut map,
-                        &mut globals,
-                    )?;
+                for fs in all_fs.into_iter() {
+                    let arena = fs.arena();
+                    for existing in by_arena.keys() {
+                        check_arena_compatibility(arena, *existing)?;
+                    }
+                    let prefix = allocator.allocate_prefix(&txn, arena)?;
+                    add_arena_path(arena, prefix, &txn, &mut path_table)?;
+                    by_arena.insert(arena, fs);
+                }
+
+                for val in path_table.iter()? {
+                    let (inode, entry) = val?;
+                    globals.insert(inode.value(), entry.value().parse()?);
                 }
             }
             txn.commit()?;
 
             Ok::<_, anyhow::Error>(Arc::new(Self {
                 allocator,
-                by_arena: map,
+                by_arena,
                 globals,
             }))
         })
@@ -145,7 +142,7 @@ impl Filesystem {
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
-    fn resolve_loc<L: Into<FsLoc>>(&self, loc: L) -> Result<ResolvedLoc, StorageError> {
+    fn resolve_loc<L: Into<FsLoc>>(&self, loc: L) -> Result<ResolvedLoc<'_>, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
             FsLoc::Inode(inode) => {
                 let prefix = inode.prefix();
@@ -153,16 +150,7 @@ impl Filesystem {
                     Some(arena) => {
                         ResolvedLoc::InArena(arena, prefix, ArenaFsLoc::Inode(inode.partial()))
                     }
-                    None => {
-                        // global inodes and pathids are identical
-                        let pathid = PathId::from(inode);
-
-                        ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
-                            Some(pathid)
-                        } else {
-                            None
-                        })
-                    }
+                    None => ResolvedLoc::Global(self.globals.get(&inode).map(|e| (inode, e))),
                 }
             }
             FsLoc::InodeAndName(inode, name) => {
@@ -174,14 +162,17 @@ impl Filesystem {
                         ArenaFsLoc::InodeAndName(inode.partial(), name),
                     ),
                     None => {
-                        // global inodes and pathids are identical
-                        let pathid = PathId::from(inode);
-                        ResolvedLoc::Global(match self.globals.get(&pathid) {
-                            None => return Err(StorageError::NotFound),
-                            Some(IntermediatePath { entries, .. }) => {
-                                entries.get(&name).map(|pathid| *pathid)
-                            }
-                        })
+                        if let Some(child_inode) = self
+                            .globals
+                            .get(&inode)
+                            .and_then(|entry| entry.subdirs.get(&name))
+                        {
+                            ResolvedLoc::Global(
+                                self.globals.get(child_inode).map(|e| (*child_inode, e)),
+                            )
+                        } else {
+                            ResolvedLoc::Global(None)
+                        }
                     }
                 }
             }
@@ -225,10 +216,10 @@ impl Filesystem {
     /// Cover the special case of a InodeAndName where name points to an arena root.
     fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
         if let FsLoc::InodeAndName(inode, name) = &loc {
-            if let Some(IntermediatePath { entries, .. }) = self.globals.get(&PathId::from(inode)) {
-                if let Some(pathid) = entries.get(name) {
-                    if pathid.partial() == PartialPathId::ROOT {
-                        return FsLoc::Inode(Inode::from(pathid));
+            if let Some(PathTableEntry { subdirs, .. }) = self.globals.get(&inode) {
+                if let Some(inode) = subdirs.get(name) {
+                    if inode.is_partial_root() {
+                        return FsLoc::Inode(*inode);
                     }
                 }
             }
@@ -245,32 +236,18 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            match this.resolve_loc(loc)? {
-                ResolvedLoc::InArena(arena, prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    let (inode, metadata) = fs.lookup(loc)?;
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, prefix, loc) => {
+                let fs = this.arena_fs(arena)?;
+                let (inode, metadata) = fs.lookup(loc)?;
 
-                    Ok((inode.with(prefix), metadata))
-                }
-                ResolvedLoc::Global(pathid) => {
-                    if let Some(pathid) = pathid
-                        && this.globals.contains_key(&pathid)
-                    {
-                        // For global directories, construct DirMetadata
-                        if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
-                            Ok((
-                                Inode::from(pathid),
-                                crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
-                            ))
-                        } else {
-                            Err(StorageError::NotFound)
-                        }
-                    } else {
-                        Err(StorageError::NotFound)
-                    }
-                }
+                Ok((inode.with(prefix), metadata))
             }
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some((inode, entry))) => Ok((
+                inode,
+                crate::arena::types::Metadata::Dir(DirMetadata::readonly(entry.mtime)),
+            )),
         })
         .await?
     }
@@ -289,10 +266,7 @@ impl Filesystem {
                 fs.dir_metadata(loc)
             }
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
-            ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
-                None => Err(StorageError::NotFound),
-                Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata::readonly(*mtime)),
-            },
+            ResolvedLoc::Global(Some((_, entry))) => Ok(DirMetadata::readonly(entry.mtime)),
         })
         .await?
     }
@@ -302,37 +276,33 @@ impl Filesystem {
         loc: L,
     ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
         let loc = loc.into();
-        let this = Arc::clone(self);
-
-        task::spawn_blocking(move || {
-            match this.resolve_loc(loc)? {
-                ResolvedLoc::InArena(arena, prefix, loc) => {
+        match self.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, prefix, loc) => {
+                let this = Arc::clone(self);
+                let vec = task::spawn_blocking(move || {
                     let fs = this.arena_fs(arena)?;
-                    let vec = fs.readdir(loc)?;
-
-                    Ok(vec
-                        .into_iter()
-                        .map(|(n, inode, m)| (n, inode.with(prefix), m))
-                        .collect())
-                }
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
-                ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
-                    None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { entries, mtime, .. }) => Ok(entries
-                        .iter()
-                        .map(|(name, pathid)| {
-                            (
-                                name.to_string(),
-                                // global inodes and pathids map 1:1
-                                Inode::from(pathid),
-                                crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
-                            )
-                        })
-                        .collect()),
-                },
+                    fs.readdir(loc)
+                })
+                .await??;
+                Ok(vec
+                    .into_iter()
+                    .map(|(n, inode, m)| (n, inode.with(prefix), m))
+                    .collect())
             }
-        })
-        .await?
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some((_, entry))) => {
+                let mut res = vec![];
+                for (name, inode) in entry.subdirs.iter() {
+                    res.push((
+                        name.to_string(),
+                        *inode,
+                        crate::arena::types::Metadata::Dir(self.dir_metadata(*inode).await?),
+                    ));
+                }
+
+                Ok(res)
+            }
+        }
     }
 
     pub async fn update(
@@ -425,24 +395,15 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            match this.resolve_loc(loc)? {
-                ResolvedLoc::InArena(arena, _, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.metadata(loc)
-                }
-                ResolvedLoc::Global(Some(pathid)) => {
-                    // For global directories, we need to construct DirMetadata
-                    if let Some(IntermediatePath { mtime, .. }) = this.globals.get(&pathid) {
-                        Ok(crate::arena::types::Metadata::Dir(DirMetadata::readonly(
-                            *mtime,
-                        )))
-                    } else {
-                        Err(StorageError::NotFound)
-                    }
-                }
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.metadata(loc)
             }
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some((_, entry))) => Ok(crate::arena::types::Metadata::Dir(
+                DirMetadata::readonly(entry.mtime),
+            )),
         })
         .await?
     }
@@ -458,8 +419,8 @@ impl Filesystem {
                 let fs = this.arena_fs(arena)?;
                 fs.list_xattrs(loc)
             }
-            ResolvedLoc::Global(Some(_)) => Ok(vec![]),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some(_)) => Ok(vec![]),
         })
         .await?
     }
@@ -477,8 +438,8 @@ impl Filesystem {
                 let fs = this.arena_fs(arena)?;
                 fs.get_xattr(loc, &xattr)
             }
-            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
         })
         .await?
     }
@@ -498,8 +459,8 @@ impl Filesystem {
                 let fs = this.arena_fs(arena)?;
                 fs.set_xattr(loc, &xattr, value.into())
             }
-            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
         })
         .await?
     }
@@ -513,8 +474,8 @@ impl Filesystem {
                 let fs = this.arena_fs(arena)?;
                 fs.unlink(loc)
             }
-            ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
         })
         .await?
     }
@@ -675,15 +636,9 @@ impl From<(Inode, String)> for FsLoc {
     }
 }
 
-enum ResolvedLoc {
-    Global(Option<PathId>),
+enum ResolvedLoc<'a> {
+    Global(Option<(Inode, &'a PathTableEntry)>),
     InArena(Arena, PathIdPrefix, ArenaFsLoc),
-}
-
-#[derive(Debug, Clone)]
-struct IntermediatePath {
-    entries: HashMap<String, PathId>,
-    mtime: UnixTime,
 }
 
 fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()> {
@@ -705,100 +660,69 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
     Ok(())
 }
 
-/// Register an [ArenaFilesystem] that handles calls for a specific arena.
-///
-/// Calls for pathid assigned to the arena will be directed there.
-fn register(
-    fs: Arc<ArenaFilesystem>,
-    txn: &GlobalWriteTransaction,
-    path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
-    allocator: &Arc<PathIdAllocator>,
-    map: &mut HashMap<Arena, Arc<ArenaFilesystem>>,
-    paths: &mut HashMap<PathId, IntermediatePath>,
-) -> anyhow::Result<()> {
-    let arena = fs.arena();
-    for existing in map.keys().map(|a| *a) {
-        check_arena_compatibility(arena, existing)?;
-    }
-    let prefix = allocator.allocate_prefix(txn, arena)?;
-    let arena_root = PartialPathId::ROOT.with(prefix);
-    add_arena_root(arena, arena_root, txn, path_table, paths)?;
-    map.insert(fs.arena(), fs);
-
-    Ok(())
-}
-
-fn add_arena_root(
+/// Register root of the given arena in the PATH_TABLE.
+fn add_arena_path(
     arena: Arena,
-    arena_root: PathId,
+    prefix: PathIdPrefix,
     txn: &GlobalWriteTransaction,
-    path_table: &mut redb::Table<&'static str, Holder<'static, PathTableEntry>>,
-    paths: &mut HashMap<PathId, IntermediatePath>,
-) -> anyhow::Result<()> {
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+) -> Result<(), StorageError> {
     let arena_path = Path::parse(arena.as_str())?;
-    let mut names = arena_path
-        .components()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .chain(/* root */ std::iter::once(""));
-    let mut current_pathid = arena_root;
-    let mut current_name = names.next().unwrap();
-    for dirname in names {
-        let entry = get_or_add_path_entry(txn, path_table, dirname)?;
-        add_intermediate_path_entry(
-            entry.pathid,
-            entry.mtime,
-            current_name,
-            current_pathid,
-            paths,
-        );
-        current_name = dirname;
-        current_pathid = entry.pathid;
+    let mut current = Inode::ROOT;
+    let mut current_entry = get_or_create_dir(path_table, current)?;
+
+    // Create intermediate directories, if necessary
+    if let Some(parent) = arena_path.parent() {
+        for dirname in parent.components() {
+            match current_entry.subdirs.get(dirname) {
+                Some(inode) => {
+                    if inode.is_partial_root() {
+                        return Err(StorageError::AlreadyExists);
+                    }
+                    current = *inode;
+                    current_entry = get_or_create_dir(path_table, current)?;
+                }
+                None => {
+                    let subdir = Inode::from(pathid_allocator::allocate_global_pathid(txn)?);
+                    current_entry.subdirs.insert(dirname.to_string(), subdir);
+                    path_table.insert(current, Holder::new(&current_entry)?)?;
+
+                    current = subdir;
+                    current_entry = get_or_create_dir(path_table, current)?;
+                }
+            }
+        }
+    }
+
+    // Add entry for arena if necessary
+    let name = arena_path.name();
+    let arena_root = PartialInode::ROOT.with(prefix);
+    match current_entry.subdirs.get(name) {
+        None => {
+            current_entry.subdirs.insert(name.to_string(), arena_root);
+            path_table.insert(current, Holder::new(&current_entry)?)?;
+        }
+        Some(inode) => {
+            if *inode != arena_root {
+                return Err(StorageError::AlreadyExists);
+            }
+        }
     }
 
     Ok(())
 }
 
-fn get_or_add_path_entry(
-    txn: &GlobalWriteTransaction,
-    path_table: &mut redb::Table<'_, &'static str, Holder<'static, PathTableEntry>>,
-    dirname: &str,
-) -> Result<PathTableEntry, anyhow::Error> {
-    let entry = if let Some(e) = path_table.get(dirname)? {
-        e.value().parse()?
-    } else {
-        let entry_pathid = if dirname == "" {
-            PathId::ROOT
-        } else {
-            pathid_allocator::allocate_global_pathid(&txn)?
-        };
-        let entry = PathTableEntry {
-            pathid: entry_pathid,
-            mtime: UnixTime::now(),
-        };
-        path_table.insert(dirname, Holder::new(&entry)?)?;
+fn get_or_create_dir(
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    inode: Inode,
+) -> Result<PathTableEntry, StorageError> {
+    if let Some(existing) = path_table.get(inode)? {
+        return Ok(existing.value().parse()?);
+    }
+    let entry = PathTableEntry::new();
+    path_table.insert(inode, Holder::new(&entry)?)?;
 
-        entry
-    };
     Ok(entry)
-}
-
-/// Adds an entry in the intermediate path with the given pathid.
-///
-/// If no such intermediate path exists, it is added.
-fn add_intermediate_path_entry(
-    pathid: PathId,
-    mtime: UnixTime,
-    entry_name: &str,
-    entry_pathid: PathId,
-    paths: &mut HashMap<PathId, IntermediatePath>,
-) {
-    let mapping = paths.entry(pathid).or_insert_with(|| IntermediatePath {
-        entries: HashMap::new(),
-        mtime,
-    });
-    mapping.entries.insert(entry_name.to_string(), entry_pathid);
 }
 
 #[cfg(test)]
@@ -808,6 +732,7 @@ mod tests {
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use realize_types::Arena;
+    use realize_types::UnixTime;
 
     fn test_arena() -> Arena {
         Arena::from("test_arena")
@@ -951,10 +876,15 @@ mod tests {
         assert_eq!(names, vec!["arenas", "other"]);
 
         // Verify all entries are directories and read-only
-        for (name, _, metadata) in entries {
+        for (name, inode, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    assert_eq!(0o555, dir_meta.mode);
+                    if inode.is_partial_root() {
+                        // arena root is writable
+                        assert_eq!(0o777, dir_meta.mode);
+                    } else {
+                        assert_eq!(0o555, dir_meta.mode);
+                    }
                     assert_ne!(dir_meta.mtime, UnixTime::ZERO);
                 }
                 _ => panic!("Expected directory metadata for {}", name),
@@ -970,10 +900,15 @@ mod tests {
         assert_eq!(names, vec!["test1", "test2"]);
 
         // Verify all entries are directories and read-only
-        for (name, _, metadata) in entries {
+        for (name, inode, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    assert_eq!(0o555, dir_meta.mode);
+                    if inode.is_partial_root() {
+                        // arena root is writable
+                        assert_eq!(0o777, dir_meta.mode);
+                    } else {
+                        assert_eq!(0o555, dir_meta.mode);
+                    }
                     assert_ne!(dir_meta.mtime, UnixTime::ZERO);
                 }
                 _ => panic!("Expected directory metadata for {}", name),
@@ -1034,8 +969,9 @@ mod tests {
         let fixture = Fixture::setup_with_arenas([arena1, arena2]).await?;
         let fs = &fixture.fs;
 
-        let arenas_dir = fs.lookup((Inode::ROOT, "arenas")).await?.0;
-        let res = fs.branch(arenas_dir, (Inode::ROOT, "test_arena2")).await;
+        let res = fs
+            .branch((Inode::ROOT, "arenas"), (Inode::ROOT, "test_arena2"))
+            .await;
         assert!(matches!(res, Err(StorageError::IsADirectory)), "{res:?}");
 
         assert!(matches!(
