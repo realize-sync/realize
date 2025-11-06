@@ -8,7 +8,7 @@ use crate::global::pathid_allocator;
 use crate::global::types::PathTableEntry;
 use crate::types::{PartialInode, PathIdPrefix};
 use crate::utils::holder::Holder;
-use crate::{Blob, FileMetadata, Inode, PathId, StorageError};
+use crate::{Blob, FileMetadata, Inode, StorageError};
 use realize_types::{Arena, Path, Peer};
 use redb::ReadableTable;
 use std::borrow::Cow;
@@ -107,16 +107,10 @@ impl Filesystem {
         self.by_arena.keys().map(|a| *a)
     }
 
-    /// Returns the pathid of an arena.
+    /// Returns the prefix of an arena.
     ///
     /// Will return [StorageError::UnknownArena] unless the arena
     /// is available.
-    pub fn arena_root(&self, arena: Arena) -> Result<PathId, StorageError> {
-        self.allocator
-            .arena_root(arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))
-    }
-
     fn prefix(&self, arena: Arena) -> Result<PathIdPrefix, StorageError> {
         self.allocator
             .prefix(arena)
@@ -683,7 +677,7 @@ fn add_arena_path(
                     current_entry = get_or_create_dir(path_table, current)?;
                 }
                 None => {
-                    let subdir = Inode::from(pathid_allocator::allocate_global_pathid(txn)?);
+                    let subdir = pathid_allocator::allocal_global_inode(txn)?;
                     current_entry.subdirs.insert(dirname.to_string(), subdir);
                     path_table.insert(current, Holder::new(&current_entry)?)?;
 
