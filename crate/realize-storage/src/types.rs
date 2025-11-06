@@ -108,6 +108,12 @@ impl From<Inode> for PathId {
     }
 }
 
+impl From<&Inode> for PathId {
+    fn from(value: &Inode) -> Self {
+        PathId(value.as_u64())
+    }
+}
+
 impl From<u64> for PathId {
     fn from(value: u64) -> Self {
         Self(value)
@@ -383,6 +389,12 @@ impl Inode {
 
 impl From<PathId> for Inode {
     fn from(value: PathId) -> Self {
+        Inode(value.as_u64())
+    }
+}
+
+impl From<&PathId> for Inode {
+    fn from(value: &PathId) -> Self {
         Inode(value.as_u64())
     }
 }

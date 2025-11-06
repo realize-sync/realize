@@ -1,4 +1,4 @@
-use super::db::{GlobalDatabase, GlobalReadTransaction};
+use super::db::GlobalDatabase;
 use super::pathid_allocator::PathIdAllocator;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
@@ -47,7 +47,6 @@ impl FileContent {
 
 /// A view on remote and local files.
 pub struct Filesystem {
-    db: Arc<GlobalDatabase>,
     allocator: Arc<PathIdAllocator>,
 
     by_arena: HashMap<Arena, Arc<ArenaFilesystem>>,
@@ -97,7 +96,6 @@ impl Filesystem {
             txn.commit()?;
 
             Ok::<_, anyhow::Error>(Arc::new(Self {
-                db,
                 allocator,
                 by_arena: map,
                 globals,
@@ -132,48 +130,31 @@ impl Filesystem {
         Ok(self.by_arena.get(&arena).ok_or(StorageError::NotFound)?)
     }
 
-    /// Returns the FS for the given pathid or fail.
-    fn arena_fs_for_pathid(&self, pathid: PathId) -> Result<&ArenaFilesystem, StorageError> {
+    /// Returns the FS for the given prefix or fail.
+    fn arena_fs_for_prefix(&self, prefix: PathIdPrefix) -> Result<&ArenaFilesystem, StorageError> {
         let arena = self
             .allocator
-            .arena_for_pathid(&self.db.begin_read()?, pathid)?
+            .arena_for_prefix(prefix)?
             .ok_or(StorageError::NotFound)?;
         self.arena_fs(arena)
     }
 
-    fn arena_fs_for_inode(&self, inode: Inode) -> Result<&ArenaFilesystem, StorageError> {
-        // We ignore the difference between PathId and Inodes for this
-        // lookup, as they come from the same ranges.
-        self.arena_fs_for_pathid(PathId(inode.as_u64()))
-    }
-
-    fn arena_for_inode(
-        &self,
-        txn: &GlobalReadTransaction,
-        inode: Inode,
-    ) -> Result<Option<Arena>, StorageError> {
-        // We ignore the difference between PathId and Inodes for this
-        // lookup, as they come from the same ranges.
-        self.allocator.arena_for_pathid(txn, PathId(inode.as_u64()))
+    fn arena_for_prefix(&self, prefix: PathIdPrefix) -> Result<Option<Arena>, StorageError> {
+        self.allocator.arena_for_prefix(prefix)
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
-    fn resolve_loc<L: Into<FsLoc>>(
-        &self,
-        txn: &GlobalReadTransaction,
-        loc: L,
-    ) -> Result<ResolvedLoc, StorageError> {
+    fn resolve_loc<L: Into<FsLoc>>(&self, loc: L) -> Result<ResolvedLoc, StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
             FsLoc::Inode(inode) => {
-                match self.arena_for_inode(txn, inode)? {
-                    Some(arena) => ResolvedLoc::InArena(
-                        arena,
-                        inode.prefix(),
-                        ArenaFsLoc::Inode(inode.partial()),
-                    ),
+                let prefix = inode.prefix();
+                match self.arena_for_prefix(prefix)? {
+                    Some(arena) => {
+                        ResolvedLoc::InArena(arena, prefix, ArenaFsLoc::Inode(inode.partial()))
+                    }
                     None => {
                         // global inodes and pathids are identical
-                        let pathid = PathId(inode.as_u64());
+                        let pathid = PathId::from(inode);
 
                         ResolvedLoc::Global(if self.globals.contains_key(&pathid) {
                             Some(pathid)
@@ -184,16 +165,16 @@ impl Filesystem {
                 }
             }
             FsLoc::InodeAndName(inode, name) => {
-                match self.arena_for_inode(txn, inode)? {
+                let prefix = inode.prefix();
+                match self.arena_for_prefix(prefix)? {
                     Some(arena) => ResolvedLoc::InArena(
                         arena,
-                        inode.prefix(),
+                        prefix,
                         ArenaFsLoc::InodeAndName(inode.partial(), name),
                     ),
                     None => {
                         // global inodes and pathids are identical
-                        let pathid = PathId(inode.as_u64());
-
+                        let pathid = PathId::from(inode);
                         ResolvedLoc::Global(match self.globals.get(&pathid) {
                             None => return Err(StorageError::NotFound),
                             Some(IntermediatePath { entries, .. }) => {
@@ -215,16 +196,23 @@ impl Filesystem {
         loc: L,
     ) -> Result<(&ArenaFilesystem, PathIdPrefix, ArenaFsLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
-            FsLoc::Inode(inode) => (
-                self.arena_fs_for_inode(inode)?,
-                inode.prefix(),
-                ArenaFsLoc::Inode(inode.partial()),
-            ),
-            FsLoc::InodeAndName(inode, name) => (
-                self.arena_fs_for_inode(inode)?,
-                inode.prefix(),
-                ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
-            ),
+            FsLoc::Inode(inode) => {
+                let prefix = inode.prefix();
+
+                (
+                    self.arena_fs_for_prefix(prefix)?,
+                    prefix,
+                    ArenaFsLoc::Inode(inode.partial()),
+                )
+            }
+            FsLoc::InodeAndName(inode, name) => {
+                let prefix = inode.prefix();
+                (
+                    self.arena_fs_for_prefix(prefix)?,
+                    prefix,
+                    ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
+                )
+            }
             FsLoc::Path(arena, path) => (
                 self.arena_fs(arena)?,
                 self.prefix(arena)?,
@@ -235,14 +223,11 @@ impl Filesystem {
 
     /// Cover the special case of a InodeAndName where name points to an arena root.
     fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
-        if let Some((pathid, name)) = match &loc {
-            FsLoc::InodeAndName(inode, name) => Some((PathId(inode.as_u64()), name)),
-            _ => None,
-        } {
-            if let Some(IntermediatePath { entries, .. }) = self.globals.get(&pathid) {
+        if let FsLoc::InodeAndName(inode, name) = &loc {
+            if let Some(IntermediatePath { entries, .. }) = self.globals.get(&PathId::from(inode)) {
                 if let Some(pathid) = entries.get(name) {
-                    if self.allocator.is_arena_root(*pathid) {
-                        return FsLoc::Inode(Inode::from(*pathid));
+                    if pathid.partial() == PartialPathId::ROOT {
+                        return FsLoc::Inode(Inode::from(pathid));
                     }
                 }
             }
@@ -260,8 +245,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
+            match this.resolve_loc(loc)? {
                 ResolvedLoc::InArena(arena, prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     let (inode, metadata) = fs.lookup(loc)?;
@@ -298,19 +282,16 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.dir_metadata(loc)
-                }
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
-                ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
-                    None => Err(StorageError::NotFound),
-                    Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata::readonly(*mtime)),
-                },
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.dir_metadata(loc)
             }
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+            ResolvedLoc::Global(Some(pathid)) => match this.globals.get(&pathid) {
+                None => Err(StorageError::NotFound),
+                Some(IntermediatePath { mtime, .. }) => Ok(DirMetadata::readonly(*mtime)),
+            },
         })
         .await?
     }
@@ -323,8 +304,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
+            match this.resolve_loc(loc)? {
                 ResolvedLoc::InArena(arena, prefix, loc) => {
                     let fs = this.arena_fs(arena)?;
                     let vec = fs.readdir(loc)?;
@@ -343,7 +323,7 @@ impl Filesystem {
                             (
                                 name.to_string(),
                                 // global inodes and pathids map 1:1
-                                Inode(pathid.as_u64()),
+                                Inode::from(pathid),
                                 crate::arena::types::Metadata::Dir(DirMetadata::readonly(*mtime)),
                             )
                         })
@@ -445,9 +425,8 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
+            match this.resolve_loc(loc)? {
+                ResolvedLoc::InArena(arena, _, loc) => {
                     let fs = this.arena_fs(arena)?;
                     fs.metadata(loc)
                 }
@@ -473,16 +452,13 @@ impl Filesystem {
     ) -> Result<Vec<&'static str>, StorageError> {
         let loc = loc.into();
         let this = Arc::clone(self);
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.list_xattrs(loc)
-                }
-                ResolvedLoc::Global(Some(_)) => Ok(vec![]),
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.list_xattrs(loc)
             }
+            ResolvedLoc::Global(Some(_)) => Ok(vec![]),
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
         })
         .await?
     }
@@ -495,16 +471,13 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
         let xattr = xattr.to_string();
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.get_xattr(loc, &xattr)
-                }
-                ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.get_xattr(loc, &xattr)
             }
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
         })
         .await?
     }
@@ -519,16 +492,13 @@ impl Filesystem {
         let this = Arc::clone(self);
         let xattr = xattr.to_string();
         let value = value.into_owned();
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.set_xattr(loc, &xattr, value.into())
-                }
-                ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.set_xattr(loc, &xattr, value.into())
             }
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
         })
         .await?
     }
@@ -537,16 +507,13 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match this.resolve_loc(&txn, loc)? {
-                ResolvedLoc::InArena(arena, _prefix, loc) => {
-                    let fs = this.arena_fs(arena)?;
-                    fs.unlink(loc)
-                }
-                ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
-                ResolvedLoc::Global(None) => Err(StorageError::NotFound),
+        task::spawn_blocking(move || match this.resolve_loc(loc)? {
+            ResolvedLoc::InArena(arena, _, loc) => {
+                let fs = this.arena_fs(arena)?;
+                fs.unlink(loc)
             }
+            ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
+            ResolvedLoc::Global(None) => Err(StorageError::NotFound),
         })
         .await?
     }
@@ -560,12 +527,8 @@ impl Filesystem {
         let dest = dest.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match (
-                this.resolve_loc(&txn, source)?,
-                this.resolve_loc(&txn, dest)?,
-            ) {
+        task::spawn_blocking(
+            move || match (this.resolve_loc(source)?, this.resolve_loc(dest)?) {
                 (
                     ResolvedLoc::InArena(source_arena, prefix, source),
                     ResolvedLoc::InArena(dest_arena, _, dest),
@@ -580,8 +543,8 @@ impl Filesystem {
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
-            }
-        })
+            },
+        )
         .await?
     }
 
@@ -595,12 +558,8 @@ impl Filesystem {
         let dest = dest.into();
         let this = Arc::clone(self);
 
-        task::spawn_blocking(move || {
-            let txn = this.db.begin_read()?;
-            match (
-                this.resolve_loc(&txn, source)?,
-                this.resolve_loc(&txn, dest)?,
-            ) {
+        task::spawn_blocking(
+            move || match (this.resolve_loc(source)?, this.resolve_loc(dest)?) {
                 (
                     ResolvedLoc::InArena(source_arena, _, source),
                     ResolvedLoc::InArena(dest_arena, _, dest),
@@ -613,8 +572,8 @@ impl Filesystem {
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
-            }
-        })
+            },
+        )
         .await?
     }
 

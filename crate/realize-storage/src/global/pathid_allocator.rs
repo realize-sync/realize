@@ -1,4 +1,4 @@
-use super::db::{GlobalReadTransaction, GlobalWriteTransaction};
+use super::db::GlobalWriteTransaction;
 use crate::types::{PartialPathId, PathIdPrefix};
 use crate::{GlobalDatabase, PathId, StorageError};
 use bimap::BiMap;
@@ -54,25 +54,11 @@ impl PathIdAllocator {
             .map(|p| *p)
     }
 
-    /// Check whether [PathId] is the root of a known arena.
-    pub(crate) fn is_arena_root(&self, pathid: PathId) -> bool {
-        self.prefixes
-            .read()
-            .unwrap()
-            .get_by_right(&pathid.prefix())
-            .is_some()
-    }
-
-    /// Maps pathids to arenas.
-    ///
-    /// The root pathid of an arena is mapped to the arena, even though
-    /// these pathids are allocated from the global range.
-    pub(crate) fn arena_for_pathid(
+    /// Maps prefixes to arenas.
+    pub(crate) fn arena_for_prefix(
         &self,
-        _txn: &GlobalReadTransaction,
-        pathid: PathId,
+        prefix: PathIdPrefix,
     ) -> Result<Option<Arena>, StorageError> {
-        let prefix = pathid.prefix();
         if prefix == PathIdPrefix::ZERO {
             return Ok(None);
         }
@@ -199,8 +185,7 @@ mod tests {
         }
 
         fn arena_for_pathid(&self, pathid: PathId) -> Result<Option<Arena>, StorageError> {
-            let txn = self.db.begin_read()?;
-            self.allocator.arena_for_pathid(&txn, pathid)
+            self.allocator.arena_for_prefix(pathid.prefix())
         }
     }
 
@@ -313,24 +298,20 @@ mod tests {
     }
 
     #[test]
-    fn arena_for_pathid_root() -> anyhow::Result<()> {
+    fn arena_for_prefix_global() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
-        let txn = fixture.db.begin_read()?;
-
-        let result = fixture.allocator.arena_for_pathid(&txn, PathId::ROOT)?;
+        let result = fixture.allocator.arena_for_prefix(PathIdPrefix::ZERO)?;
         assert_eq!(None, result);
 
         Ok(())
     }
 
     #[test]
-    fn arena_for_pathid_arena_root() -> anyhow::Result<()> {
+    fn arena_for_prefix_arena() -> anyhow::Result<()> {
         let arena = Arena::from("test");
         let fixture = Fixture::setup([arena])?;
-        let txn = fixture.db.begin_read()?;
-
-        let arena_root = fixture.allocator.arena_root(arena).unwrap();
-        let result = fixture.allocator.arena_for_pathid(&txn, arena_root)?;
+        let prefix = fixture.allocator.prefix(arena).unwrap();
+        let result = fixture.allocator.arena_for_prefix(prefix)?;
 
         assert_eq!(Some(arena), result);
 
@@ -340,11 +321,9 @@ mod tests {
     #[test]
     fn arena_for_pathid_not_found() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
-        let txn = fixture.db.begin_read()?;
-
         let result = fixture
             .allocator
-            .arena_for_pathid(&txn, PartialPathId(999).with(PathIdPrefix::from_u8(99)));
+            .arena_for_prefix(PathIdPrefix::from_u8(99));
 
         assert!(result.is_err());
         match result {
