@@ -59,13 +59,14 @@ impl Filesystem {
     /// Create a new Filesystems with the database at the given path.
     pub(crate) async fn with_db<T>(
         db: Arc<GlobalDatabase>,
-        allocator: Arc<PathIdAllocator>,
         by_arena: T,
     ) -> Result<Arc<Self>, anyhow::Error>
     where
         T: IntoIterator<Item = Arc<ArenaFilesystem>> + Send + 'static,
     {
         task::spawn_blocking(move || {
+            let allocator = PathIdAllocator::setup(&db)?;
+
             let mut map = HashMap::new();
             let mut globals = HashMap::new();
             let txn = db.begin_write()?;
@@ -719,7 +720,7 @@ fn register(
     for existing in map.keys().map(|a| *a) {
         check_arena_compatibility(arena, existing)?;
     }
-    let prefix = allocator.allocate_prefix(arena)?;
+    let prefix = allocator.allocate_prefix(txn, arena)?;
     let arena_root = PartialPathId::ROOT.with(prefix);
     add_arena_root(arena, arena_root, txn, path_table, paths)?;
     map.insert(fs.arena(), fs);
@@ -829,11 +830,6 @@ mod tests {
             let tempdir = TempDir::new()?;
 
             let arenas = arenas.into_iter().collect::<Vec<_>>();
-            let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let allocator = PathIdAllocator::new(Arc::clone(&db))?;
-            for arena in &arenas {
-                allocator.allocate_prefix(*arena)?;
-            }
             let mut arena_fs = vec![];
             for arena in arenas {
                 let blob_dir = tempdir.child(format!("{arena}/blobs"));
@@ -846,7 +842,8 @@ mod tests {
                     datadir.path(),
                 )?);
             }
-            let fs = Filesystem::with_db(Arc::clone(&db), Arc::clone(&allocator), arena_fs).await?;
+            let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
+            let fs = Filesystem::with_db(db, arena_fs).await?;
 
             Ok(Self {
                 fs,

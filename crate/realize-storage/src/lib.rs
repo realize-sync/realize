@@ -5,7 +5,6 @@ use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
-use global::pathid_allocator::PathIdAllocator;
 use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,13 +66,11 @@ impl Storage {
                 .with_context(|| format!("in arena {arena}"))?,
             );
         }
-
         let globaldb = create_globaldb(&config.cache.db)
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
         let cache = Filesystem::with_db(
             Arc::clone(&globaldb),
-            PathIdAllocator::new(globaldb)?,
             arena_storage
                 .values()
                 .map(|s| Arc::clone(&s.fs))
