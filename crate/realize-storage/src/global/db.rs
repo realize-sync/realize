@@ -19,7 +19,7 @@ const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
 ///
 /// Key: arena name
 /// Value: root pathid of arena
-const ARENA_TABLE: TableDefinition<&str, PathId> = TableDefinition::new("cache.arena");
+const ARENA_TABLE: TableDefinition<&str, PathId> = TableDefinition::new("arena");
 
 /// Tracks mapping of pathid to path and mtime for global directories
 /// (non-arena).

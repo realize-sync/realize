@@ -27,7 +27,7 @@ use uuid::Uuid;
 /// Key: u64 (monotonically increasing index value)
 /// Value: HistoryTableEntry
 const HISTORY_TABLE: TableDefinition<u64, Holder<HistoryTableEntry>> =
-    TableDefinition::new("index.history");
+    TableDefinition::new("history");
 
 /// Database settings.
 ///
@@ -62,7 +62,7 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PartialPathId, u32> =
 /// Key: (PartialPathId, Layer) (layer, pathid)
 /// Value: CacheTableEntry
 const CACHE_TABLE: TableDefinition<(PartialPathId, Layer), Holder<CacheTableEntry>> =
-    TableDefinition::new("cache.file");
+    TableDefinition::new("cache");
 
 /// Track peer files that might have been deleted remotely.
 ///
@@ -74,7 +74,7 @@ const CACHE_TABLE: TableDefinition<(PartialPathId, Layer), Holder<CacheTableEntr
 /// Key: (peer, file pathid)
 /// Value: ()
 const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PartialPathId), ()> =
-    TableDefinition::new("acache.pending_catchup");
+    TableDefinition::new("pending_catchup");
 
 /// Track Peer UUIDs.
 ///
@@ -82,8 +82,7 @@ const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PartialPathId), ()> =
 ///
 /// Key: &str (Peer)
 /// Value: PeerTableEntry
-const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
-    TableDefinition::new("acache.peer");
+const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> = TableDefinition::new("peer");
 
 /// Track last seen notification index.
 ///
@@ -91,7 +90,7 @@ const PEER_TABLE: TableDefinition<&str, Holder<PeerTableEntry>> =
 ///
 /// Key: &str (Peer)
 /// Value: last seen index
-const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("acache.notification");
+const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("notification");
 
 /// Track blobs.
 ///
@@ -110,7 +109,7 @@ const BLOB_TABLE: TableDefinition<PartialPathId, Holder<BlobTableEntry>> =
 /// Key: u16 (LRU Queue ID)
 /// Value: QueueTableEntry
 const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
-    TableDefinition::new("blob.lru_queue");
+    TableDefinition::new("blob_lru_queue");
 
 /// Track current pathid range for each arena.
 ///
