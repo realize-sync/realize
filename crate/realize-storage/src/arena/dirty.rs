@@ -555,7 +555,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let path = tree.setup(Path::parse("test/path.txt")?)?;
-        let job_id = JobId::from(1);
+        let job_id = JobId(1);
 
         // Mark path as dirty first
         dirty.mark_dirty(path, "test")?;
@@ -584,7 +584,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let path = tree.setup(Path::parse("test/path.txt")?)?;
-        let job_id = JobId::from(1);
+        let job_id = JobId(1);
 
         // Mark path as dirty first
         dirty.mark_dirty(path, "test")?;
@@ -613,7 +613,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let path = tree.setup(Path::parse("test/path.txt")?)?;
-        let job_id = JobId::from(1);
+        let job_id = JobId(1);
 
         // First mark a path as dirty to create the job entry
         dirty.mark_dirty(path, "test")?;
@@ -711,7 +711,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut tree = txn.write_tree()?;
         let path = tree.setup(Path::parse("test/path.txt")?)?;
-        let job_id = JobId::from(1);
+        let job_id = JobId(1);
 
         // First mark a path as dirty to create the job entry
         dirty.mark_dirty(path, "test")?;
@@ -737,8 +737,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let path1 = tree.setup(Path::parse("path1.txt")?)?;
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
-        let job_id1 = JobId::from(1);
-        let job_id2 = JobId::from(2);
+        let job_id1 = JobId(1);
+        let job_id2 = JobId(2);
 
         // First mark paths as dirty to create the job entries
         dirty.mark_dirty(path1, "test")?;
@@ -774,8 +774,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let path1 = tree.setup(Path::parse("path1.txt")?)?;
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
-        let job_id1 = JobId::from(1);
-        let job_id2 = JobId::from(2);
+        let job_id1 = JobId(1);
+        let job_id2 = JobId(2);
 
         // First mark paths as dirty to create the job entries
         dirty.mark_dirty(path1, "test")?;
@@ -842,7 +842,7 @@ mod tests {
         let mut dirty = txn.write_dirty()?;
         let mut tree = txn.write_tree()?;
         let path = tree.setup(Path::parse("test/path.txt")?)?;
-        let job_id = JobId::from(1);
+        let job_id = JobId(1);
 
         dirty.mark_dirty(path, "test")?;
         let counter = dirty.get_counter(path)?;
@@ -868,8 +868,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let path1 = tree.setup(Path::parse("test/path1.txt")?)?;
         let path2 = tree.setup(Path::parse("test/path2.txt")?)?;
-        let job_id1 = JobId::from(1);
-        let job_id2 = JobId::from(2);
+        let job_id1 = JobId(1);
+        let job_id2 = JobId(2);
 
         dirty.mark_dirty(path1, "test")?;
         dirty.mark_dirty(path2, "test")?;

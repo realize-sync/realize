@@ -235,7 +235,7 @@ impl Filesystem {
                 let fs = this.arena_fs(arena)?;
                 let (inode, metadata) = fs.lookup(loc)?;
 
-                Ok((inode.with(prefix), metadata))
+                Ok((inode.to_inode(prefix), metadata))
             }
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some((inode, entry))) => Ok((
@@ -280,7 +280,7 @@ impl Filesystem {
                 .await??;
                 Ok(vec
                     .into_iter()
-                    .map(|(n, inode, m)| (n, inode.with(prefix), m))
+                    .map(|(n, inode, m)| (n, inode.to_inode(prefix), m))
                     .collect())
             }
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
@@ -495,7 +495,7 @@ impl Filesystem {
                     let fs = this.arena_fs(source_arena)?;
                     let (inode, m) = fs.branch(source, dest)?;
 
-                    Ok((inode.with(prefix), m))
+                    Ok((inode.to_inode(prefix), m))
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
@@ -546,7 +546,7 @@ impl Filesystem {
 
             let (inode, m) = fs.mkdir(loc)?;
 
-            Ok((inode.with(prefix), m))
+            Ok((inode.to_inode(prefix), m))
         })
         .await?
     }
@@ -578,7 +578,7 @@ impl Filesystem {
 
             let (inode, file) = fs.create(options, loc)?;
 
-            Ok((inode.with(prefix), file))
+            Ok((inode.to_inode(prefix), file))
         })
         .await?
     }
@@ -690,7 +690,7 @@ fn add_arena_path(
 
     // Add entry for arena if necessary
     let name = arena_path.name();
-    let arena_root = PartialInode::ROOT.with(prefix);
+    let arena_root = PartialInode::ROOT.to_inode(prefix);
     match current_entry.subdirs.get(name) {
         None => {
             current_entry.subdirs.insert(name.to_string(), arena_root);

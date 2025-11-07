@@ -93,7 +93,7 @@ impl PathIdAllocator {
 
 /// Allocate a new pathid in [GlobalDatabase].
 pub(crate) fn allocal_global_inode(txn: &GlobalWriteTransaction) -> Result<Inode, StorageError> {
-    Ok(PartialInode::from(allocate(&mut txn.pathid_range_table()?)?).with(PathIdPrefix::ZERO))
+    Ok(PartialInode::from(allocate(&mut txn.pathid_range_table()?)?).to_inode(PathIdPrefix::ZERO))
 }
 
 /// Allocate a new pathid, using the given table and prefix.
