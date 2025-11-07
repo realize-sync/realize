@@ -11,7 +11,7 @@ use crate::arena::types::DirMetadata;
 use crate::arena::xattr;
 use crate::global::fs::FileContent;
 use crate::types::{PartialInode, PartialPathId};
-use crate::{Blob, FileRealm, PathId};
+use crate::{Blob, FileRealm};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Path, Peer};
 use std::borrow::Cow;
@@ -469,11 +469,6 @@ impl ArenaFsLoc {
 impl From<PartialPathId> for ArenaFsLoc {
     fn from(value: PartialPathId) -> Self {
         ArenaFsLoc::PathId(value)
-    }
-}
-impl From<PathId> for ArenaFsLoc {
-    fn from(value: PathId) -> Self {
-        ArenaFsLoc::PathId(value.partial())
     }
 }
 

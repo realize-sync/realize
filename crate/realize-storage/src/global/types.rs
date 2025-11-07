@@ -1,4 +1,5 @@
 use crate::Inode;
+use crate::types::PathIdPrefix;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -88,6 +89,42 @@ impl ByteConvertible<PathTableEntry> for PathTableEntry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArenaTableEntry {
+    pub(crate) prefix: PathIdPrefix,
+}
+
+impl NamedType for ArenaTableEntry {
+    fn typename() -> &'static str {
+        "ArenaTableEntry"
+    }
+}
+
+impl ByteConvertible<ArenaTableEntry> for ArenaTableEntry {
+    fn from_bytes(data: &[u8]) -> Result<ArenaTableEntry, ByteConversionError> {
+        let message_reader = serialize_packed::read_message(&mut &data[..], ReaderOptions::new())?;
+        let msg: cache_capnp::arena_table_entry::Reader =
+            message_reader.get_root::<cache_capnp::arena_table_entry::Reader>()?;
+
+        let prefix = PathIdPrefix::from_u8(msg.get_prefix());
+
+        return Ok(ArenaTableEntry { prefix });
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
+        let mut message = ::capnp::message::Builder::new_default();
+        let mut builder: cache_capnp::arena_table_entry::Builder =
+            message.init_root::<cache_capnp::arena_table_entry::Builder>();
+
+        builder.set_prefix(self.prefix.as_u8());
+
+        let mut buffer: Vec<u8> = Vec::new();
+        serialize_packed::write_message(&mut buffer, &message)?;
+
+        Ok(buffer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +141,18 @@ mod tests {
         assert_eq!(
             entry,
             PathTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn convert_arena_table_entry() -> anyhow::Result<()> {
+        let entry = ArenaTableEntry {
+            prefix: PathIdPrefix::from_u8(9),
+        };
+        assert_eq!(
+            entry,
+            ArenaTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
         );
         Ok(())
     }

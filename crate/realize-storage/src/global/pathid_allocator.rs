@@ -1,5 +1,7 @@
 use super::db::GlobalWriteTransaction;
+use crate::global::types::ArenaTableEntry;
 use crate::types::{PartialInode, PartialPathId, PathIdPrefix};
+use crate::utils::holder::Holder;
 use crate::{GlobalDatabase, Inode, StorageError};
 use bimap::BiMap;
 use realize_types::Arena;
@@ -21,8 +23,10 @@ impl PathIdAllocator {
         let table = txn.arena_table()?;
         let mut prefixes = BiMap::new();
         for value in table.iter()? {
-            let (arena, pathid) = value?;
-            prefixes.insert(Arena::from(arena.value()), pathid.value().prefix());
+            let (arena, entry) = value?;
+            let arena = Arena::from(arena.value());
+            let ArenaTableEntry { prefix } = entry.value().parse()?;
+            prefixes.insert(arena, prefix);
         }
 
         Ok(Arc::new(Self {
@@ -66,17 +70,18 @@ impl PathIdAllocator {
         // self.prefix.
         let prefix;
         if let Some(existing) = arena_table.get(arena.as_str())? {
-            let pathid = existing.value();
-            prefix = pathid.prefix();
+            prefix = existing.value().parse()?.prefix;
         } else {
             let mut max_prefix = 0u8;
             for value in arena_table.iter()? {
                 let (_, pathid) = value?;
-                max_prefix = std::cmp::max(max_prefix, pathid.value().prefix().as_u8());
+                max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
             }
             prefix = PathIdPrefix::from_u8(max_prefix + 1);
-            let root = PartialPathId::ROOT.with(prefix);
-            arena_table.insert(arena.as_str(), root)?;
+            arena_table.insert(
+                arena.as_str(),
+                Holder::with_content(ArenaTableEntry { prefix })?,
+            )?;
             log::debug!("[{arena}]: prefix {prefix}");
         }
 

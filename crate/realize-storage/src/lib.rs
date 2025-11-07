@@ -32,7 +32,7 @@ pub use arena::types::{
 };
 pub use error::StorageError;
 pub use global::fs::{FileContent, Filesystem, FsLoc};
-pub use types::{Inode, JobId, PathId};
+pub use types::{Inode, JobId};
 
 use crate::config::NamedArenaConfig;
 

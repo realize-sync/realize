@@ -14,6 +14,10 @@ struct Subdir {
   inode @1: UInt64;
 }
 
+struct ArenaTableEntry {
+  prefix @0: UInt8;
+}
+
 # Time as duration since UNIX_EPOCH.
 struct Time {
   secs @0: UInt64;

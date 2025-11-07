@@ -1,7 +1,7 @@
-use crate::global::types::PathTableEntry;
+use crate::global::types::{ArenaTableEntry, PathTableEntry};
 use crate::types::PartialPathId;
 use crate::utils::holder::Holder;
-use crate::{Inode, PathId, StorageError};
+use crate::{Inode, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
 use std::sync::Arc;
 
@@ -15,11 +15,11 @@ use std::sync::Arc;
 const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
     TableDefinition::new("pathid_range");
 
-/// Maps arena to their root directory pathid.
+/// Store arena definitions.
 ///
 /// Key: arena name
-/// Value: root pathid of arena
-const ARENA_TABLE: TableDefinition<&str, PathId> = TableDefinition::new("arena");
+/// Value: ArenaTableEntry
+const ARENA_TABLE: TableDefinition<&str, Holder<ArenaTableEntry>> = TableDefinition::new("arena");
 
 /// Tracks mapping of pathid to path and mtime for global directories
 /// (non-arena).
@@ -84,7 +84,7 @@ impl GlobalWriteTransaction {
 
     pub fn arena_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, &'static str, PathId>, StorageError> {
+    ) -> Result<Table<'txn, &'static str, Holder<'static, ArenaTableEntry>>, StorageError> {
         Ok(self.inner.open_table(ARENA_TABLE)?)
     }
 
@@ -106,7 +106,9 @@ pub struct GlobalReadTransaction {
 }
 
 impl GlobalReadTransaction {
-    pub fn arena_table(&self) -> Result<ReadOnlyTable<&'static str, PathId>, StorageError> {
+    pub fn arena_table(
+        &self,
+    ) -> Result<ReadOnlyTable<&'static str, Holder<'static, ArenaTableEntry>>, StorageError> {
         Ok(self.inner.open_table(ARENA_TABLE)?)
     }
 }
