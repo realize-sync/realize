@@ -2,7 +2,7 @@ use super::db::BeforeCommit;
 use crate::StorageError;
 use crate::arena::db::Tag;
 use crate::global::pathid_allocator;
-use crate::types::PartialPathId;
+use crate::types::PathId;
 use realize_types::{Arena, Path};
 use redb::{ReadableTable, Table};
 use std::borrow::{Borrow, Cow};
@@ -46,14 +46,14 @@ impl Tree {
         Self { arena }
     }
 
-    pub(crate) fn root(&self) -> PartialPathId {
-        PartialPathId::ROOT
+    pub(crate) fn root(&self) -> PathId {
+        PathId::ROOT
     }
 }
 
 pub(crate) struct ReadableOpenTree<T>
 where
-    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
     table: T,
     arena: Arena,
@@ -61,7 +61,7 @@ where
 
 impl<T> ReadableOpenTree<T>
 where
-    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
     pub(crate) fn new(table: T, tree: &Tree) -> Self {
         Self {
@@ -76,17 +76,13 @@ where
 /// See also [TreeExt] for path-based operations.
 pub(crate) trait TreeReadOperations {
     /// Returns the tree root pathid.
-    fn root(&self) -> PartialPathId;
+    fn root(&self) -> PathId;
 
     /// Lookup a specific name in the given node.
-    fn lookup_pathid(
-        &self,
-        pathid: PartialPathId,
-        name: &str,
-    ) -> Result<Option<PartialPathId>, StorageError>;
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError>;
 
     /// List names under the given pathid.
-    fn readdir_pathid(&self, pathid: PartialPathId) -> ReadDirIterator<'_>;
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_>;
 
     /// Return the parent of the given pathid, or None if not found.
     ///
@@ -94,13 +90,13 @@ pub(crate) trait TreeReadOperations {
     /// have a parent.
     ///
     /// See also [TreeExt::ancestors]
-    fn parent(&self, pathid: PartialPathId) -> Result<Option<PartialPathId>, StorageError>;
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError>;
 
     /// Return the name {pathid} can be found in in {parent_pathid}.
     fn name_in(
         &self,
-        parent_pathid: PartialPathId,
-        pathid: PartialPathId,
+        parent_pathid: PathId,
+        pathid: PathId,
     ) -> Result<Option<String>, StorageError>;
 
     /// Returns the arena this tree belongs to.
@@ -109,29 +105,25 @@ pub(crate) trait TreeReadOperations {
 
 impl<T> TreeReadOperations for ReadableOpenTree<T>
 where
-    T: ReadableTable<(PartialPathId, &'static str), PartialPathId>,
+    T: ReadableTable<(PathId, &'static str), PathId>,
 {
-    fn root(&self) -> PartialPathId {
-        PartialPathId::ROOT
+    fn root(&self) -> PathId {
+        PathId::ROOT
     }
 
-    fn lookup_pathid(
-        &self,
-        pathid: PartialPathId,
-        name: &str,
-    ) -> Result<Option<PartialPathId>, StorageError> {
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
         lookup(&self.table, pathid, name)
     }
-    fn readdir_pathid(&self, pathid: PartialPathId) -> ReadDirIterator<'_> {
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
         readdir(&self.table, pathid)
     }
-    fn parent(&self, pathid: PartialPathId) -> Result<Option<PartialPathId>, StorageError> {
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
     }
     fn name_in(
         &self,
-        parent_pathid: PartialPathId,
-        pathid: PartialPathId,
+        parent_pathid: PathId,
+        pathid: PathId,
     ) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_pathid, pathid)
     }
@@ -141,26 +133,22 @@ where
 }
 
 impl<'a> TreeReadOperations for WritableOpenTree<'a> {
-    fn root(&self) -> PartialPathId {
-        PartialPathId::ROOT
+    fn root(&self) -> PathId {
+        PathId::ROOT
     }
-    fn lookup_pathid(
-        &self,
-        pathid: PartialPathId,
-        name: &str,
-    ) -> Result<Option<PartialPathId>, StorageError> {
+    fn lookup_pathid(&self, pathid: PathId, name: &str) -> Result<Option<PathId>, StorageError> {
         lookup(&self.table, pathid, name)
     }
-    fn readdir_pathid(&self, pathid: PartialPathId) -> ReadDirIterator<'_> {
+    fn readdir_pathid(&self, pathid: PathId) -> ReadDirIterator<'_> {
         readdir(&self.table, pathid)
     }
-    fn parent(&self, pathid: PartialPathId) -> Result<Option<PartialPathId>, StorageError> {
+    fn parent(&self, pathid: PathId) -> Result<Option<PathId>, StorageError> {
         parent(&self.table, pathid)
     }
     fn name_in(
         &self,
-        parent_pathid: PartialPathId,
-        pathid: PartialPathId,
+        parent_pathid: PathId,
+        pathid: PathId,
     ) -> Result<Option<String>, StorageError> {
         name_in(&self.table, parent_pathid, pathid)
     }
@@ -174,10 +162,10 @@ impl<'a> TreeReadOperations for WritableOpenTree<'a> {
 ///
 /// Such locations are usually created automatically using into().
 pub(crate) enum TreeLoc<'a> {
-    PathId(PartialPathId),
+    PathId(PathId),
     PathRef(&'a Path),
     Path(Path),
-    PathIdAndName(PartialPathId, Cow<'a, str>),
+    PathIdAndName(PathId, Cow<'a, str>),
 }
 
 impl<'a> TreeLoc<'a> {
@@ -208,8 +196,8 @@ impl<'a> TreeLoc<'a> {
     }
 }
 
-impl From<PartialPathId> for TreeLoc<'static> {
-    fn from(value: PartialPathId) -> Self {
+impl From<PathId> for TreeLoc<'static> {
+    fn from(value: PathId) -> Self {
         TreeLoc::PathId(value)
     }
 }
@@ -226,19 +214,19 @@ impl<'a> From<&'a Path> for TreeLoc<'a> {
     }
 }
 
-impl<'a> From<(PartialPathId, &'a str)> for TreeLoc<'a> {
-    fn from(value: (PartialPathId, &'a str)) -> Self {
+impl<'a> From<(PathId, &'a str)> for TreeLoc<'a> {
+    fn from(value: (PathId, &'a str)) -> Self {
         TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
 
-impl<'a> From<(PartialPathId, &'a String)> for TreeLoc<'a> {
-    fn from(value: (PartialPathId, &'a String)) -> Self {
+impl<'a> From<(PathId, &'a String)> for TreeLoc<'a> {
+    fn from(value: (PathId, &'a String)) -> Self {
         TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
-impl From<(PartialPathId, String)> for TreeLoc<'static> {
-    fn from(value: (PartialPathId, String)) -> Self {
+impl From<(PathId, String)> for TreeLoc<'static> {
+    fn from(value: (PathId, String)) -> Self {
         TreeLoc::PathIdAndName(value.0, Cow::from(value.1))
     }
 }
@@ -247,20 +235,14 @@ impl From<(PartialPathId, String)> for TreeLoc<'static> {
 /// with [Path].
 pub(crate) trait TreeExt {
     /// Resolve the given tree location to an pathid.
-    fn resolve<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-    ) -> Result<Option<PartialPathId>, StorageError>;
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<PathId>, StorageError>;
 
     /// Resolve the given tree location to an pathid or return [Storage::NotFound].
-    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PartialPathId, StorageError>;
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError>;
 
     /// Lookup the given path and return the most specific pathid matching the
     /// path - which might just be the root if nothing matches.
-    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        path: L,
-    ) -> Result<PartialPathId, StorageError>;
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, path: L) -> Result<PathId, StorageError>;
 
     /// Read the content of the given directory.
     fn readdir<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> ReadDirIterator<'_>;
@@ -269,7 +251,7 @@ pub(crate) trait TreeExt {
     /// iterator of pathids (depth-first).
     ///
     /// Only enters the nodes for which `enter` returns true.
-    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PartialPathId, StorageError>>
+    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
         L: Into<TreeLoc<'a>>;
 
@@ -280,21 +262,15 @@ pub(crate) trait TreeExt {
 
     /// Return an iterator that returns the parent of pathid and it
     /// parent until the root.
-    fn ancestors(
-        &self,
-        pathid: PartialPathId,
-    ) -> impl Iterator<Item = Result<PartialPathId, StorageError>>;
+    fn ancestors(&self, pathid: PathId) -> impl Iterator<Item = Result<PathId, StorageError>>;
 }
 
 impl<T: TreeReadOperations> TreeExt for T {
-    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PartialPathId, StorageError> {
+    fn expect<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
         self.resolve(loc)?.ok_or(StorageError::NotFound)
     }
 
-    fn resolve<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-    ) -> Result<Option<PartialPathId>, StorageError> {
+    fn resolve<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<Option<PathId>, StorageError> {
         let loc = loc.into();
         match loc {
             TreeLoc::PathId(pathid) => Ok(Some(pathid)),
@@ -304,10 +280,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(
-        &self,
-        loc: L,
-    ) -> Result<PartialPathId, StorageError> {
+    fn resolve_partial<'a, L: Into<TreeLoc<'a>>>(&self, loc: L) -> Result<PathId, StorageError> {
         let loc = loc.into();
         match loc {
             TreeLoc::PathId(pathid) => Ok(pathid),
@@ -329,7 +302,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PartialPathId, StorageError>>
+    fn recurse<'a, L>(&self, loc: L) -> impl Iterator<Item = Result<PathId, StorageError>>
     where
         L: Into<TreeLoc<'a>>,
     {
@@ -371,10 +344,7 @@ impl<T: TreeReadOperations> TreeExt for T {
         }
     }
 
-    fn ancestors(
-        &self,
-        pathid: PartialPathId,
-    ) -> impl Iterator<Item = Result<PartialPathId, StorageError>> {
+    fn ancestors(&self, pathid: PathId) -> impl Iterator<Item = Result<PathId, StorageError>> {
         Ancestors {
             tree: self,
             current: Some(pathid),
@@ -387,14 +357,14 @@ where
     T: TreeReadOperations,
 {
     tree: &'a T,
-    current: Option<PartialPathId>,
+    current: Option<PathId>,
 }
 
 impl<'a, T> Iterator for Ancestors<'a, T>
 where
     T: TreeReadOperations,
 {
-    type Item = Result<PartialPathId, StorageError>;
+    type Item = Result<PathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.current.take() {
@@ -425,7 +395,7 @@ impl<'a, T> Iterator for RecurseIterator<'a, T>
 where
     T: TreeReadOperations,
 {
-    type Item = Result<PartialPathId, StorageError>;
+    type Item = Result<PathId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(iter) = self.stack.back_mut() {
@@ -451,9 +421,9 @@ where
 pub(crate) struct WritableOpenTree<'a> {
     tag: Tag,
     before_commit: &'a BeforeCommit,
-    table: Table<'a, (PartialPathId, &'static str), PartialPathId>,
-    refcount_table: Table<'a, PartialPathId, u32>,
-    pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
+    table: Table<'a, (PathId, &'static str), PathId>,
+    refcount_table: Table<'a, PathId, u32>,
+    pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
     tree: &'a Tree,
 }
 
@@ -461,9 +431,9 @@ impl<'a> WritableOpenTree<'a> {
     pub(crate) fn new(
         tag: Tag,
         before_commit: &'a BeforeCommit,
-        tree_table: Table<'a, (PartialPathId, &'static str), PartialPathId>,
-        refcount_table: Table<'a, PartialPathId, u32>,
-        pathid_range_table: redb::Table<'a, (), (PartialPathId, PartialPathId)>,
+        tree_table: Table<'a, (PathId, &'static str), PathId>,
+        refcount_table: Table<'a, PathId, u32>,
+        pathid_range_table: redb::Table<'a, (), (PathId, PathId)>,
         tree: &'a Tree,
     ) -> Self {
         Self {
@@ -554,7 +524,7 @@ impl<'a> WritableOpenTree<'a> {
     pub(crate) fn setup<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         loc: L,
-    ) -> Result<PartialPathId, StorageError> {
+    ) -> Result<PathId, StorageError> {
         match loc.into() {
             TreeLoc::PathId(pathid) => Ok(pathid),
             TreeLoc::Path(path) => self.setup_path(&path),
@@ -563,7 +533,7 @@ impl<'a> WritableOpenTree<'a> {
         }
     }
 
-    fn setup_path(&mut self, path: &Path) -> Result<PartialPathId, StorageError> {
+    fn setup_path(&mut self, path: &Path) -> Result<PathId, StorageError> {
         let (pathid, added) = self.add_path(path.as_ref())?;
         if added {
             log::debug!("[{}] \"{path}\" = pathid {pathid}", self.tag);
@@ -586,9 +556,9 @@ impl<'a> WritableOpenTree<'a> {
     /// methods on [WritableOpenTree].
     pub(crate) fn setup_name(
         &mut self,
-        parent_pathid: PartialPathId,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<PartialPathId, StorageError> {
+    ) -> Result<PathId, StorageError> {
         let (pathid, added) = self.add_name(parent_pathid, name)?;
 
         if added {
@@ -613,7 +583,7 @@ impl<'a> WritableOpenTree<'a> {
     /// setup instead.
     ///
     /// Return (pathid, added), with added true if the leaf pathid is new.
-    fn add_path(&mut self, path: &Path) -> Result<(PartialPathId, bool), StorageError> {
+    fn add_path(&mut self, path: &Path) -> Result<(PathId, bool), StorageError> {
         let path = path.as_ref();
         let mut current = (self.root(), false);
         for component in path.components() {
@@ -630,9 +600,9 @@ impl<'a> WritableOpenTree<'a> {
     /// Return (pathid, added), with added true if the pathid is new.
     fn add_name(
         &mut self,
-        parent_pathid: PartialPathId,
+        parent_pathid: PathId,
         name: &str,
-    ) -> Result<(PartialPathId, bool), StorageError> {
+    ) -> Result<(PathId, bool), StorageError> {
         match get_pathid(&self.table, parent_pathid, name)? {
             Some(pathid) => Ok((pathid, false)),
             None => {
@@ -649,7 +619,7 @@ impl<'a> WritableOpenTree<'a> {
     /// This is called automatically by the insert methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn incref(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
+    fn incref(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
             .get(pathid)?
@@ -670,7 +640,7 @@ impl<'a> WritableOpenTree<'a> {
     /// This is called automatically by the remove methods in this
     /// class. Incrementing a reference should be tied to insertion in
     /// another table and removing to removal from another table.
-    fn decref(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
+    fn decref(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let mut refcount = self
             .refcount_table
             .get(pathid)?
@@ -687,7 +657,7 @@ impl<'a> WritableOpenTree<'a> {
         Ok(())
     }
 
-    fn check_refcount(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
+    fn check_refcount(&mut self, pathid: PathId) -> Result<(), StorageError> {
         let refcount = self
             .refcount_table
             .get(pathid)?
@@ -707,7 +677,7 @@ impl<'a> WritableOpenTree<'a> {
     /// Remove mapping of `pathid` from its parent.
     ///
     /// This must only be called after checking the pathid refcount.
-    fn remove_mapping(&mut self, pathid: PartialPathId) -> Result<(), StorageError> {
+    fn remove_mapping(&mut self, pathid: PathId) -> Result<(), StorageError> {
         log::trace!(
             "[{}] {pathid} lost its last reference; Cleaning up.",
             self.tag
@@ -723,14 +693,14 @@ impl<'a> WritableOpenTree<'a> {
         Ok(())
     }
 
-    fn allocate_pathid(&mut self) -> Result<PartialPathId, StorageError> {
+    fn allocate_pathid(&mut self) -> Result<PathId, StorageError> {
         pathid_allocator::allocate(&mut self.pathid_range_table)
     }
 
     fn add_pathid(
         &mut self,
-        parent_pathid: PartialPathId,
-        new_pathid: PartialPathId,
+        parent_pathid: PathId,
+        new_pathid: PathId,
         name: &str,
     ) -> Result<(), StorageError> {
         self.table.insert((parent_pathid, name), new_pathid)?;
@@ -742,17 +712,17 @@ impl<'a> WritableOpenTree<'a> {
 }
 
 fn lookup(
-    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
-    pathid: PartialPathId,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
     name: &str,
-) -> Result<Option<PartialPathId>, StorageError> {
+) -> Result<Option<PathId>, StorageError> {
     Ok(tree_table.get((pathid, name))?.map(|v| v.value()))
 }
 
 fn name_in(
-    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
-    parent_pathid: PartialPathId,
-    pathid: PartialPathId,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    parent_pathid: PathId,
+    pathid: PathId,
 ) -> Result<Option<String>, StorageError> {
     let pathid = pathid;
     for v in tree_table.range(pathid_range(parent_pathid))? {
@@ -771,15 +741,15 @@ fn name_in(
 }
 
 fn parent(
-    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
-    pathid: PartialPathId,
-) -> Result<Option<PartialPathId>, StorageError> {
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
+) -> Result<Option<PathId>, StorageError> {
     Ok(tree_table.get((pathid, ".."))?.map(|v| v.value()))
 }
 
 fn readdir(
-    tree_table: &impl ReadableTable<(PartialPathId, &'static str), PartialPathId>,
-    pathid: PartialPathId,
+    tree_table: &impl ReadableTable<(PathId, &'static str), PathId>,
+    pathid: PathId,
 ) -> ReadDirIterator<'_> {
     let range = tree_table
         .range(pathid_range(pathid))
@@ -790,8 +760,7 @@ fn readdir(
 
 /// Iterator returned by [TreeReadOperations::readdir]
 pub(crate) struct ReadDirIterator<'a> {
-    iter:
-        Option<Result<redb::Range<'a, (PartialPathId, &'static str), PartialPathId>, StorageError>>,
+    iter: Option<Result<redb::Range<'a, (PathId, &'static str), PathId>, StorageError>>,
 }
 
 impl<'a> ReadDirIterator<'a> {
@@ -807,7 +776,7 @@ impl<'a> ReadDirIterator<'a> {
 }
 
 impl<'a> Iterator for ReadDirIterator<'a> {
-    type Item = Result<(String, PartialPathId), StorageError>;
+    type Item = Result<(String, PathId), StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.iter {
@@ -836,10 +805,10 @@ impl<'a> Iterator for ReadDirIterator<'a> {
 }
 
 fn get_pathid(
-    table: &impl redb::ReadableTable<(PartialPathId, &'static str), PartialPathId>,
-    parent_pathid: PartialPathId,
+    table: &impl redb::ReadableTable<(PathId, &'static str), PathId>,
+    parent_pathid: PathId,
     name: &str,
-) -> Result<Option<PartialPathId>, StorageError> {
+) -> Result<Option<PathId>, StorageError> {
     match table.get((parent_pathid, name))? {
         None => Ok(None),
         Some(e) => Ok(Some(e.value())),
@@ -847,14 +816,14 @@ fn get_pathid(
 }
 
 /// Builds a range that covers all entries for the given pathid.
-fn pathid_range(pathid: PartialPathId) -> std::ops::Range<(PartialPathId, &'static str)> {
+fn pathid_range(pathid: PathId) -> std::ops::Range<(PathId, &'static str)> {
     (pathid, "")..(pathid.plus(1), "")
 }
 
 fn resolve_path(
     tree: &impl TreeReadOperations,
     path: &Path,
-) -> Result<Option<PartialPathId>, StorageError> {
+) -> Result<Option<PathId>, StorageError> {
     let mut current = tree.root();
     for component in path.components() {
         if let Some(e) = tree.lookup_pathid(current, component)? {
@@ -870,7 +839,7 @@ fn resolve_path(
 fn resolve_path_partial(
     tree: &impl TreeReadOperations,
     path: &Path,
-) -> Result<PartialPathId, StorageError> {
+) -> Result<PathId, StorageError> {
     let path = path.as_ref();
     let mut current = tree.root();
     for component in path.components() {
@@ -1117,7 +1086,7 @@ mod tests {
 
         // Invalid pathids are reported as NotFound
         assert!(matches!(
-            tree.backtrack(PartialPathId(999)),
+            tree.backtrack(PathId(999)),
             Err(StorageError::NotFound),
         ));
 
@@ -1136,7 +1105,7 @@ mod tests {
         assert_eq!(Some(tree.root()), tree.parent(foo)?);
         assert_eq!(Some(foo), tree.parent(bar)?);
         assert_eq!(Some(bar), tree.parent(baz)?);
-        assert_eq!(None, tree.parent(PartialPathId(999))?);
+        assert_eq!(None, tree.parent(PathId(999))?);
         assert_eq!(None, tree.parent(tree.root())?);
 
         Ok(())
@@ -1234,8 +1203,8 @@ mod tests {
         let bar_path = Path::parse("foo/bar")?;
         let qux_path = Path::parse("baz/qux")?;
         let baz_path = Path::parse("baz")?;
-        let qux: PartialPathId;
-        let baz: PartialPathId;
+        let qux: PathId;
+        let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
             let bar = tree.setup(&bar_path)?;
@@ -1271,8 +1240,8 @@ mod tests {
         let bar_path = Path::parse("foo/bar")?;
         let foo_path = Path::parse("foo")?;
 
-        let qux: PartialPathId;
-        let baz: PartialPathId;
+        let qux: PathId;
+        let baz: PathId;
         {
             let mut tree = txn.write_tree()?;
             let foo = tree.setup_name(tree.root(), "foo")?;

@@ -10,7 +10,7 @@ use crate::arena::tree::TreeReadOperations;
 use crate::arena::types::DirMetadata;
 use crate::arena::xattr;
 use crate::global::fs::FileContent;
-use crate::types::{PartialInode, PartialPathId};
+use crate::types::{PartialInode, PathId};
 use crate::{Blob, FileRealm};
 use crate::{Inode, StorageError};
 use realize_types::{Arena, Path, Peer};
@@ -443,10 +443,10 @@ impl ArenaFilesystem {
 }
 
 pub(crate) enum ArenaFsLoc {
-    PathId(PartialPathId),
+    PathId(PathId),
     Inode(PartialInode),
     Path(Path),
-    PathIdAndName(PartialPathId, String),
+    PathIdAndName(PathId, String),
     InodeAndName(PartialInode, String),
 }
 
@@ -466,8 +466,8 @@ impl ArenaFsLoc {
         })
     }
 }
-impl From<PartialPathId> for ArenaFsLoc {
-    fn from(value: PartialPathId) -> Self {
+impl From<PathId> for ArenaFsLoc {
+    fn from(value: PathId) -> Self {
         ArenaFsLoc::PathId(value)
     }
 }
@@ -496,19 +496,19 @@ impl From<&Path> for ArenaFsLoc {
     }
 }
 
-impl From<(PartialPathId, &str)> for ArenaFsLoc {
-    fn from(value: (PartialPathId, &str)) -> Self {
+impl From<(PathId, &str)> for ArenaFsLoc {
+    fn from(value: (PathId, &str)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
 
-impl From<(PartialPathId, &String)> for ArenaFsLoc {
-    fn from(value: (PartialPathId, &String)) -> Self {
+impl From<(PathId, &String)> for ArenaFsLoc {
+    fn from(value: (PathId, &String)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1.to_string())
     }
 }
-impl From<(PartialPathId, String)> for ArenaFsLoc {
-    fn from(value: (PartialPathId, String)) -> Self {
+impl From<(PathId, String)> for ArenaFsLoc {
+    fn from(value: (PathId, String)) -> Self {
         ArenaFsLoc::PathIdAndName(value.0, value.1)
     }
 }

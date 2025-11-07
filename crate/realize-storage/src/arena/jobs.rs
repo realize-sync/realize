@@ -2,7 +2,7 @@ use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
-use crate::types::PartialPathId;
+use crate::types::PathId;
 use crate::{JobId, JobStatus, StorageError};
 use realize_types::Hash;
 use std::fs::File;
@@ -79,11 +79,7 @@ impl StorageJobProcessor {
         }
     }
 
-    fn set_protected(
-        &self,
-        pathid: PartialPathId,
-        protected: bool,
-    ) -> Result<JobStatus, StorageError> {
+    fn set_protected(&self, pathid: PathId, protected: bool) -> Result<JobStatus, StorageError> {
         let txn = self.db.begin_write()?;
         {
             let tree = txn.read_tree()?;
@@ -100,7 +96,7 @@ impl StorageJobProcessor {
     /// Gives up and returns [JobStatus::Abandoned] if the current
     /// versions in the cache or the current version in the index
     /// don't match `hash`.
-    fn unrealize(&self, pathid: PartialPathId, hash: Hash) -> Result<JobStatus, StorageError> {
+    fn unrealize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let realpath: PathBuf;
         let cachepath: PathBuf;
         let _guard = self.db.cache().inhibit_watcher();
@@ -168,7 +164,7 @@ impl StorageJobProcessor {
     ///
     /// A `index_hash` value of `None` means that the file must not
     /// exit. If it exists, realize gives up and returns false.
-    fn realize(&self, pathid: PartialPathId, hash: Hash) -> Result<JobStatus, StorageError> {
+    fn realize(&self, pathid: PathId, hash: Hash) -> Result<JobStatus, StorageError> {
         let tag = self.db.tag();
         let source: PathBuf;
         let dest: PathBuf;
@@ -363,7 +359,7 @@ mod tests {
             Ok(buf)
         }
 
-        fn pathid(&self, path: &Path) -> anyhow::Result<PartialPathId> {
+        fn pathid(&self, path: &Path) -> anyhow::Result<PathId> {
             let txn = self.db.begin_read()?;
 
             Ok(txn.read_tree()?.expect(path)?)

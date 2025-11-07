@@ -1,7 +1,7 @@
 #![allow(dead_code)] // WIP
 use super::BlobInfo;
 use crate::arena::db::ArenaDatabase;
-use crate::types::PartialPathId;
+use crate::types::PathId;
 use crate::{CacheStatus, StorageError};
 use realize_types::{ByteRange, ByteRanges, Hash};
 use std::io::SeekFrom;
@@ -101,7 +101,7 @@ pub(crate) struct SharedBlobFile {
     id: BlobFileId,
     db: Arc<ArenaDatabase>,
     path: PathBuf,
-    pathid: PartialPathId,
+    pathid: PathId,
     size: u64,
     hash: Hash,
     tx_readable: watch::Sender<ReadableRange>,

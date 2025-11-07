@@ -13,7 +13,7 @@ use super::types::{
 };
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
-use crate::types::{PartialInode, PartialPathId};
+use crate::types::{PartialInode, PathId};
 use crate::utils::holder::Holder;
 use realize_types::Arena;
 use redb::TableDefinition;
@@ -40,14 +40,13 @@ const SETTINGS_TABLE: TableDefinition<(), Holder<SettingsTableEntry>> =
 ///
 /// Key: (pathid, name)
 /// Value: pathid
-pub(crate) const TREE_TABLE: TableDefinition<(PartialPathId, &str), PartialPathId> =
-    TableDefinition::new("tree");
+pub(crate) const TREE_TABLE: TableDefinition<(PathId, &str), PathId> = TableDefinition::new("tree");
 
 /// Refcount for tree nodes
 ///
 /// Key: pathid
 /// Value: u32 (refcount)
-pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PartialPathId, u32> =
+pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PathId, u32> =
     TableDefinition::new("tree_refcount");
 
 /// Track peer files.
@@ -61,7 +60,7 @@ pub(crate) const TREE_REFCOUNT_TABLE: TableDefinition<PartialPathId, u32> =
 ///
 /// Key: (PartialPathId, Layer) (layer, pathid)
 /// Value: CacheTableEntry
-const CACHE_TABLE: TableDefinition<(PartialPathId, Layer), Holder<CacheTableEntry>> =
+const CACHE_TABLE: TableDefinition<(PathId, Layer), Holder<CacheTableEntry>> =
     TableDefinition::new("cache");
 
 /// Track peer files that might have been deleted remotely.
@@ -73,7 +72,7 @@ const CACHE_TABLE: TableDefinition<(PartialPathId, Layer), Holder<CacheTableEntr
 ///
 /// Key: (peer, file pathid)
 /// Value: ()
-const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PartialPathId), ()> =
+const PENDING_CATCHUP_TABLE: TableDefinition<(&str, PathId), ()> =
     TableDefinition::new("pending_catchup");
 
 /// Track Peer UUIDs.
@@ -96,8 +95,7 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("not
 ///
 /// Key: BlodId
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<PartialPathId, Holder<BlobTableEntry>> =
-    TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<PathId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
 /// Track the next blob ID to be allocated.
 ///
@@ -118,15 +116,14 @@ const BLOB_LRU_QUEUE_TABLE: TableDefinition<u16, Holder<QueueTableEntry>> =
 ///
 /// Key: ()
 /// Value: (PartialPathId, PartialPathId) (last pathid allocated, end of range)
-pub(crate) const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
+pub(crate) const PATHID_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
     TableDefinition::new("pathid_range");
 
 /// Mark table for storing file marks within an Arena.
 ///
 /// Key: &str (path)
 /// Value: Holder<MarkTableEntry>
-const MARK_TABLE: TableDefinition<PartialPathId, Holder<MarkTableEntry>> =
-    TableDefinition::new("mark");
+const MARK_TABLE: TableDefinition<PathId, Holder<MarkTableEntry>> = TableDefinition::new("mark");
 
 /// Path marked dirty, indexed by path.
 ///
@@ -136,13 +133,13 @@ const MARK_TABLE: TableDefinition<PartialPathId, Holder<MarkTableEntry>> =
 ///
 /// Key: &str (path)
 /// Value: dirty counter (key of DIRTY_LOG_TABLE)
-const DIRTY_TABLE: TableDefinition<PartialPathId, u64> = TableDefinition::new("dirty");
+const DIRTY_TABLE: TableDefinition<PathId, u64> = TableDefinition::new("dirty");
 
 /// Path marked dirty, indexed by an increasing counter.
 ///
 /// Key: u64 (increasing counter)
 /// Value: &str (path)
-const DIRTY_LOG_TABLE: TableDefinition<u64, PartialPathId> = TableDefinition::new("dirty_log");
+const DIRTY_LOG_TABLE: TableDefinition<u64, PathId> = TableDefinition::new("dirty_log");
 
 /// Highest counter value for DIRTY_LOG_TABLE.
 ///
@@ -161,12 +158,12 @@ const FAILED_JOB_TABLE: TableDefinition<u64, Holder<FailedJobTableEntry>> =
 ///
 /// In most cases, pathids are converted to inodes directly. In some cases, however
 /// a mapping is required which is what this table and its reverse provide.
-const INODE_TO_PATHID_TABLE: TableDefinition<PartialInode, PartialPathId> =
+const INODE_TO_PATHID_TABLE: TableDefinition<PartialInode, PathId> =
     TableDefinition::new("inode_to_pathid");
 
 /// Maps [PartialPathId] to a partial inode value (that is, without
 /// ipath prefix); the reverse of [INODE_TO_PATHID_TABLE];
-const PATHID_TO_INODE_TABLE: TableDefinition<PartialPathId, PartialInode> =
+const PATHID_TO_INODE_TABLE: TableDefinition<PathId, PartialInode> =
     TableDefinition::new("pathid_to_inode");
 
 pub(crate) struct ArenaDatabase {

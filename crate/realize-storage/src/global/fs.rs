@@ -6,7 +6,7 @@ use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::pathid_allocator;
 use crate::global::types::PathTableEntry;
-use crate::types::{PartialInode, PathIdPrefix};
+use crate::types::{InodePrefix, PartialInode};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, StorageError};
 use realize_types::{Arena, Path, Peer};
@@ -111,7 +111,7 @@ impl Filesystem {
     ///
     /// Will return [StorageError::UnknownArena] unless the arena
     /// is available.
-    fn prefix(&self, arena: Arena) -> Result<PathIdPrefix, StorageError> {
+    fn prefix(&self, arena: Arena) -> Result<InodePrefix, StorageError> {
         self.allocator
             .prefix(arena)
             .ok_or_else(|| StorageError::UnknownArena(arena))
@@ -123,7 +123,7 @@ impl Filesystem {
     }
 
     /// Returns the FS for the given prefix or fail.
-    fn arena_fs_for_prefix(&self, prefix: PathIdPrefix) -> Result<&ArenaFilesystem, StorageError> {
+    fn arena_fs_for_prefix(&self, prefix: InodePrefix) -> Result<&ArenaFilesystem, StorageError> {
         let arena = self
             .allocator
             .arena_for_prefix(prefix)?
@@ -131,7 +131,7 @@ impl Filesystem {
         self.arena_fs(arena)
     }
 
-    fn arena_for_prefix(&self, prefix: PathIdPrefix) -> Result<Option<Arena>, StorageError> {
+    fn arena_for_prefix(&self, prefix: InodePrefix) -> Result<Option<Arena>, StorageError> {
         self.allocator.arena_for_prefix(prefix)
     }
 
@@ -180,7 +180,7 @@ impl Filesystem {
     fn resolve_arena_loc<L: Into<FsLoc>>(
         &self,
         loc: L,
-    ) -> Result<(&ArenaFilesystem, PathIdPrefix, ArenaFsLoc), StorageError> {
+    ) -> Result<(&ArenaFilesystem, InodePrefix, ArenaFsLoc), StorageError> {
         Ok(match self.resolve_arena_root(loc.into()) {
             FsLoc::Inode(inode) => {
                 let prefix = inode.prefix();
@@ -212,7 +212,7 @@ impl Filesystem {
         if let FsLoc::InodeAndName(inode, name) = &loc {
             if let Some(PathTableEntry { subdirs, .. }) = self.globals.get(&inode) {
                 if let Some(inode) = subdirs.get(name) {
-                    if inode.is_partial_root() {
+                    if inode.is_arena_root() {
                         return FsLoc::Inode(*inode);
                     }
                 }
@@ -632,7 +632,7 @@ impl From<(Inode, String)> for FsLoc {
 
 enum ResolvedLoc<'a> {
     Global(Option<(Inode, &'a PathTableEntry)>),
-    InArena(Arena, PathIdPrefix, ArenaFsLoc),
+    InArena(Arena, InodePrefix, ArenaFsLoc),
 }
 
 fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()> {
@@ -657,7 +657,7 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 /// Register root of the given arena in the PATH_TABLE.
 fn add_arena_path(
     arena: Arena,
-    prefix: PathIdPrefix,
+    prefix: InodePrefix,
     txn: &GlobalWriteTransaction,
     path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
 ) -> Result<(), StorageError> {
@@ -670,7 +670,7 @@ fn add_arena_path(
         for dirname in parent.components() {
             match current_entry.subdirs.get(dirname) {
                 Some(inode) => {
-                    if inode.is_partial_root() {
+                    if inode.is_arena_root() {
                         return Err(StorageError::AlreadyExists);
                     }
                     current = *inode;
@@ -873,7 +873,7 @@ mod tests {
         for (name, inode, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    if inode.is_partial_root() {
+                    if inode.is_arena_root() {
                         // arena root is writable
                         assert_eq!(0o777, dir_meta.mode);
                     } else {
@@ -897,7 +897,7 @@ mod tests {
         for (name, inode, metadata) in entries {
             match metadata {
                 crate::arena::types::Metadata::Dir(dir_meta) => {
-                    if inode.is_partial_root() {
+                    if inode.is_arena_root() {
                         // arena root is writable
                         assert_eq!(0o777, dir_meta.mode);
                     } else {

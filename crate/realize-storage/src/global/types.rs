@@ -1,5 +1,5 @@
 use crate::Inode;
-use crate::types::PathIdPrefix;
+use crate::types::InodePrefix;
 use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
@@ -91,7 +91,7 @@ impl ByteConvertible<PathTableEntry> for PathTableEntry {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ArenaTableEntry {
-    pub(crate) prefix: PathIdPrefix,
+    pub(crate) prefix: InodePrefix,
 }
 
 impl NamedType for ArenaTableEntry {
@@ -106,7 +106,7 @@ impl ByteConvertible<ArenaTableEntry> for ArenaTableEntry {
         let msg: cache_capnp::arena_table_entry::Reader =
             message_reader.get_root::<cache_capnp::arena_table_entry::Reader>()?;
 
-        let prefix = PathIdPrefix::from_u8(msg.get_prefix());
+        let prefix = InodePrefix::from_u8(msg.get_prefix());
 
         return Ok(ArenaTableEntry { prefix });
     }
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn convert_arena_table_entry() -> anyhow::Result<()> {
         let entry = ArenaTableEntry {
-            prefix: PathIdPrefix::from_u8(9),
+            prefix: InodePrefix::from_u8(9),
         };
         assert_eq!(
             entry,

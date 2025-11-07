@@ -1,5 +1,5 @@
 use crate::global::types::{ArenaTableEntry, PathTableEntry};
-use crate::types::PartialPathId;
+use crate::types::PathId;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
 use redb::{ReadOnlyTable, Table, TableDefinition};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 ///
 /// Key: ()
 /// Value: (PathId, PathId) (last pathid allocated, end of range)
-const PATHID_RANGE_TABLE: TableDefinition<(), (PartialPathId, PartialPathId)> =
+const PATHID_RANGE_TABLE: TableDefinition<(), (PathId, PathId)> =
     TableDefinition::new("pathid_range");
 
 /// Store arena definitions.
@@ -90,7 +90,7 @@ impl GlobalWriteTransaction {
 
     pub fn pathid_range_table<'txn>(
         &'txn self,
-    ) -> Result<Table<'txn, (), (PartialPathId, PartialPathId)>, StorageError> {
+    ) -> Result<Table<'txn, (), (PathId, PathId)>, StorageError> {
         Ok(self.inner.open_table(PATHID_RANGE_TABLE)?)
     }
 

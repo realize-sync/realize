@@ -1,14 +1,22 @@
 use redb::{Key, TypeName, Value};
 
+/// A prefix that identifies a subset [Inode]s.
+///
+/// The inode subset is used to identify the arena an inode belongs
+/// to. An [Inode] always has a prefix and a arena-specific value, a
+/// [PartialInode] has only an arena-specific value.
+///
+/// The special prefix [InodePrefix::ZERO] is used to identify inodes
+/// that are not part of any arenas.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PathIdPrefix(u8);
+pub struct InodePrefix(u8);
 
-impl PathIdPrefix {
+impl InodePrefix {
     pub(crate) const MASK: u64 = 0x00ffffffffffffff;
-    pub const ZERO: PathIdPrefix = PathIdPrefix(0);
+    pub const ZERO: InodePrefix = InodePrefix(0);
 
-    pub fn from_u8(val: u8) -> PathIdPrefix {
-        PathIdPrefix(val)
+    pub fn from_u8(val: u8) -> InodePrefix {
+        InodePrefix(val)
     }
 
     pub fn as_u64(&self) -> u64 {
@@ -20,49 +28,55 @@ impl PathIdPrefix {
     }
 }
 
-impl From<u64> for PathIdPrefix {
+impl From<u64> for InodePrefix {
     fn from(value: u64) -> Self {
-        PathIdPrefix((value >> 56) as u8)
+        InodePrefix((value >> 56) as u8)
     }
 }
 
-impl std::fmt::Display for PathIdPrefix {
+impl std::fmt::Display for InodePrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:x}+", self.0)
     }
 }
 
-impl std::fmt::Debug for PathIdPrefix {
+impl std::fmt::Debug for InodePrefix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PathIdPrefix({:x})", self.0)
     }
 }
 
-/// A local pathid number.
+/// An arena-specific number that identifies a path.
 ///
-/// Combine it with a [PathIdPrefix] to make it a globl [PathId]
+/// A [PathId] is a unique (within its arena) and stable way of
+/// identifying a path that exists whithin an arena.
+///
+/// In general [PathIds] from different arenas can't be compared. The
+/// single exception to this rule being [PathId::ROOT], which
+/// identifies the root of any arena.
+///
+/// [PathId]s are converted to [PartialInode] using
+/// [crate::arena::CacheReadOperations] then associated with the
+/// arena's [InodePrefix] to form an [Inode].
 ///
 /// This type can be used as a key or value in redb database schemas.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PartialPathId(pub u64);
+pub struct PathId(pub u64);
 
-impl PartialPathId {
-    pub const ZERO: PartialPathId = PartialPathId(0);
-    pub const ROOT: PartialPathId = PartialPathId(1);
-    pub const MAX: PartialPathId = PartialPathId(PathIdPrefix::MASK);
+impl PathId {
+    /// An invalid path id.
+    pub const ZERO: PathId = PathId(0);
 
-    /// Create a new PathId from a u64 value.
-    pub fn new(value: u64) -> Self {
-        Self(value)
-    }
+    /// Special path id used to identify the root.
+    pub const ROOT: PathId = PathId(1);
 
-    /// Add a prefix to this local id, make it a [PathId].
-    pub fn to_inode(&self, prefix: PathIdPrefix) -> Inode {
-        PartialInode::from(self).to_inode(prefix)
-    }
+    /// Maximum allowed pathid value.
+    pub const MAX: PathId = PathId(InodePrefix::MASK);
 
-    pub fn is_partial_root(&self) -> bool {
-        *self == PartialPathId::ROOT
+    /// Return true if this is the special path id 1, which identifies
+    /// a root.
+    pub fn is_arena_root(&self) -> bool {
+        *self == PathId::ROOT
     }
 
     /// Get the underlying u64 value.
@@ -70,12 +84,12 @@ impl PartialPathId {
         self.0
     }
 
-    pub fn plus(&self, val: u64) -> PartialPathId {
-        PartialPathId(self.0 + val)
+    pub fn plus(&self, val: u64) -> PathId {
+        PathId(self.0 + val)
     }
 
-    pub fn minus(&self, val: u64) -> PartialPathId {
-        PartialPathId(self.0 - val)
+    pub fn minus(&self, val: u64) -> PathId {
+        PathId(self.0 - val)
     }
 
     pub fn as_u64(&self) -> u64 {
@@ -90,50 +104,44 @@ impl PartialPathId {
         format!("{:016x}", self.0)
     }
 
-    pub fn as_optional(pathid: u64) -> Option<PartialPathId> {
+    pub fn as_optional(pathid: u64) -> Option<PathId> {
         if pathid == 0 {
             None
         } else {
-            Some(PartialPathId(pathid))
+            Some(PathId(pathid))
         }
     }
 
-    pub fn from_optional(pathid: Option<PartialPathId>) -> u64 {
+    pub fn from_optional(pathid: Option<PathId>) -> u64 {
         pathid.map(|i| i.0).unwrap_or(0)
     }
 }
 
-impl From<PartialInode> for PartialPathId {
+impl From<PartialInode> for PathId {
     fn from(value: PartialInode) -> Self {
-        PartialPathId(value.as_u64())
+        PathId(value.as_u64())
     }
 }
 
-impl From<&PartialInode> for PartialPathId {
+impl From<&PartialInode> for PathId {
     fn from(value: &PartialInode) -> Self {
-        PartialPathId(value.as_u64())
+        PathId(value.as_u64())
     }
 }
 
-impl From<u64> for PartialPathId {
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl std::fmt::Display for PartialPathId {
+impl std::fmt::Display for PathId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "_+{:x}", self.0)
     }
 }
 
-impl std::fmt::Debug for PartialPathId {
+impl std::fmt::Debug for PathId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PartialPathId({:x})", self.0)
+        write!(f, "PathId({:x})", self.0)
     }
 }
 
-impl Key for PartialPathId {
+impl Key for PathId {
     fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
         let value1 = u64::from_le_bytes(data1.try_into().unwrap_or([0; 8]));
         let value2 = u64::from_le_bytes(data2.try_into().unwrap_or([0; 8]));
@@ -141,8 +149,8 @@ impl Key for PartialPathId {
     }
 }
 
-impl Value for PartialPathId {
-    type SelfType<'a> = PartialPathId;
+impl Value for PathId {
+    type SelfType<'a> = PathId;
     type AsBytes<'a>
         = [u8; 8]
     where
@@ -152,11 +160,11 @@ impl Value for PartialPathId {
         Some(8)
     }
 
-    fn from_bytes<'a>(data: &'a [u8]) -> PartialPathId
+    fn from_bytes<'a>(data: &'a [u8]) -> PathId
     where
         Self: 'a,
     {
-        PartialPathId(<u64>::from_le_bytes(data.try_into().unwrap_or([0; 8])))
+        PathId(<u64>::from_le_bytes(data.try_into().unwrap_or([0; 8])))
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; 8]
@@ -168,7 +176,7 @@ impl Value for PartialPathId {
     }
 
     fn type_name() -> TypeName {
-        TypeName::new("PartialPathId")
+        TypeName::new("PathId")
     }
 }
 
@@ -184,23 +192,23 @@ impl Inode {
     pub const ROOT: Inode = Inode(1);
 
     /// Create a new Inode from a u64 value.
-    pub fn new(prefix: PathIdPrefix, partial: PartialInode) -> Self {
-        Self(prefix.as_u64() | (partial.as_u64() & PathIdPrefix::MASK))
+    pub fn new(prefix: InodePrefix, partial: PartialInode) -> Self {
+        Self(prefix.as_u64() | (partial.as_u64() & InodePrefix::MASK))
     }
 
     /// Check whether the corresponding [PartialInode] is a root.
-    pub fn is_partial_root(&self) -> bool {
+    pub fn is_arena_root(&self) -> bool {
         self.partial() == PartialInode::ROOT
     }
 
     /// Return the [PartialInode] that's part of this inode.
     pub fn partial(&self) -> PartialInode {
-        PartialInode(self.0 & PathIdPrefix::MASK)
+        PartialInode(self.0 & InodePrefix::MASK)
     }
 
     /// Return the inode prefix
-    pub fn prefix(&self) -> PathIdPrefix {
-        PathIdPrefix((self.0 >> 56) as u8)
+    pub fn prefix(&self) -> InodePrefix {
+        InodePrefix((self.0 >> 56) as u8)
     }
 
     /// Get the underlying u64 value.
@@ -290,11 +298,11 @@ impl PartialInode {
     pub const MAX: PartialInode = PartialInode(u64::MAX);
     pub const ROOT: PartialInode = PartialInode(1);
 
-    pub fn to_inode(&self, prefix: PathIdPrefix) -> Inode {
+    pub fn to_inode(&self, prefix: InodePrefix) -> Inode {
         Inode::new(prefix, *self)
     }
 
-    pub fn is_partial_root(&self) -> bool {
+    pub fn is_arena_root(&self) -> bool {
         *self == PartialInode::ROOT
     }
 
@@ -319,14 +327,14 @@ impl PartialInode {
     }
 }
 
-impl From<PartialPathId> for PartialInode {
-    fn from(value: PartialPathId) -> Self {
+impl From<PathId> for PartialInode {
+    fn from(value: PathId) -> Self {
         PartialInode(value.as_u64())
     }
 }
 
-impl From<&PartialPathId> for PartialInode {
-    fn from(value: &PartialPathId) -> Self {
+impl From<&PathId> for PartialInode {
+    fn from(value: &PathId) -> Self {
         PartialInode(value.as_u64())
     }
 }
@@ -441,16 +449,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn partial_and_full_pathid() {
-        let prefix = PathIdPrefix(0x12);
-        let partial = PartialPathId(0x133);
-        let inode = partial.to_inode(prefix);
-        assert_eq!(0x1200000000000133, inode.as_u64());
-    }
-
-    #[test]
     fn partial_and_full_inode() {
-        let prefix = PathIdPrefix(0x12);
+        let prefix = InodePrefix(0x12);
         let partial = PartialInode(0x133);
         let full = partial.to_inode(prefix);
         assert_eq!(0x1200000000000133, full.as_u64());
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn pathid_prefix() {
-        let prefix = PathIdPrefix(0x12);
+        let prefix = InodePrefix(0x12);
         assert_eq!(0x12, prefix.as_u8());
         assert_eq!(0x1200000000000000, prefix.as_u64());
         assert_eq!("PathIdPrefix(12)", format!("{:?}", prefix));
@@ -469,71 +469,62 @@ mod tests {
 
     #[test]
     fn pathid_display() {
-        assert_eq!("2b+", format!("{}", PathIdPrefix(43)));
-        assert_eq!("PathIdPrefix(2b)", format!("{:?}", PathIdPrefix(43)));
-        assert_eq!("_+19d", format!("{}", PartialPathId(413)));
-        assert_eq!("PartialPathId(19d)", format!("{:?}", PartialPathId(413)));
+        assert_eq!("2b+", format!("{}", InodePrefix(43)));
+        assert_eq!("PathIdPrefix(2b)", format!("{:?}", InodePrefix(43)));
+        assert_eq!("_+19d", format!("{}", PathId(413)));
+        assert_eq!("PathId(19d)", format!("{:?}", PathId(413)));
     }
 
     #[test]
-    fn partial_pathid_redb_key() {
-        let pathid1 = PartialPathId(100);
-        let pathid2 = PartialPathId(200);
-        let pathid3 = PartialPathId(100);
+    fn pathid_redb_key() {
+        let pathid1 = PathId(100);
+        let pathid2 = PathId(200);
+        let pathid3 = PathId(100);
 
-        let data1 = PartialPathId::as_bytes(&pathid1);
-        let data2 = PartialPathId::as_bytes(&pathid2);
-        let data3 = PartialPathId::as_bytes(&pathid3);
+        let data1 = PathId::as_bytes(&pathid1);
+        let data2 = PathId::as_bytes(&pathid2);
+        let data3 = PathId::as_bytes(&pathid3);
 
-        assert_eq!(
-            PartialPathId::compare(&data1, &data2),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            PartialPathId::compare(&data2, &data1),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            PartialPathId::compare(&data1, &data3),
-            std::cmp::Ordering::Equal
-        );
+        assert_eq!(PathId::compare(&data1, &data2), std::cmp::Ordering::Less);
+        assert_eq!(PathId::compare(&data2, &data1), std::cmp::Ordering::Greater);
+        assert_eq!(PathId::compare(&data1, &data3), std::cmp::Ordering::Equal);
     }
 
     #[test]
-    fn partial_pathid_redb_value() {
-        let original = PartialPathId(12345);
-        let bytes = PartialPathId::as_bytes(&original);
-        let restored = PartialPathId::from_bytes(&bytes);
+    fn pathid_redb_value() {
+        let original = PathId(12345);
+        let bytes = PathId::as_bytes(&original);
+        let restored = PathId::from_bytes(&bytes);
 
         assert_eq!(original, restored);
     }
 
     #[test]
-    fn partial_pathid_redb_value_edge_cases() {
+    fn pathid_redb_value_edge_cases() {
         // Test zero
-        let zero = PartialPathId(0);
-        let zero_bytes = PartialPathId::as_bytes(&zero);
-        let zero_restored = PartialPathId::from_bytes(&zero_bytes);
+        let zero = PathId(0);
+        let zero_bytes = PathId::as_bytes(&zero);
+        let zero_restored = PathId::from_bytes(&zero_bytes);
         assert_eq!(zero, zero_restored);
 
         // Test maximum u64 value
-        let max = PartialPathId(u64::MAX);
-        let max_bytes = PartialPathId::as_bytes(&max);
-        let max_restored = PartialPathId::from_bytes(&max_bytes);
+        let max = PathId(u64::MAX);
+        let max_bytes = PathId::as_bytes(&max);
+        let max_restored = PathId::from_bytes(&max_bytes);
         assert_eq!(max, max_restored);
     }
 
     #[test]
-    fn partial_pathid_redb_value_invalid_data() {
+    fn pathid_redb_value_invalid_data() {
         // Test with insufficient data (should handle gracefully)
         let short_data = &[1, 2, 3]; // Less than 8 bytes
-        let restored = PartialPathId::from_bytes(short_data);
+        let restored = PathId::from_bytes(short_data);
         // Should default to 0 or handle gracefully
         assert_eq!(restored.as_u64(), 0);
 
         // Test with exactly 8 bytes
         let valid_data = &[1, 0, 0, 0, 0, 0, 0, 0]; // Little endian 1
-        let restored = PartialPathId::from_bytes(valid_data);
+        let restored = PathId::from_bytes(valid_data);
         assert_eq!(restored.as_u64(), 1);
     }
 }

@@ -8,7 +8,7 @@ use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
 use super::types::Mark;
 use super::types::MarkTableEntry;
 use crate::StorageError;
-use crate::types::PartialPathId;
+use crate::types::PathId;
 use crate::utils::holder::Holder;
 use redb::{ReadableTable, Table};
 
@@ -91,14 +91,14 @@ pub(crate) fn clear_arena_mark<'a, L: Into<TreeLoc<'a>>>(
 
 pub(crate) struct ReadableOpenMark<T>
 where
-    T: ReadableTable<PartialPathId, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
     table: T,
 }
 
 impl<T> ReadableOpenMark<T>
 where
-    T: ReadableTable<PartialPathId, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
     pub(crate) fn new(table: T) -> Self {
         Self { table }
@@ -106,11 +106,11 @@ where
 }
 
 pub(crate) struct WritableOpenMark<'a> {
-    table: Table<'a, PartialPathId, Holder<'static, MarkTableEntry>>,
+    table: Table<'a, PathId, Holder<'static, MarkTableEntry>>,
 }
 
 impl<'a> WritableOpenMark<'a> {
-    pub(crate) fn new(table: Table<'a, PartialPathId, Holder<MarkTableEntry>>) -> Self {
+    pub(crate) fn new(table: Table<'a, PathId, Holder<MarkTableEntry>>) -> Self {
         Self { table }
     }
 }
@@ -123,18 +123,18 @@ pub(crate) trait MarkReadOperations {
     fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PartialPathId,
+        pathid: PathId,
     ) -> Result<(Mark, bool), StorageError>;
 }
 
 impl<T> MarkReadOperations for ReadableOpenMark<T>
 where
-    T: ReadableTable<PartialPathId, Holder<'static, MarkTableEntry>>,
+    T: ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
 {
     fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PartialPathId,
+        pathid: PathId,
     ) -> Result<(Mark, bool), StorageError> {
         get_at_pathid(&self.table, tree, pathid)
     }
@@ -144,7 +144,7 @@ impl<'a> MarkReadOperations for WritableOpenMark<'a> {
     fn get_at_pathid(
         &self,
         tree: &impl TreeReadOperations,
-        pathid: PartialPathId,
+        pathid: PathId,
     ) -> Result<(Mark, bool), StorageError> {
         get_at_pathid(&self.table, tree, pathid)
     }
@@ -244,9 +244,9 @@ impl<'a> WritableOpenMark<'a> {
 }
 
 fn get_at_pathid(
-    mark_table: &impl ReadableTable<PartialPathId, Holder<'static, MarkTableEntry>>,
+    mark_table: &impl ReadableTable<PathId, Holder<'static, MarkTableEntry>>,
     tree: &impl TreeReadOperations,
-    pathid: PartialPathId,
+    pathid: PathId,
 ) -> Result<(Mark, bool), StorageError> {
     if let Some(e) = mark_table.get(pathid)? {
         return Ok((e.value().parse()?.mark, true));
@@ -293,9 +293,7 @@ mod tests {
         dirty.delete_range(0, 999)
     }
 
-    fn dirty_pathids(
-        dirty: &impl DirtyReadOperations,
-    ) -> Result<HashSet<PartialPathId>, StorageError> {
+    fn dirty_pathids(dirty: &impl DirtyReadOperations) -> Result<HashSet<PathId>, StorageError> {
         let mut start = 0;
         let mut pathids = HashSet::new();
         while let Some((pathid, counter)) = dirty.next_dirty(start)? {

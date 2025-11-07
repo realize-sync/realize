@@ -1,6 +1,6 @@
 use super::db::GlobalWriteTransaction;
 use crate::global::types::ArenaTableEntry;
-use crate::types::{PartialInode, PartialPathId, PathIdPrefix};
+use crate::types::{InodePrefix, PartialInode, PathId};
 use crate::utils::holder::Holder;
 use crate::{GlobalDatabase, Inode, StorageError};
 use bimap::BiMap;
@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 /// Allocate pathid ranges and assign them to arenas.
 pub(crate) struct PathIdAllocator {
-    prefixes: RwLock<BiMap<Arena, PathIdPrefix>>,
+    prefixes: RwLock<BiMap<Arena, InodePrefix>>,
 }
 
 impl PathIdAllocator {
@@ -37,7 +37,7 @@ impl PathIdAllocator {
     /// Return the prefix of the given arena.
     ///
     /// The arena must have been added to this allocator.
-    pub(crate) fn prefix(&self, arena: Arena) -> Option<PathIdPrefix> {
+    pub(crate) fn prefix(&self, arena: Arena) -> Option<InodePrefix> {
         self.prefixes
             .read()
             .unwrap()
@@ -48,9 +48,9 @@ impl PathIdAllocator {
     /// Maps prefixes to arenas.
     pub(crate) fn arena_for_prefix(
         &self,
-        prefix: PathIdPrefix,
+        prefix: InodePrefix,
     ) -> Result<Option<Arena>, StorageError> {
-        if prefix == PathIdPrefix::ZERO {
+        if prefix == InodePrefix::ZERO {
             return Ok(None);
         }
         if let Some(arena) = self.prefixes.read().unwrap().get_by_right(&prefix) {
@@ -63,7 +63,7 @@ impl PathIdAllocator {
         &self,
         txn: &GlobalWriteTransaction,
         arena: Arena,
-    ) -> Result<PathIdPrefix, StorageError> {
+    ) -> Result<InodePrefix, StorageError> {
         let mut arena_table = txn.arena_table()?;
         // Check again, as the database is the source of truth and
         // it could can be temporarily inconsistent with
@@ -77,7 +77,7 @@ impl PathIdAllocator {
                 let (_, pathid) = value?;
                 max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
             }
-            prefix = PathIdPrefix::from_u8(max_prefix + 1);
+            prefix = InodePrefix::from_u8(max_prefix + 1);
             arena_table.insert(
                 arena.as_str(),
                 Holder::with_content(ArenaTableEntry { prefix })?,
@@ -93,17 +93,17 @@ impl PathIdAllocator {
 
 /// Allocate a new pathid in [GlobalDatabase].
 pub(crate) fn allocal_global_inode(txn: &GlobalWriteTransaction) -> Result<Inode, StorageError> {
-    Ok(PartialInode::from(allocate(&mut txn.pathid_range_table()?)?).to_inode(PathIdPrefix::ZERO))
+    Ok(PartialInode::from(allocate(&mut txn.pathid_range_table()?)?).to_inode(InodePrefix::ZERO))
 }
 
 /// Allocate a new pathid, using the given table and prefix.
 /// allocation function.
 pub(crate) fn allocate(
-    current_range_table: &mut redb::Table<'_, (), (PartialPathId, PartialPathId)>,
-) -> Result<PartialPathId, StorageError> {
+    current_range_table: &mut redb::Table<'_, (), (PathId, PathId)>,
+) -> Result<PathId, StorageError> {
     let (current, end) = match current_range_table.get(())? {
         Some(value) => value.value(),
-        None => (PartialPathId::ROOT, PartialPathId::MAX),
+        None => (PathId::ROOT, PathId::MAX),
     };
     if current < end {
         let pathid = current.plus(1);
@@ -158,7 +158,7 @@ mod tests {
             self.arena_dbs.get(&arena).unwrap()
         }
 
-        fn allocate_arena_pathid(&self, arena: Arena) -> Result<PartialPathId, StorageError> {
+        fn allocate_arena_pathid(&self, arena: Arena) -> Result<PathId, StorageError> {
             let txn = self.arena_db(arena).begin_write()?;
             let pathid = super::allocate(&mut txn.pathid_range_table()?)?;
             txn.commit()?;
@@ -173,8 +173,8 @@ mod tests {
         let b = Arena::from("b");
         let fixture = Fixture::setup([a, b])?;
 
-        assert_eq!(Some(PathIdPrefix::from_u8(1)), fixture.allocator.prefix(a));
-        assert_eq!(Some(PathIdPrefix::from_u8(2)), fixture.allocator.prefix(b));
+        assert_eq!(Some(InodePrefix::from_u8(1)), fixture.allocator.prefix(a));
+        assert_eq!(Some(InodePrefix::from_u8(2)), fixture.allocator.prefix(b));
         assert!(fixture.allocator.prefix(Arena::from("notadded")).is_none());
 
         Ok(())
@@ -204,26 +204,26 @@ mod tests {
         let c = Arena::from("c");
         let fixture = Fixture::setup([a, b, c])?;
 
-        let a_prefix = PathIdPrefix::from_u8(1);
-        let b_prefix = PathIdPrefix::from_u8(2);
-        let c_prefix = PathIdPrefix::from_u8(3);
+        let a_prefix = InodePrefix::from_u8(1);
+        let b_prefix = InodePrefix::from_u8(2);
+        let c_prefix = InodePrefix::from_u8(3);
 
         assert_eq!(Some(a_prefix), fixture.allocator.prefix(a));
         assert_eq!(Some(b_prefix), fixture.allocator.prefix(b));
         assert_eq!(Some(c_prefix), fixture.allocator.prefix(c));
 
         // 1 is root, so everything starts at 2
-        assert_eq!(PartialPathId(2), fixture.allocate_arena_pathid(a)?);
-        assert_eq!(PartialPathId(3), fixture.allocate_arena_pathid(a)?);
-        assert_eq!(PartialPathId(4), fixture.allocate_arena_pathid(a)?);
+        assert_eq!(PathId(2), fixture.allocate_arena_pathid(a)?);
+        assert_eq!(PathId(3), fixture.allocate_arena_pathid(a)?);
+        assert_eq!(PathId(4), fixture.allocate_arena_pathid(a)?);
 
-        assert_eq!(PartialPathId(2), fixture.allocate_arena_pathid(b)?);
-        assert_eq!(PartialPathId(3), fixture.allocate_arena_pathid(b)?);
-        assert_eq!(PartialPathId(4), fixture.allocate_arena_pathid(b)?);
+        assert_eq!(PathId(2), fixture.allocate_arena_pathid(b)?);
+        assert_eq!(PathId(3), fixture.allocate_arena_pathid(b)?);
+        assert_eq!(PathId(4), fixture.allocate_arena_pathid(b)?);
 
-        assert_eq!(PartialPathId(2), fixture.allocate_arena_pathid(c)?);
-        assert_eq!(PartialPathId(3), fixture.allocate_arena_pathid(c)?);
-        assert_eq!(PartialPathId(4), fixture.allocate_arena_pathid(c)?);
+        assert_eq!(PathId(2), fixture.allocate_arena_pathid(c)?);
+        assert_eq!(PathId(3), fixture.allocate_arena_pathid(c)?);
+        assert_eq!(PathId(4), fixture.allocate_arena_pathid(c)?);
 
         Ok(())
     }
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn arena_for_prefix_global() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
-        let result = fixture.allocator.arena_for_prefix(PathIdPrefix::ZERO)?;
+        let result = fixture.allocator.arena_for_prefix(InodePrefix::ZERO)?;
         assert_eq!(None, result);
 
         Ok(())
@@ -252,9 +252,7 @@ mod tests {
     #[test]
     fn arena_for_pathid_not_found() -> anyhow::Result<()> {
         let fixture = Fixture::setup([])?;
-        let result = fixture
-            .allocator
-            .arena_for_prefix(PathIdPrefix::from_u8(99));
+        let result = fixture.allocator.arena_for_prefix(InodePrefix::from_u8(99));
 
         assert!(result.is_err());
         match result {
@@ -272,9 +270,9 @@ mod tests {
         let txn = fixture.arena_db(arena).begin_write()?;
         {
             let mut table = txn.pathid_range_table()?;
-            table.insert((), (PartialPathId::MAX.minus(2), PartialPathId::MAX))?;
-            assert_eq!(PartialPathId::MAX.minus(1), allocate(&mut table)?);
-            assert_eq!(PartialPathId::MAX, allocate(&mut table)?);
+            table.insert((), (PathId::MAX.minus(2), PathId::MAX))?;
+            assert_eq!(PathId::MAX.minus(1), allocate(&mut table)?);
+            assert_eq!(PathId::MAX, allocate(&mut table)?);
             assert!(matches!(
                 allocate(&mut table),
                 Err(StorageError::PathIdSpaceExhausted)

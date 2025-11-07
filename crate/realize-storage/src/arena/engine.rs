@@ -6,7 +6,7 @@ use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::CacheStatus;
 use crate::arena::tree::TreeReadOperations;
-use crate::types::{JobId, PartialPathId};
+use crate::types::{JobId, PathId};
 use crate::{Mark, StorageError};
 use realize_types::{Hash, Path, UnixTime};
 use std::sync::Arc;
@@ -50,22 +50,22 @@ pub(crate) enum StorageJob {
     /// If the cache already has a newer version, the indexed file is
     /// just dropped.
     Unrealize {
-        pathid: PartialPathId,
+        pathid: PathId,
         indexed_hash: Hash,
     },
 
     /// Realize the given file with `counter`, moving `Hash` from
     /// cache to the index, currently containing nothing or `Hash`.
     Realize {
-        pathid: PartialPathId,
+        pathid: PathId,
         hash: Hash,
     },
 
     /// Move the blob to the protected queue.
-    ProtectBlob(PartialPathId),
+    ProtectBlob(PathId),
 
     /// Move the blob to the unprotected queue.
-    UnprotectBlob(PartialPathId),
+    UnprotectBlob(PathId),
 }
 
 impl StorageJob {
@@ -431,7 +431,7 @@ impl Engine {
         &self,
         txn: &ArenaReadTransaction,
         tree: &impl TreeReadOperations,
-        pathid: PartialPathId,
+        pathid: PathId,
     ) -> Result<Option<StorageJob>, StorageError> {
         let cache = txn.read_cache()?;
         let blobs = txn.read_blobs()?;
@@ -765,7 +765,7 @@ mod tests {
             Ok(())
         }
 
-        fn pathid(&self, path: &Path) -> anyhow::Result<PartialPathId> {
+        fn pathid(&self, path: &Path) -> anyhow::Result<PathId> {
             let txn = self.db.begin_read()?;
 
             Ok(txn.read_tree()?.expect(path)?)
