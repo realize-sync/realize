@@ -1,95 +1,7 @@
 use super::db::GlobalWriteTransaction;
-use crate::global::types::ArenaTableEntry;
 use crate::types::{InodePrefix, PartialInode, PathId};
-use crate::utils::holder::Holder;
-use crate::{GlobalDatabase, Inode, StorageError};
-use bimap::BiMap;
-use realize_types::Arena;
+use crate::{Inode, StorageError};
 use redb::ReadableTable;
-use std::sync::{Arc, RwLock};
-
-/// Allocate pathid ranges and assign them to arenas.
-pub(crate) struct PathIdAllocator {
-    prefixes: RwLock<BiMap<Arena, InodePrefix>>,
-}
-
-impl PathIdAllocator {
-    /// Create a new allocator, backed by the given global database.
-    ///
-    /// An arena root is allocated for all arenas in `arenas` and
-    /// stored in the database for next time..
-    pub(crate) fn setup(db: &Arc<GlobalDatabase>) -> Result<Arc<Self>, StorageError> {
-        let txn = db.begin_read()?;
-        let table = txn.arena_table()?;
-        let mut prefixes = BiMap::new();
-        for value in table.iter()? {
-            let (arena, entry) = value?;
-            let arena = Arena::from(arena.value());
-            let ArenaTableEntry { prefix } = entry.value().parse()?;
-            prefixes.insert(arena, prefix);
-        }
-
-        Ok(Arc::new(Self {
-            prefixes: RwLock::new(prefixes),
-        }))
-    }
-
-    /// Return the prefix of the given arena.
-    ///
-    /// The arena must have been added to this allocator.
-    pub(crate) fn prefix(&self, arena: Arena) -> Option<InodePrefix> {
-        self.prefixes
-            .read()
-            .unwrap()
-            .get_by_left(&arena)
-            .map(|p| *p)
-    }
-
-    /// Maps prefixes to arenas.
-    pub(crate) fn arena_for_prefix(
-        &self,
-        prefix: InodePrefix,
-    ) -> Result<Option<Arena>, StorageError> {
-        if prefix == InodePrefix::ZERO {
-            return Ok(None);
-        }
-        if let Some(arena) = self.prefixes.read().unwrap().get_by_right(&prefix) {
-            return Ok(Some(*arena));
-        }
-        Err(StorageError::NotFound)
-    }
-
-    pub(crate) fn allocate_prefix(
-        &self,
-        txn: &GlobalWriteTransaction,
-        arena: Arena,
-    ) -> Result<InodePrefix, StorageError> {
-        let mut arena_table = txn.arena_table()?;
-        // Check again, as the database is the source of truth and
-        // it could can be temporarily inconsistent with
-        // self.prefix.
-        let prefix;
-        if let Some(existing) = arena_table.get(arena.as_str())? {
-            prefix = existing.value().parse()?.prefix;
-        } else {
-            let mut max_prefix = 0u8;
-            for value in arena_table.iter()? {
-                let (_, pathid) = value?;
-                max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
-            }
-            prefix = InodePrefix::from_u8(max_prefix + 1);
-            arena_table.insert(
-                arena.as_str(),
-                Holder::with_content(ArenaTableEntry { prefix })?,
-            )?;
-            log::debug!("[{arena}]: prefix {prefix}");
-        }
-
-        self.prefixes.write().unwrap().insert(arena, prefix);
-
-        Ok(prefix)
-    }
-}
 
 /// Allocate a new pathid in [GlobalDatabase].
 pub(crate) fn allocal_global_inode(txn: &GlobalWriteTransaction) -> Result<Inode, StorageError> {
@@ -116,13 +28,16 @@ pub(crate) fn allocate(
 
 #[cfg(test)]
 mod tests {
+    use realize_types::Arena;
+
     use super::*;
+    use crate::global::db::GlobalDatabase;
     use crate::utils::redb_utils;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     struct Fixture {
         db: Arc<GlobalDatabase>,
-        allocator: Arc<PathIdAllocator>,
         arena_dbs: HashMap<Arena, Arc<GlobalDatabase>>,
     }
 
@@ -133,25 +48,12 @@ mod tests {
         {
             let _ = env_logger::try_init();
             let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let arenas = arenas.into_iter().collect::<Vec<_>>();
-            let allocator = PathIdAllocator::setup(&db)?;
-
-            let txn = db.begin_write()?;
-            for arena in &arenas {
-                allocator.allocate_prefix(&txn, *arena)?;
-            }
-            txn.commit()?;
-
             let mut arena_dbs = HashMap::new();
-            for arena in arenas {
+            for arena in arenas.into_iter() {
                 arena_dbs.insert(arena, GlobalDatabase::new(redb_utils::in_memory()?)?);
             }
 
-            Ok(Self {
-                allocator,
-                db,
-                arena_dbs,
-            })
+            Ok(Self { db, arena_dbs })
         }
 
         fn arena_db(&self, arena: Arena) -> &Arc<GlobalDatabase> {
@@ -165,19 +67,6 @@ mod tests {
 
             Ok(pathid)
         }
-    }
-
-    #[test]
-    fn assign_prefix() -> anyhow::Result<()> {
-        let a = Arena::from("a");
-        let b = Arena::from("b");
-        let fixture = Fixture::setup([a, b])?;
-
-        assert_eq!(Some(InodePrefix::from_u8(1)), fixture.allocator.prefix(a));
-        assert_eq!(Some(InodePrefix::from_u8(2)), fixture.allocator.prefix(b));
-        assert!(fixture.allocator.prefix(Arena::from("notadded")).is_none());
-
-        Ok(())
     }
 
     #[test]
@@ -204,14 +93,6 @@ mod tests {
         let c = Arena::from("c");
         let fixture = Fixture::setup([a, b, c])?;
 
-        let a_prefix = InodePrefix::from_u8(1);
-        let b_prefix = InodePrefix::from_u8(2);
-        let c_prefix = InodePrefix::from_u8(3);
-
-        assert_eq!(Some(a_prefix), fixture.allocator.prefix(a));
-        assert_eq!(Some(b_prefix), fixture.allocator.prefix(b));
-        assert_eq!(Some(c_prefix), fixture.allocator.prefix(c));
-
         // 1 is root, so everything starts at 2
         assert_eq!(PathId(2), fixture.allocate_arena_pathid(a)?);
         assert_eq!(PathId(3), fixture.allocate_arena_pathid(a)?);
@@ -229,42 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_for_prefix_global() -> anyhow::Result<()> {
-        let fixture = Fixture::setup([])?;
-        let result = fixture.allocator.arena_for_prefix(InodePrefix::ZERO)?;
-        assert_eq!(None, result);
-
-        Ok(())
-    }
-
-    #[test]
-    fn arena_for_prefix_arena() -> anyhow::Result<()> {
-        let arena = Arena::from("test");
-        let fixture = Fixture::setup([arena])?;
-        let prefix = fixture.allocator.prefix(arena).unwrap();
-        let result = fixture.allocator.arena_for_prefix(prefix)?;
-
-        assert_eq!(Some(arena), result);
-
-        Ok(())
-    }
-
-    #[test]
-    fn arena_for_pathid_not_found() -> anyhow::Result<()> {
-        let fixture = Fixture::setup([])?;
-        let result = fixture.allocator.arena_for_prefix(InodePrefix::from_u8(99));
-
-        assert!(result.is_err());
-        match result {
-            Err(StorageError::NotFound) => {}
-            _ => panic!("Expected NotFound error"),
-        }
-
-        Ok(())
-    }
-
-    #[test]
-    fn arena_pathid_exhaustion() -> anyhow::Result<()> {
+    fn pathid_exhaustion() -> anyhow::Result<()> {
         let arena = Arena::from("arena");
         let fixture = Fixture::setup([arena])?;
         let txn = fixture.arena_db(arena).begin_write()?;

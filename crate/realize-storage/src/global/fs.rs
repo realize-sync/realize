@@ -1,16 +1,16 @@
 use super::db::GlobalDatabase;
-use super::pathid_allocator::PathIdAllocator;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, FileRealm};
 use crate::global::db::GlobalWriteTransaction;
 use crate::global::pathid_allocator;
-use crate::global::types::PathTableEntry;
+use crate::global::types::{ArenaTableEntry, PathTableEntry};
 use crate::types::{InodePrefix, PartialInode};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, StorageError};
+use bimap::BiMap;
 use realize_types::{Arena, Path, Peer};
-use redb::ReadableTable;
+use redb::{ReadableTable, Table};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -47,9 +47,10 @@ impl FileContent {
 
 /// A view on remote and local files.
 pub struct Filesystem {
-    allocator: Arc<PathIdAllocator>,
     by_arena: HashMap<Arena, Arc<ArenaFilesystem>>,
 
+    /// An in-memory copy of ARENA_TABLE.
+    prefixes: BiMap<Arena, InodePrefix>,
     /// An in-memory copy of PATH_TABLE.
     globals: HashMap<Inode, PathTableEntry>,
 }
@@ -64,13 +65,13 @@ impl Filesystem {
         T: IntoIterator<Item = Arc<ArenaFilesystem>> + Send + 'static,
     {
         task::spawn_blocking(move || {
-            let allocator = PathIdAllocator::setup(&db)?;
-
             let mut by_arena = HashMap::new();
             let mut globals = HashMap::new();
+            let mut prefixes = BiMap::new();
             let txn = db.begin_write()?;
             {
                 let mut path_table = txn.path_table()?;
+                let mut arena_table = txn.arena_table()?;
 
                 if path_table.get(Inode::ROOT)?.is_none() {
                     path_table.insert(Inode::ROOT, Holder::with_content(PathTableEntry::new())?)?;
@@ -81,9 +82,16 @@ impl Filesystem {
                     for existing in by_arena.keys() {
                         check_arena_compatibility(arena, *existing)?;
                     }
-                    let prefix = allocator.allocate_prefix(&txn, arena)?;
+                    let prefix = allocate_prefix(&mut arena_table, arena)?;
                     add_arena_path(arena, prefix, &txn, &mut path_table)?;
                     by_arena.insert(arena, fs);
+                }
+
+                for value in arena_table.iter()? {
+                    let (arena, entry) = value?;
+                    let arena = Arena::from(arena.value());
+                    let ArenaTableEntry { prefix } = entry.value().parse()?;
+                    prefixes.insert(arena, prefix);
                 }
 
                 for val in path_table.iter()? {
@@ -94,8 +102,8 @@ impl Filesystem {
             txn.commit()?;
 
             Ok::<_, anyhow::Error>(Arc::new(Self {
-                allocator,
                 by_arena,
+                prefixes,
                 globals,
             }))
         })
@@ -112,8 +120,9 @@ impl Filesystem {
     /// Will return [StorageError::UnknownArena] unless the arena
     /// is available.
     fn prefix(&self, arena: Arena) -> Result<InodePrefix, StorageError> {
-        self.allocator
-            .prefix(arena)
+        self.prefixes
+            .get_by_left(&arena)
+            .map(|p| *p)
             .ok_or_else(|| StorageError::UnknownArena(arena))
     }
 
@@ -125,14 +134,19 @@ impl Filesystem {
     /// Returns the FS for the given prefix or fail.
     fn arena_fs_for_prefix(&self, prefix: InodePrefix) -> Result<&ArenaFilesystem, StorageError> {
         let arena = self
-            .allocator
             .arena_for_prefix(prefix)?
             .ok_or(StorageError::NotFound)?;
         self.arena_fs(arena)
     }
 
     fn arena_for_prefix(&self, prefix: InodePrefix) -> Result<Option<Arena>, StorageError> {
-        self.allocator.arena_for_prefix(prefix)
+        if prefix == InodePrefix::ZERO {
+            return Ok(None);
+        }
+        if let Some(arena) = self.prefixes.get_by_right(&prefix) {
+            return Ok(Some(*arena));
+        }
+        Err(StorageError::NotFound)
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
@@ -717,6 +731,33 @@ fn get_or_create_dir(
     path_table.insert(inode, Holder::new(&entry)?)?;
 
     Ok(entry)
+}
+
+/// Allocate a prefix for `arena` in the database.
+///
+/// If a prefix already exists, return it.
+fn allocate_prefix(
+    arena_table: &mut Table<'_, &'static str, Holder<'static, ArenaTableEntry>>,
+    arena: Arena,
+) -> Result<InodePrefix, StorageError> {
+    let prefix;
+    if let Some(existing) = arena_table.get(arena.as_str())? {
+        prefix = existing.value().parse()?.prefix;
+    } else {
+        let mut max_prefix = 0u8;
+        for value in arena_table.iter()? {
+            let (_, pathid) = value?;
+            max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
+        }
+        prefix = InodePrefix::from_u8(max_prefix + 1);
+        arena_table.insert(
+            arena.as_str(),
+            Holder::with_content(ArenaTableEntry { prefix })?,
+        )?;
+        log::debug!("[{arena}]: prefix {prefix}");
+    }
+
+    Ok(prefix)
 }
 
 #[cfg(test)]
