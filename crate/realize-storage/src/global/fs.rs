@@ -66,8 +66,8 @@ impl Filesystem {
     {
         task::spawn_blocking(move || {
             let mut by_arena = HashMap::new();
-            let mut globals = HashMap::new();
-            let mut prefixes = BiMap::new();
+            let globals;
+            let prefixes;
             let txn = db.begin_write()?;
             {
                 let mut path_table = txn.path_table()?;
@@ -79,25 +79,17 @@ impl Filesystem {
 
                 for fs in all_fs.into_iter() {
                     let arena = fs.arena();
-                    for existing in by_arena.keys() {
-                        check_arena_compatibility(arena, *existing)?;
+                    for existing in arena_table.iter()? {
+                        let existing = Arena::from(existing?.0.value());
+                        check_arena_compatibility(arena, existing)?;
                     }
                     let prefix = allocate_prefix(&mut arena_table, arena)?;
                     add_arena_path(arena, prefix, &txn, &mut path_table)?;
                     by_arena.insert(arena, fs);
                 }
 
-                for value in arena_table.iter()? {
-                    let (arena, entry) = value?;
-                    let arena = Arena::from(arena.value());
-                    let ArenaTableEntry { prefix } = entry.value().parse()?;
-                    prefixes.insert(arena, prefix);
-                }
-
-                for val in path_table.iter()? {
-                    let (inode, entry) = val?;
-                    globals.insert(inode.value(), entry.value().parse()?);
-                }
+                prefixes = reload_prefixes(&arena_table)?;
+                globals = reload_globals(&path_table)?;
             }
             txn.commit()?;
 
@@ -112,7 +104,7 @@ impl Filesystem {
 
     /// Lists arenas available in this database
     pub fn arenas(&self) -> impl Iterator<Item = Arena> {
-        self.by_arena.keys().map(|a| *a)
+        self.prefixes.left_values().map(|a| *a)
     }
 
     /// Returns the prefix of an arena.
@@ -128,17 +120,14 @@ impl Filesystem {
 
     /// Returns the FS for the given arena or fail.
     fn arena_fs(&self, arena: Arena) -> Result<&ArenaFilesystem, StorageError> {
-        Ok(self.by_arena.get(&arena).ok_or(StorageError::NotFound)?)
+        Ok(self
+            .by_arena
+            .get(&arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))?)
     }
 
-    /// Returns the FS for the given prefix or fail.
-    fn arena_fs_for_prefix(&self, prefix: InodePrefix) -> Result<&ArenaFilesystem, StorageError> {
-        let arena = self
-            .arena_for_prefix(prefix)?
-            .ok_or(StorageError::NotFound)?;
-        self.arena_fs(arena)
-    }
-
+    /// Return the arena that corresponds to the prefix or None for
+    /// the global prefix.
     fn arena_for_prefix(&self, prefix: InodePrefix) -> Result<Option<Arena>, StorageError> {
         if prefix == InodePrefix::ZERO {
             return Ok(None);
@@ -191,28 +180,36 @@ impl Filesystem {
     }
 
     /// Convert a [GlobalTreeLoc] into an arena and arena [TreeLoc] or fail.
+    ///
+    /// The prefix must belong to an arena. This function return
+    /// [StorageError::NotInAnArena] if given the global prefix. This
+    /// method is appropriate in situations where there must be
+    /// an arena.
     fn resolve_arena_loc<L: Into<FsLoc>>(
         &self,
         loc: L,
     ) -> Result<(&ArenaFilesystem, InodePrefix, ArenaFsLoc), StorageError> {
-        Ok(match self.resolve_arena_root(loc.into()) {
-            FsLoc::Inode(inode) => {
-                let prefix = inode.prefix();
+        fn require_arena_fs(
+            this: &Filesystem,
+            inode: Inode,
+        ) -> Result<&ArenaFilesystem, StorageError> {
+            let arena = this
+                .arena_for_prefix(inode.prefix())?
+                .ok_or(StorageError::NotInAnArena)?;
+            this.arena_fs(arena)
+        }
 
-                (
-                    self.arena_fs_for_prefix(prefix)?,
-                    prefix,
-                    ArenaFsLoc::Inode(inode.partial()),
-                )
-            }
-            FsLoc::InodeAndName(inode, name) => {
-                let prefix = inode.prefix();
-                (
-                    self.arena_fs_for_prefix(prefix)?,
-                    prefix,
-                    ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
-                )
-            }
+        Ok(match self.resolve_arena_root(loc.into()) {
+            FsLoc::Inode(inode) => (
+                require_arena_fs(self, inode)?,
+                inode.prefix(),
+                ArenaFsLoc::Inode(inode.partial()),
+            ),
+            FsLoc::InodeAndName(inode, name) => (
+                require_arena_fs(self, inode)?,
+                inode.prefix(),
+                ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
+            ),
             FsLoc::Path(arena, path) => (
                 self.arena_fs(arena)?,
                 self.prefix(arena)?,
@@ -758,6 +755,32 @@ fn allocate_prefix(
     }
 
     Ok(prefix)
+}
+
+fn reload_prefixes(
+    arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
+) -> Result<BiMap<Arena, InodePrefix>, StorageError> {
+    let mut prefixes = BiMap::new();
+    for value in arena_table.iter()? {
+        let (arena, entry) = value?;
+        let arena = Arena::from(arena.value());
+        let ArenaTableEntry { prefix } = entry.value().parse()?;
+        prefixes.insert(arena, prefix);
+    }
+
+    Ok(prefixes)
+}
+
+fn reload_globals(
+    path_table: &impl ReadableTable<Inode, Holder<'static, PathTableEntry>>,
+) -> Result<HashMap<Inode, PathTableEntry>, StorageError> {
+    let mut globals = HashMap::new();
+    for val in path_table.iter()? {
+        let (inode, entry) = val?;
+        globals.insert(inode.value(), entry.value().parse()?);
+    }
+
+    Ok(globals)
 }
 
 #[cfg(test)]

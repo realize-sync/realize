@@ -46,6 +46,9 @@ pub enum StorageError {
     #[error("unknown arena: {0}")]
     UnknownArena(Arena),
 
+    #[error("no arena at this point")]
+    NotInAnArena,
+
     #[error("database is inconsistent. This is a bug. {0}")]
     InconsistentDatabase(String),
 
@@ -122,6 +125,7 @@ impl StorageError {
             StorageError::InvalidRsyncSignature => InvalidInput,
             StorageError::DatabaseOutdated(_) => InvalidData,
             StorageError::UnknownArena(_) => NotFound,
+            StorageError::NotInAnArena => NotFound,
             StorageError::InconsistentDatabase(_) => Other,
             StorageError::CrossesDevices => CrossesDevices,
             StorageError::AlreadyExists => AlreadyExists,

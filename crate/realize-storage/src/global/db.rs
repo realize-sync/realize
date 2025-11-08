@@ -60,6 +60,7 @@ impl GlobalDatabase {
         })
     }
 
+    #[allow(dead_code)]
     pub fn begin_read(&self) -> Result<GlobalReadTransaction, StorageError> {
         Ok(GlobalReadTransaction {
             inner: self.db.begin_read()?,
@@ -106,6 +107,7 @@ pub struct GlobalReadTransaction {
 }
 
 impl GlobalReadTransaction {
+    #[allow(dead_code)]
     pub fn arena_table(
         &self,
     ) -> Result<ReadOnlyTable<&'static str, Holder<'static, ArenaTableEntry>>, StorageError> {
