@@ -37,7 +37,6 @@ where
                 NamedArenaConfig {
                     arena,
                     config: ArenaConfig {
-                        workdir: arena_datadir.parent().unwrap().to_path_buf(),
                         datadir: arena_datadir,
                     },
                 }

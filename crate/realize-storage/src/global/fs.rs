@@ -1,20 +1,20 @@
 use super::db::GlobalDatabase;
+use crate::arena::db::ArenaDatabase;
 use crate::arena::fs::{ArenaFilesystem, ArenaFsLoc};
 use crate::arena::notifier::{Notification, Progress};
 use crate::arena::types::{DirMetadata, FileRealm};
-use crate::global::db::GlobalWriteTransaction;
 use crate::global::pathid_allocator;
 use crate::global::types::{ArenaTableEntry, PathTableEntry};
-use crate::types::{InodePrefix, PartialInode};
+use crate::types::{InodePrefix, PartialInode, PathId};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, StorageError};
 use bimap::BiMap;
 use realize_types::{Arena, Path, Peer};
-use redb::{ReadableTable, Table};
+use redb::ReadableTable;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::task;
 
 /// File content, returned by [FileSystem::file_content].
@@ -47,7 +47,12 @@ impl FileContent {
 
 /// A view on remote and local files.
 pub struct Filesystem {
-    by_arena: HashMap<Arena, Arc<ArenaFilesystem>>,
+    db: Arc<GlobalDatabase>,
+    state: RwLock<FilesystemState>,
+}
+
+struct FilesystemState {
+    arena_fs: HashMap<Arena, Arc<ArenaFilesystem>>,
 
     /// An in-memory copy of ARENA_TABLE.
     prefixes: BiMap<Arena, InodePrefix>,
@@ -57,46 +62,33 @@ pub struct Filesystem {
 
 impl Filesystem {
     /// Create a new Filesystems with the database at the given path.
-    pub(crate) async fn with_db<T>(
-        db: Arc<GlobalDatabase>,
-        all_fs: T,
-    ) -> Result<Arc<Self>, anyhow::Error>
-    where
-        T: IntoIterator<Item = Arc<ArenaFilesystem>> + Send + 'static,
-    {
+    pub(crate) async fn with_db(db: Arc<GlobalDatabase>) -> Result<Arc<Self>, anyhow::Error> {
         task::spawn_blocking(move || {
-            let mut by_arena = HashMap::new();
+            let mut arena_fs = HashMap::new();
             let globals;
             let prefixes;
             let txn = db.begin_write()?;
             {
                 let mut path_table = txn.path_table()?;
-                let mut arena_table = txn.arena_table()?;
-
                 if path_table.get(Inode::ROOT)?.is_none() {
                     path_table.insert(Inode::ROOT, Holder::with_content(PathTableEntry::new())?)?;
                 }
 
-                for fs in all_fs.into_iter() {
-                    let arena = fs.arena();
-                    for existing in arena_table.iter()? {
-                        let existing = Arena::from(existing?.0.value());
-                        check_arena_compatibility(arena, existing)?;
-                    }
-                    let prefix = allocate_prefix(&mut arena_table, arena)?;
-                    add_arena_path(arena, prefix, &txn, &mut path_table)?;
-                    by_arena.insert(arena, fs);
-                }
+                let arena_table = txn.arena_table()?;
+                build_missing_arena_fs(&arena_table, &mut arena_fs)?;
 
-                prefixes = reload_prefixes(&arena_table)?;
-                globals = reload_globals(&path_table)?;
+                prefixes = build_prefix_map(&arena_table)?;
+                globals = build_globals(&path_table)?;
             }
             txn.commit()?;
 
             Ok::<_, anyhow::Error>(Arc::new(Self {
-                by_arena,
-                prefixes,
-                globals,
+                db,
+                state: RwLock::new(FilesystemState {
+                    arena_fs,
+                    prefixes,
+                    globals,
+                }),
             }))
         })
         .await?
@@ -104,68 +96,106 @@ impl Filesystem {
 
     /// Lists arenas available in this database
     pub fn arenas(&self) -> impl Iterator<Item = Arena> {
-        self.prefixes.left_values().map(|a| *a)
+        self.state
+            .read()
+            .unwrap()
+            .prefixes
+            .left_values()
+            .map(|a| *a)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
-    /// Returns the prefix of an arena.
-    ///
-    /// Will return [StorageError::UnknownArena] unless the arena
-    /// is available.
-    fn prefix(&self, arena: Arena) -> Result<InodePrefix, StorageError> {
-        self.prefixes
-            .get_by_left(&arena)
-            .map(|p| *p)
-            .ok_or_else(|| StorageError::UnknownArena(arena))
-    }
-
-    /// Returns the FS for the given arena or fail.
-    fn arena_fs(&self, arena: Arena) -> Result<&ArenaFilesystem, StorageError> {
-        Ok(self
-            .by_arena
+    /// Get the database of the given arena, if it exists.
+    pub(crate) fn arena_db(&self, arena: Arena) -> Option<Arc<ArenaDatabase>> {
+        self.state
+            .read()
+            .unwrap()
+            .arena_fs
             .get(&arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))?)
+            .map(|fs| Arc::clone(fs.db()))
     }
 
-    /// Return the arena that corresponds to the prefix or None for
-    /// the global prefix.
-    fn arena_for_prefix(&self, prefix: InodePrefix) -> Result<Option<Arena>, StorageError> {
-        if prefix == InodePrefix::ZERO {
-            return Ok(None);
+    /// Return the [ArenaFilesystem] of the given arena.
+    pub(crate) fn arena_fs(&self, arena: Arena) -> Result<Arc<ArenaFilesystem>, StorageError> {
+        self.state.read().unwrap().arena_fs(arena)
+    }
+
+    /// Add a new arena to the filesystem
+    pub(crate) fn add_arena(
+        &self,
+        arena: Arena,
+        datadir: &std::path::Path,
+    ) -> Result<Arc<ArenaDatabase>, StorageError> {
+        let txn = self.db.begin_write()?;
+
+        let prefixes;
+        let globals;
+        {
+            let mut arena_table = txn.arena_table()?;
+            let mut path_table = txn.path_table()?;
+            let mut pathid_range_table = txn.pathid_range_table()?;
+
+            add_arena_to_database(
+                &mut arena_table,
+                &mut path_table,
+                &mut pathid_range_table,
+                arena,
+                datadir,
+            )?;
+
+            prefixes = build_prefix_map(&arena_table)?;
+            globals = build_globals(&path_table)?;
         }
-        if let Some(arena) = self.prefixes.get_by_right(&prefix) {
-            return Ok(Some(*arena));
-        }
-        Err(StorageError::NotFound)
+        let db = build_arena_db(arena, datadir)?;
+        let fs = ArenaFilesystem::new(Arc::clone(&db));
+
+        txn.commit()?;
+
+        let mut state = self.state.write().unwrap();
+        state.arena_fs.insert(arena, fs);
+        state.prefixes = prefixes;
+        state.globals = globals;
+
+        Ok(db)
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
-    fn resolve_loc<L: Into<FsLoc>>(&self, loc: L) -> Result<ResolvedLoc<'_>, StorageError> {
-        Ok(match self.resolve_arena_root(loc.into()) {
+    fn resolve_loc<L: Into<FsLoc>>(&self, loc: L) -> Result<ResolvedLoc, StorageError> {
+        let state = self.state.read().unwrap();
+        Ok(match state.resolve_arena_root(loc.into()) {
             FsLoc::Inode(inode) => {
                 let prefix = inode.prefix();
-                match self.arena_for_prefix(prefix)? {
-                    Some(arena) => {
-                        ResolvedLoc::InArena(arena, prefix, ArenaFsLoc::Inode(inode.partial()))
+                match state.arena_for_prefix(prefix)? {
+                    Some(arena) => ResolvedLoc::InArena(
+                        state.arena_fs(arena)?,
+                        prefix,
+                        ArenaFsLoc::Inode(inode.partial()),
+                    ),
+                    None => {
+                        ResolvedLoc::Global(state.globals.get(&inode).map(|e| (inode, e.clone())))
                     }
-                    None => ResolvedLoc::Global(self.globals.get(&inode).map(|e| (inode, e))),
                 }
             }
             FsLoc::InodeAndName(inode, name) => {
                 let prefix = inode.prefix();
-                match self.arena_for_prefix(prefix)? {
+                match state.arena_for_prefix(prefix)? {
                     Some(arena) => ResolvedLoc::InArena(
-                        arena,
+                        state.arena_fs(arena)?,
                         prefix,
                         ArenaFsLoc::InodeAndName(inode.partial(), name),
                     ),
                     None => {
-                        if let Some(child_inode) = self
+                        if let Some(child_inode) = state
                             .globals
                             .get(&inode)
                             .and_then(|entry| entry.subdirs.get(&name))
                         {
                             ResolvedLoc::Global(
-                                self.globals.get(child_inode).map(|e| (*child_inode, e)),
+                                state
+                                    .globals
+                                    .get(child_inode)
+                                    .map(|e| (*child_inode, e.clone())),
                             )
                         } else {
                             ResolvedLoc::Global(None)
@@ -173,64 +203,26 @@ impl Filesystem {
                     }
                 }
             }
-            FsLoc::Path(arena, path) => {
-                ResolvedLoc::InArena(arena, self.prefix(arena)?, ArenaFsLoc::Path(path))
-            }
-        })
-    }
-
-    /// Convert a [GlobalTreeLoc] into an arena and arena [TreeLoc] or fail.
-    ///
-    /// The prefix must belong to an arena. This function return
-    /// [StorageError::NotInAnArena] if given the global prefix. This
-    /// method is appropriate in situations where there must be
-    /// an arena.
-    fn resolve_arena_loc<L: Into<FsLoc>>(
-        &self,
-        loc: L,
-    ) -> Result<(&ArenaFilesystem, InodePrefix, ArenaFsLoc), StorageError> {
-        fn require_arena_fs(
-            this: &Filesystem,
-            inode: Inode,
-        ) -> Result<&ArenaFilesystem, StorageError> {
-            let arena = this
-                .arena_for_prefix(inode.prefix())?
-                .ok_or(StorageError::NotInAnArena)?;
-            this.arena_fs(arena)
-        }
-
-        Ok(match self.resolve_arena_root(loc.into()) {
-            FsLoc::Inode(inode) => (
-                require_arena_fs(self, inode)?,
-                inode.prefix(),
-                ArenaFsLoc::Inode(inode.partial()),
-            ),
-            FsLoc::InodeAndName(inode, name) => (
-                require_arena_fs(self, inode)?,
-                inode.prefix(),
-                ArenaFsLoc::InodeAndName(inode.partial(), name.into()),
-            ),
-            FsLoc::Path(arena, path) => (
-                self.arena_fs(arena)?,
-                self.prefix(arena)?,
+            FsLoc::Path(arena, path) => ResolvedLoc::InArena(
+                state.arena_fs(arena)?,
+                state.prefix(arena)?,
                 ArenaFsLoc::Path(path),
             ),
         })
     }
 
-    /// Cover the special case of a InodeAndName where name points to an arena root.
-    fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
-        if let FsLoc::InodeAndName(inode, name) = &loc {
-            if let Some(PathTableEntry { subdirs, .. }) = self.globals.get(&inode) {
-                if let Some(inode) = subdirs.get(name) {
-                    if inode.is_arena_root() {
-                        return FsLoc::Inode(*inode);
-                    }
-                }
-            }
+    /// Convert a [GlobalTreeLoc] into an arena location.
+    ///
+    /// The location must belong to an arena. This function return
+    /// [StorageError::NotInAnArena] if given a global location.
+    fn resolve_arena_loc<L: Into<FsLoc>>(
+        &self,
+        loc: L,
+    ) -> Result<(Arc<ArenaFilesystem>, InodePrefix, ArenaFsLoc), StorageError> {
+        if let ResolvedLoc::InArena(fs, prefix, loc) = self.resolve_loc(loc)? {
+            return Ok((fs, prefix, loc));
         }
-
-        loc
+        return Err(StorageError::NotInAnArena);
     }
 
     /// Lookup a directory entry.
@@ -242,8 +234,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, prefix, loc) => {
-                let fs = this.arena_fs(arena)?;
+            ResolvedLoc::InArena(fs, prefix, loc) => {
                 let (inode, metadata) = fs.lookup(loc)?;
 
                 Ok((inode.to_inode(prefix), metadata))
@@ -266,10 +257,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.dir_metadata(loc)
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.dir_metadata(loc),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some((_, entry))) => Ok(DirMetadata::readonly(entry.mtime)),
         })
@@ -282,13 +270,8 @@ impl Filesystem {
     ) -> Result<Vec<(String, Inode, crate::arena::types::Metadata)>, StorageError> {
         let loc = loc.into();
         match self.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, prefix, loc) => {
-                let this = Arc::clone(self);
-                let vec = task::spawn_blocking(move || {
-                    let fs = this.arena_fs(arena)?;
-                    fs.readdir(loc)
-                })
-                .await??;
+            ResolvedLoc::InArena(fs, prefix, loc) => {
+                let vec = task::spawn_blocking(move || fs.readdir(loc)).await??;
                 Ok(vec
                     .into_iter()
                     .map(|(n, inode, m)| (n, inode.to_inode(prefix), m))
@@ -401,10 +384,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.metadata(loc)
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.metadata(loc),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some((_, entry))) => Ok(crate::arena::types::Metadata::Dir(
                 DirMetadata::readonly(entry.mtime),
@@ -420,10 +400,7 @@ impl Filesystem {
         let loc = loc.into();
         let this = Arc::clone(self);
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.list_xattrs(loc)
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.list_xattrs(loc),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some(_)) => Ok(vec![]),
         })
@@ -439,10 +416,7 @@ impl Filesystem {
         let this = Arc::clone(self);
         let xattr = xattr.to_string();
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.get_xattr(loc, &xattr)
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.get_xattr(loc, &xattr),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
         })
@@ -460,10 +434,7 @@ impl Filesystem {
         let xattr = xattr.to_string();
         let value = value.into_owned();
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.set_xattr(loc, &xattr, value.into())
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.set_xattr(loc, &xattr, value.into()),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some(_)) => Err(StorageError::NoSuchAttribute),
         })
@@ -475,10 +446,7 @@ impl Filesystem {
         let this = Arc::clone(self);
 
         task::spawn_blocking(move || match this.resolve_loc(loc)? {
-            ResolvedLoc::InArena(arena, _, loc) => {
-                let fs = this.arena_fs(arena)?;
-                fs.unlink(loc)
-            }
+            ResolvedLoc::InArena(fs, _, loc) => fs.unlink(loc),
             ResolvedLoc::Global(None) => Err(StorageError::NotFound),
             ResolvedLoc::Global(Some(_)) => Err(StorageError::IsADirectory),
         })
@@ -497,14 +465,13 @@ impl Filesystem {
         task::spawn_blocking(
             move || match (this.resolve_loc(source)?, this.resolve_loc(dest)?) {
                 (
-                    ResolvedLoc::InArena(source_arena, prefix, source),
-                    ResolvedLoc::InArena(dest_arena, _, dest),
+                    ResolvedLoc::InArena(source_fs, prefix, source),
+                    ResolvedLoc::InArena(dest_fs, _, dest),
                 ) => {
-                    if source_arena != dest_arena {
+                    if source_fs.arena() != dest_fs.arena() {
                         return Err(StorageError::CrossesDevices);
                     }
-                    let fs = this.arena_fs(source_arena)?;
-                    let (inode, m) = fs.branch(source, dest)?;
+                    let (inode, m) = source_fs.branch(source, dest)?;
 
                     Ok((inode.to_inode(prefix), m))
                 }
@@ -528,14 +495,13 @@ impl Filesystem {
         task::spawn_blocking(
             move || match (this.resolve_loc(source)?, this.resolve_loc(dest)?) {
                 (
-                    ResolvedLoc::InArena(source_arena, _, source),
-                    ResolvedLoc::InArena(dest_arena, _, dest),
+                    ResolvedLoc::InArena(source_fs, _, source),
+                    ResolvedLoc::InArena(dest_fs, _, dest),
                 ) => {
-                    if source_arena != dest_arena {
+                    if source_fs.arena() != dest_fs.arena() {
                         return Err(StorageError::CrossesDevices);
                     }
-                    let fs = this.arena_fs(source_arena)?;
-                    fs.rename(source, dest, noreplace)
+                    source_fs.rename(source, dest, noreplace)
                 }
                 (ResolvedLoc::Global(_), ResolvedLoc::Global(_)) => Err(StorageError::IsADirectory),
                 (_, _) => Err(StorageError::CrossesDevices),
@@ -595,6 +561,55 @@ impl Filesystem {
     }
 }
 
+impl FilesystemState {
+    /// Returns the prefix of an arena.
+    ///
+    /// Will return [StorageError::UnknownArena] unless the arena
+    /// is available.
+    fn prefix(&self, arena: Arena) -> Result<InodePrefix, StorageError> {
+        self.prefixes
+            .get_by_left(&arena)
+            .map(|p| *p)
+            .ok_or_else(|| StorageError::UnknownArena(arena))
+    }
+
+    /// Returns the FS for the given arena or fail.
+    fn arena_fs(&self, arena: Arena) -> Result<Arc<ArenaFilesystem>, StorageError> {
+        Ok(self
+            .arena_fs
+            .get(&arena)
+            .cloned()
+            .ok_or_else(|| StorageError::UnknownArena(arena))?)
+    }
+
+    /// Return the arena that corresponds to the prefix or None for
+    /// the global prefix.
+    fn arena_for_prefix(&self, prefix: InodePrefix) -> Result<Option<Arena>, StorageError> {
+        if prefix == InodePrefix::ZERO {
+            return Ok(None);
+        }
+        if let Some(arena) = self.prefixes.get_by_right(&prefix) {
+            return Ok(Some(*arena));
+        }
+        Err(StorageError::NotFound)
+    }
+
+    /// Cover the special case of a InodeAndName where name points to an arena root.
+    fn resolve_arena_root(&self, loc: FsLoc) -> FsLoc {
+        if let FsLoc::InodeAndName(inode, name) = &loc {
+            if let Some(PathTableEntry { subdirs, .. }) = self.globals.get(&inode) {
+                if let Some(inode) = subdirs.get(name) {
+                    if inode.is_arena_root() {
+                        return FsLoc::Inode(*inode);
+                    }
+                }
+            }
+        }
+
+        loc
+    }
+}
+
 /// A location within the Filesystem.
 ///
 /// This is usually a [Path] within an [Arena] or a [PathId], but can
@@ -641,12 +656,122 @@ impl From<(Inode, String)> for FsLoc {
     }
 }
 
-enum ResolvedLoc<'a> {
-    Global(Option<(Inode, &'a PathTableEntry)>),
-    InArena(Arena, InodePrefix, ArenaFsLoc),
+enum ResolvedLoc {
+    Global(Option<(Inode, PathTableEntry)>),
+    InArena(Arc<ArenaFilesystem>, InodePrefix, ArenaFsLoc),
 }
 
-fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()> {
+fn get_or_create_dir(
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    inode: Inode,
+) -> Result<PathTableEntry, StorageError> {
+    if let Some(existing) = path_table.get(inode)? {
+        return Ok(existing.value().parse()?);
+    }
+    let entry = PathTableEntry::new();
+    path_table.insert(inode, Holder::new(&entry)?)?;
+
+    Ok(entry)
+}
+
+fn build_prefix_map(
+    arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
+) -> Result<BiMap<Arena, InodePrefix>, StorageError> {
+    let mut prefixes = BiMap::new();
+    for value in arena_table.iter()? {
+        let (arena, entry) = value?;
+        let arena = Arena::from(arena.value());
+        let ArenaTableEntry { prefix, .. } = entry.value().parse()?;
+        prefixes.insert(arena, prefix);
+    }
+
+    Ok(prefixes)
+}
+
+fn build_globals(
+    path_table: &impl ReadableTable<Inode, Holder<'static, PathTableEntry>>,
+) -> Result<HashMap<Inode, PathTableEntry>, StorageError> {
+    let mut globals = HashMap::new();
+    for val in path_table.iter()? {
+        let (inode, entry) = val?;
+        globals.insert(inode.value(), entry.value().parse()?);
+    }
+
+    Ok(globals)
+}
+
+/// Build [ArenaFilesystem] instances defined in `arena_table` missing from `arena_fs`.
+fn build_missing_arena_fs(
+    arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
+    arena_fs: &mut HashMap<Arena, Arc<ArenaFilesystem>>,
+) -> Result<(), StorageError> {
+    for entry in arena_table.iter()? {
+        let (arena, entry) = entry?;
+        let arena = Arena::from(arena.value());
+        if arena_fs.contains_key(&arena) {
+            continue;
+        }
+        let entry = entry.value().parse()?;
+        let db = build_arena_db(arena, &entry.datadir)?;
+        arena_fs.insert(arena, ArenaFilesystem::new(db));
+    }
+
+    Ok(())
+}
+
+fn build_arena_db(
+    arena: Arena,
+    datadir: &std::path::Path,
+) -> Result<Arc<ArenaDatabase>, StorageError> {
+    let datadir = datadir.canonicalize()?;
+    let blob_dir = datadir.join(".realize/blobs");
+    std::fs::create_dir_all(&blob_dir)?;
+    ArenaDatabase::new(
+        redb::Database::create(datadir.join(".realize/arena.db"))?,
+        arena,
+        blob_dir,
+        datadir,
+    )
+}
+
+/// Store arena into the database.
+///
+/// This fills `arena_table` and `path_table` as appropriate for the database.
+fn add_arena_to_database(
+    arena_table: &mut redb::Table<&'static str, Holder<'static, ArenaTableEntry>>,
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    pathid_range_table: &mut redb::Table<(), (PathId, PathId)>,
+    arena: Arena,
+    datadir: &std::path::Path,
+) -> Result<(), StorageError> {
+    check_arena_compatibility(arena_table, arena)?;
+
+    let mut max_prefix = 0u8;
+    for value in arena_table.iter()? {
+        let (_, pathid) = value?;
+        max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
+    }
+    let prefix = InodePrefix::from_u8(max_prefix + 1);
+    arena_table.insert(
+        arena.as_str(),
+        Holder::with_content(ArenaTableEntry {
+            prefix,
+            datadir: datadir.to_path_buf(),
+        })?,
+    )?;
+
+    log::debug!("[{arena}]: prefix {prefix}");
+
+    add_arena_path(path_table, pathid_range_table, arena, prefix)?;
+
+    Ok(())
+}
+
+/// Make sure that `arena` is compatible with existing arenas in `arena_table`
+fn check_arena_compatibility(
+    arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
+    arena: Arena,
+) -> Result<(), StorageError> {
     fn is_path_prefix(prefix: &str, arena: &str) -> bool {
         if let Some(rest) = arena.strip_prefix(prefix) {
             rest.starts_with("/")
@@ -654,12 +779,17 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
             false
         }
     }
-    if is_path_prefix(arena.as_str(), existing.as_str())
-        || is_path_prefix(existing.as_str(), arena.as_str())
-    {
-        return Err(anyhow::anyhow!(
-            "arena {arena} incompatible with existing arena {existing}"
-        ));
+
+    for existing in arena_table.iter()? {
+        let existing = Arena::from(existing?.0.value());
+        if existing == arena {
+            return Err(StorageError::AlreadyExists);
+        }
+        if is_path_prefix(arena.as_str(), existing.as_str())
+            || is_path_prefix(existing.as_str(), arena.as_str())
+        {
+            return Err(StorageError::IncompatibleArenas(arena, existing));
+        }
     }
 
     Ok(())
@@ -667,10 +797,10 @@ fn check_arena_compatibility(arena: Arena, existing: Arena) -> anyhow::Result<()
 
 /// Register root of the given arena in the PATH_TABLE.
 fn add_arena_path(
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    pathid_range_table: &mut redb::Table<(), (PathId, PathId)>,
     arena: Arena,
     prefix: InodePrefix,
-    txn: &GlobalWriteTransaction,
-    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
 ) -> Result<(), StorageError> {
     let arena_path = Path::parse(arena.as_str())?;
     let mut current = Inode::ROOT;
@@ -688,7 +818,9 @@ fn add_arena_path(
                     current_entry = get_or_create_dir(path_table, current)?;
                 }
                 None => {
-                    let subdir = pathid_allocator::allocal_global_inode(txn)?;
+                    let subdir =
+                        PartialInode::from(pathid_allocator::allocate(pathid_range_table)?)
+                            .to_inode(InodePrefix::ZERO);
                     current_entry.subdirs.insert(dirname.to_string(), subdir);
                     path_table.insert(current, Holder::new(&current_entry)?)?;
 
@@ -715,72 +847,6 @@ fn add_arena_path(
     }
 
     Ok(())
-}
-
-fn get_or_create_dir(
-    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
-    inode: Inode,
-) -> Result<PathTableEntry, StorageError> {
-    if let Some(existing) = path_table.get(inode)? {
-        return Ok(existing.value().parse()?);
-    }
-    let entry = PathTableEntry::new();
-    path_table.insert(inode, Holder::new(&entry)?)?;
-
-    Ok(entry)
-}
-
-/// Allocate a prefix for `arena` in the database.
-///
-/// If a prefix already exists, return it.
-fn allocate_prefix(
-    arena_table: &mut Table<'_, &'static str, Holder<'static, ArenaTableEntry>>,
-    arena: Arena,
-) -> Result<InodePrefix, StorageError> {
-    let prefix;
-    if let Some(existing) = arena_table.get(arena.as_str())? {
-        prefix = existing.value().parse()?.prefix;
-    } else {
-        let mut max_prefix = 0u8;
-        for value in arena_table.iter()? {
-            let (_, pathid) = value?;
-            max_prefix = std::cmp::max(max_prefix, pathid.value().parse()?.prefix.as_u8());
-        }
-        prefix = InodePrefix::from_u8(max_prefix + 1);
-        arena_table.insert(
-            arena.as_str(),
-            Holder::with_content(ArenaTableEntry { prefix })?,
-        )?;
-        log::debug!("[{arena}]: prefix {prefix}");
-    }
-
-    Ok(prefix)
-}
-
-fn reload_prefixes(
-    arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
-) -> Result<BiMap<Arena, InodePrefix>, StorageError> {
-    let mut prefixes = BiMap::new();
-    for value in arena_table.iter()? {
-        let (arena, entry) = value?;
-        let arena = Arena::from(arena.value());
-        let ArenaTableEntry { prefix } = entry.value().parse()?;
-        prefixes.insert(arena, prefix);
-    }
-
-    Ok(prefixes)
-}
-
-fn reload_globals(
-    path_table: &impl ReadableTable<Inode, Holder<'static, PathTableEntry>>,
-) -> Result<HashMap<Inode, PathTableEntry>, StorageError> {
-    let mut globals = HashMap::new();
-    for val in path_table.iter()? {
-        let (inode, entry) = val?;
-        globals.insert(inode.value(), entry.value().parse()?);
-    }
-
-    Ok(globals)
 }
 
 #[cfg(test)]
@@ -812,22 +878,11 @@ mod tests {
             let _ = env_logger::try_init();
             let tempdir = TempDir::new()?;
 
-            let arenas = arenas.into_iter().collect::<Vec<_>>();
-            let mut arena_fs = vec![];
-            for arena in arenas {
-                let blob_dir = tempdir.child(format!("{arena}/blobs"));
-                blob_dir.create_dir_all()?;
-                let datadir = tempdir.child(format!("{arena}/data"));
-                datadir.create_dir_all()?;
-                arena_fs.push(ArenaFilesystem::for_testing(
-                    arena,
-                    blob_dir.path(),
-                    datadir.path(),
-                )?);
+            let fs = Filesystem::with_db(GlobalDatabase::new(redb_utils::in_memory()?)?).await?;
+            for arena in arenas.into_iter() {
+                let datadir = tempdir.child(format!("{arena}"));
+                fs.add_arena(arena, datadir.path())?;
             }
-            let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
-            let fs = Filesystem::with_db(db, arena_fs).await?;
-
             Ok(Self {
                 fs,
                 _tempdir: tempdir,
@@ -885,7 +940,6 @@ mod tests {
             Arena::from("other"),
         ])
         .await?;
-
         let fs = &fixture.fs;
 
         let (arenas, metadata) = fs.lookup((Inode::ROOT, "arenas")).await.unwrap();
@@ -973,20 +1027,29 @@ mod tests {
             }
         }
 
-        assert!(
+        assert_eq!(
+            vec![".realize"],
             fs.readdir((Arena::from("arenas/test1"), Path::root()))
                 .await?
-                .is_empty()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
         );
-        assert!(
+        assert_eq!(
+            vec![".realize"],
             fs.readdir((Arena::from("arenas/test2"), Path::root()))
                 .await?
-                .is_empty()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
         );
-        assert!(
+        assert_eq!(
+            vec![".realize"],
             fs.readdir((Arena::from("other"), Path::root()))
                 .await?
-                .is_empty()
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>(),
         );
 
         Ok(())

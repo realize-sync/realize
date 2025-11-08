@@ -49,6 +49,9 @@ pub enum StorageError {
     #[error("no arena at this point")]
     NotInAnArena,
 
+    #[error("arenas '{0}' and '{1}' have incompatible paths")]
+    IncompatibleArenas(Arena, Arena),
+
     #[error("database is inconsistent. This is a bug. {0}")]
     InconsistentDatabase(String),
 
@@ -126,6 +129,7 @@ impl StorageError {
             StorageError::DatabaseOutdated(_) => InvalidData,
             StorageError::UnknownArena(_) => NotFound,
             StorageError::NotInAnArena => NotFound,
+            StorageError::IncompatibleArenas(_, _) => InvalidData,
             StorageError::InconsistentDatabase(_) => Other,
             StorageError::CrossesDevices => CrossesDevices,
             StorageError::AlreadyExists => AlreadyExists,

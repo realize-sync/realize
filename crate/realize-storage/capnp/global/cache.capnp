@@ -16,6 +16,7 @@ struct Subdir {
 
 struct ArenaTableEntry {
   prefix @0: UInt8;
+  datadir @1: Data;
 }
 
 # Time as duration since UNIX_EPOCH.

@@ -73,11 +73,10 @@ impl Fixture {
         };
 
         // Configure arena with required cache and optional local path
-        config.storage.arenas.push(NamedArenaConfig::new(
-            arena,
-            testdir.to_path_buf(),
-            tempdir.child("testdir-metadata").to_path_buf(),
-        ));
+        config
+            .storage
+            .arenas
+            .push(NamedArenaConfig::new(arena, testdir.to_path_buf()));
 
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");

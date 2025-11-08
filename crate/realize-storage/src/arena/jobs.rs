@@ -235,11 +235,12 @@ impl StorageJobProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::fs::ArenaFilesystem;
     use crate::arena::index;
     use crate::arena::tree::TreeExt;
     use crate::arena::types::IndexedFile;
     use crate::utils::hash;
-    use crate::{ArenaFilesystem, Blob, CacheStatus, Mark, Notification};
+    use crate::{Blob, CacheStatus, Mark, Notification};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -270,7 +271,7 @@ mod tests {
             let root = tempdir.child("root");
             root.create_dir_all()?;
             let db = ArenaDatabase::for_testing(arena, &blob_dir, &root)?;
-            let cache = ArenaFilesystem::new(arena, Arc::clone(&db))?;
+            let cache = ArenaFilesystem::new(Arc::clone(&db));
 
             let engine = Engine::new(Arc::clone(&db), |attempt| {
                 if attempt < 3 {

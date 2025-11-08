@@ -1,10 +1,7 @@
 use crate::config::{self, HumanDuration};
-use crate::utils::redb_utils;
 use anyhow::Context;
 use db::ArenaDatabase;
 use engine::Engine;
-use fs::ArenaFilesystem;
-use realize_types::Arena;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -35,48 +32,26 @@ mod xattr;
 /// Gives access to arena-specific stores and functions.
 pub(crate) struct ArenaStorage {
     pub(crate) db: Arc<ArenaDatabase>,
-    pub(crate) fs: Arc<ArenaFilesystem>,
     pub(crate) engine: Arc<Engine>,
     _watcher: RealWatcher,
     _drop_guard: DropGuard,
 }
 
 impl ArenaStorage {
-    pub(crate) async fn from_config(
-        arena: Arena,
-        arena_config: &config::ArenaConfig,
+    pub(crate) async fn with_db(
+        db: Arc<ArenaDatabase>,
         watcher_config: &config::WatcherConfig,
-        exclude: &Vec<&std::path::Path>,
     ) -> anyhow::Result<Self> {
         let shutdown = CancellationToken::new();
-        let dbpath = arena_config.workdir.join("arena.db");
-        let datadir = &arena_config.datadir;
-        let db = ArenaDatabase::new(
-            redb_utils::open(&dbpath).await?,
-            arena,
-            &arena_config.workdir.join("blobs"),
-            datadir,
-        )
-        .with_context(|| format!("Arena {arena} database in {dbpath:?}",))?;
         let tag = db.tag();
-        log::debug!("[{tag}] Arena setup with database {dbpath:?} and datadir {datadir:?}",);
+        let datadir = db.cache().datadir();
+        log::info!("[{tag}] Watching {datadir:?}");
 
-        let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
-        let exclude = exclude
-            .iter()
-            .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir).ok())
-            .collect::<Vec<_>>();
-        log::info!(
-            "[{tag}] Watching {datadir:?}{}",
-            exclude
-                .iter()
-                .map(|p| format!(" -\"{p}\""))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
         let watcher = RealWatcher::builder(Arc::clone(&db))
             .with_initial_scan()
-            .exclude_all(exclude.iter())
+            // This can be configured differently in the .toml, but we don't have access
+            // to it here. TODO: fix
+            .exclude_all([realize_types::Path::parse(".realize")?].iter())
             .debounce(
                 watcher_config
                     .debounce
@@ -107,7 +82,6 @@ impl ArenaStorage {
 
         Ok(ArenaStorage {
             db,
-            fs: Arc::clone(&arena_fs),
             engine,
             _watcher: watcher,
             _drop_guard: shutdown.drop_guard(),

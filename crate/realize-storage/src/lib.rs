@@ -1,6 +1,5 @@
 use anyhow::Context;
 use arena::engine::Engine;
-use arena::fs::ArenaFilesystem;
 use arena::{ArenaStorage, indexed_store};
 use config::StorageConfig;
 use futures::Stream;
@@ -46,38 +45,35 @@ impl Storage {
     /// Create and initialize storage from its configuration.
     pub async fn from_config(config: &StorageConfig) -> anyhow::Result<Arc<Self>> {
         let mut arena_storage = HashMap::new();
-        let exclude = build_exclude(&config);
+        let globaldb = create_globaldb(&config.cache.db)
+            .await
+            .with_context(|| format!("global database {:?}", config.cache.db))?;
+        let cache = Filesystem::with_db(globaldb).await?;
 
         for NamedArenaConfig {
             arena,
             config: arena_config,
         } in &config.arenas
         {
-            let arena = Arena::from(arena.as_str());
+            let arena = *arena;
+            let arena_db = if let Some(db) = cache.arena_db(arena) {
+                db
+            } else {
+                cache.add_arena(arena, &arena_config.datadir)?
+            };
+            log::debug!(
+                "[{}] Arena setup with datadir {:?}",
+                arena_db.tag(),
+                arena_db.cache().datadir()
+            );
+
             arena_storage.insert(
                 arena,
-                ArenaStorage::from_config(
-                    arena,
-                    arena_config,
-                    &config.watcher,
-                    &exclude.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
-                )
-                .await
-                .with_context(|| format!("in arena {arena}"))?,
+                ArenaStorage::with_db(arena_db, &config.watcher)
+                    .await
+                    .with_context(|| format!("in arena {arena}"))?,
             );
         }
-        let globaldb = create_globaldb(&config.cache.db)
-            .await
-            .with_context(|| format!("global database {:?}", config.cache.db))?;
-        let cache = Filesystem::with_db(
-            Arc::clone(&globaldb),
-            arena_storage
-                .values()
-                .map(|s| Arc::clone(&s.fs))
-                .collect::<Vec<_>>(),
-        )
-        .await
-        .context("global cache")?;
 
         Ok(Arc::new(Self {
             cache,
@@ -109,11 +105,7 @@ impl Storage {
 
     /// Take into account notification from a remote peer.
     pub async fn update(&self, peer: Peer, notification: Notification) -> Result<(), StorageError> {
-        let arena_storage = self.arena_storage(notification.arena())?;
-        let fs: Arc<ArenaFilesystem> = Arc::clone(&arena_storage.fs);
-        task::spawn_blocking(move || fs.update(peer, notification)).await??;
-
-        Ok(())
+        self.cache().update(peer, notification).await
     }
 
     /// Set the default mark for the files in the given arena.
@@ -273,17 +265,4 @@ impl Storage {
 
 async fn create_globaldb(path: &std::path::Path) -> anyhow::Result<Arc<GlobalDatabase>> {
     Ok(GlobalDatabase::new(redb_utils::open(path).await?)?)
-}
-
-/// Build a vector of all databases listed in `config`, to be excluded
-/// from syncing.
-fn build_exclude(config: &StorageConfig) -> Vec<std::path::PathBuf> {
-    let mut exclude = vec![];
-    // Cache is now required
-    exclude.push(config.cache.db.clone());
-    for NamedArenaConfig { config, .. } in &config.arenas {
-        exclude.push(config.workdir.clone())
-    }
-
-    exclude
 }

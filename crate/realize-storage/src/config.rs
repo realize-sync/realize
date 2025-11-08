@@ -94,23 +94,17 @@ pub struct ArenaConfig {
     /// Optional local path to the directory where files for that arena are stored.
     /// If specified, an indexer will be created for this arena.
     pub datadir: PathBuf,
-    /// Path to the directory where the database, blobs and overlay workdir are kept.
-    ///
-    /// This directory must be on the same directory as datadir, if specified.
-    pub workdir: PathBuf,
 }
 
 impl NamedArenaConfig {
-    pub fn new<P1, P2>(arena: Arena, root: P1, metadata: P2) -> Self
+    pub fn new<P>(arena: Arena, root: P) -> Self
     where
-        P1: AsRef<std::path::Path>,
-        P2: AsRef<std::path::Path>,
+        P: AsRef<std::path::Path>,
     {
         Self {
             arena,
             config: ArenaConfig {
                 datadir: root.as_ref().to_path_buf(),
-                workdir: metadata.as_ref().to_path_buf(),
             },
         }
     }
@@ -341,13 +335,11 @@ mod tests {
 
             [[arena]]
             name = "arena1"
-            workdir = "/path/to/arena1"
-            datadir = "/path/to/arena1/data"
+            datadir = "/path/to/arena1"
 
             [[arena]]
             name = "arena2"
-            datadir = "/path/to/arena2/data"
-            workdir = "/path/to/arena2"
+            datadir = "/path/to/arena2"
         "#;
 
         let config: StorageConfig = toml::from_str(toml_str).unwrap();
@@ -363,15 +355,13 @@ mod tests {
                 NamedArenaConfig {
                     arena: Arena::from("arena1"),
                     config: ArenaConfig {
-                        workdir: PathBuf::from("/path/to/arena1"),
-                        datadir: PathBuf::from("/path/to/arena1/data"),
+                        datadir: PathBuf::from("/path/to/arena1"),
                     },
                 },
                 NamedArenaConfig {
                     arena: Arena::from("arena2"),
                     config: ArenaConfig {
-                        workdir: PathBuf::from("/path/to/arena2"),
-                        datadir: PathBuf::from("/path/to/arena2/data"),
+                        datadir: PathBuf::from("/path/to/arena2"),
                     },
                 },
             ],

@@ -51,8 +51,7 @@ mod tests {
 
             [[arena]]
             name = "arena1"
-            datadir = "/path/to/arena1/data"
-            workdir = "/path/to/arena1/"
+            datadir = "/path/to/arena1"
 
             [watcher]
             max_parallel_hashers = 4
@@ -78,8 +77,7 @@ mod tests {
                         realize_storage::config::NamedArenaConfig {
                             arena: Arena::from("arena1"),
                             config: realize_storage::config::ArenaConfig {
-                              datadir: PathBuf::from("/path/to/arena1/data"),
-                              workdir: PathBuf::from("/path/to/arena1"),
+                              datadir: PathBuf::from("/path/to/arena1"),
                             }
                         },
                     ],

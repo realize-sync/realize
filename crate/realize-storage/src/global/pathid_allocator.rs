@@ -1,12 +1,6 @@
-use super::db::GlobalWriteTransaction;
-use crate::types::{InodePrefix, PartialInode, PathId};
-use crate::{Inode, StorageError};
+use crate::StorageError;
+use crate::types::PathId;
 use redb::ReadableTable;
-
-/// Allocate a new pathid in [GlobalDatabase].
-pub(crate) fn allocal_global_inode(txn: &GlobalWriteTransaction) -> Result<Inode, StorageError> {
-    Ok(PartialInode::from(allocate(&mut txn.pathid_range_table()?)?).to_inode(InodePrefix::ZERO))
-}
 
 /// Allocate a new pathid, using the given table and prefix.
 /// allocation function.
@@ -28,16 +22,14 @@ pub(crate) fn allocate(
 
 #[cfg(test)]
 mod tests {
-    use realize_types::Arena;
-
     use super::*;
     use crate::global::db::GlobalDatabase;
     use crate::utils::redb_utils;
+    use realize_types::Arena;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     struct Fixture {
-        db: Arc<GlobalDatabase>,
         arena_dbs: HashMap<Arena, Arc<GlobalDatabase>>,
     }
 
@@ -47,13 +39,12 @@ mod tests {
             T: IntoIterator<Item = Arena>,
         {
             let _ = env_logger::try_init();
-            let db = GlobalDatabase::new(redb_utils::in_memory()?)?;
             let mut arena_dbs = HashMap::new();
             for arena in arenas.into_iter() {
                 arena_dbs.insert(arena, GlobalDatabase::new(redb_utils::in_memory()?)?);
             }
 
-            Ok(Self { db, arena_dbs })
+            Ok(Self { arena_dbs })
         }
 
         fn arena_db(&self, arena: Arena) -> &Arc<GlobalDatabase> {
@@ -67,23 +58,6 @@ mod tests {
 
             Ok(pathid)
         }
-    }
-
-    #[test]
-    fn allocate_pathid_global() -> anyhow::Result<()> {
-        let fixture = Fixture::setup([])?;
-        let txn = fixture.db.begin_write()?;
-
-        let inode1 = allocal_global_inode(&txn)?;
-        let inode2 = allocal_global_inode(&txn)?;
-
-        // First allocation should be 2 (since 1 is ROOT_INODE)
-        assert_eq!(Inode(2), inode1);
-        // Second allocation should be 3
-        assert_eq!(Inode(3), inode2);
-
-        txn.commit()?;
-        Ok(())
     }
 
     #[test]

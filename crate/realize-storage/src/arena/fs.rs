@@ -54,16 +54,23 @@ impl ArenaFilesystem {
             datadir,
         )?;
 
-        Ok(ArenaFilesystem::new(arena, Arc::clone(&db))?)
+        Ok(ArenaFilesystem::new(Arc::clone(&db)))
     }
 
     /// Create a new ArenaCache from an arena, root pathid, database, and blob directory.
-    pub(crate) fn new(arena: Arena, db: Arc<ArenaDatabase>) -> Result<Arc<Self>, StorageError> {
-        Ok(Arc::new(Self { arena, db }))
+    pub(crate) fn new(db: Arc<ArenaDatabase>) -> Arc<Self> {
+        Arc::new(Self {
+            arena: db.arena(),
+            db,
+        })
     }
 
     pub(crate) fn arena(&self) -> Arena {
         self.arena
+    }
+
+    pub(crate) fn db(&self) -> &Arc<ArenaDatabase> {
+        &self.db
     }
 
     pub(crate) fn lookup(

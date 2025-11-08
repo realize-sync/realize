@@ -5,6 +5,9 @@ use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::UnixTime;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::PathBuf;
 
 #[allow(dead_code)]
 #[allow(unknown_lints)]
@@ -92,6 +95,7 @@ impl ByteConvertible<PathTableEntry> for PathTableEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ArenaTableEntry {
     pub(crate) prefix: InodePrefix,
+    pub(crate) datadir: PathBuf,
 }
 
 impl NamedType for ArenaTableEntry {
@@ -107,8 +111,9 @@ impl ByteConvertible<ArenaTableEntry> for ArenaTableEntry {
             message_reader.get_root::<cache_capnp::arena_table_entry::Reader>()?;
 
         let prefix = InodePrefix::from_u8(msg.get_prefix());
+        let datadir = PathBuf::from(OsString::from_vec(msg.get_datadir()?.into()));
 
-        return Ok(ArenaTableEntry { prefix });
+        return Ok(ArenaTableEntry { prefix, datadir });
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, ByteConversionError> {
@@ -117,6 +122,7 @@ impl ByteConvertible<ArenaTableEntry> for ArenaTableEntry {
             message.init_root::<cache_capnp::arena_table_entry::Builder>();
 
         builder.set_prefix(self.prefix.as_u8());
+        builder.set_datadir(&self.datadir.as_os_str().as_bytes());
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
@@ -149,6 +155,7 @@ mod tests {
     fn convert_arena_table_entry() -> anyhow::Result<()> {
         let entry = ArenaTableEntry {
             prefix: InodePrefix::from_u8(9),
+            datadir: PathBuf::from("/datadir"),
         };
         assert_eq!(
             entry,
