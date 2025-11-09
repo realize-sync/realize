@@ -15,9 +15,11 @@ use std::io::{self, ErrorKind};
 /// Returns I/O error with [ErrorKind::NotADirectory] if any
 /// intermediate component of the path is a symlink.
 pub fn metadata_no_symlink_blocking(
-    root: &std::path::Path,
-    path: &Path,
+    root: impl AsRef<std::path::Path>,
+    path: impl AsRef<Path>,
 ) -> Result<Metadata, io::Error> {
+    let root = root.as_ref();
+    let path = path.as_ref();
     let mut current_path = root.to_path_buf();
     if let Some(parent) = path.parent() {
         for component in parent.components() {
