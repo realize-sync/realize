@@ -12,7 +12,7 @@ use crate::utils::debouncer::DebouncerMap;
 use crate::utils::{fs_utils, hash};
 use notify::event::{MetadataKind, ModifyKind};
 use notify::{Event, EventKind, RecommendedWatcher, Watcher as _};
-use realize_types::{self, Path, UnixTime};
+use realize_types::{self, Path, PathSet, UnixTime};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ pub struct RealWatcher {
 /// Builder for creating a RealWatcher with convenient configuration options.
 pub struct RealWatcherBuilder {
     db: Arc<ArenaDatabase>,
-    exclude: Vec<realize_types::Path>,
+    exclude: PathSet,
     initial_scan: bool,
     debounce: Duration,
     max_parallelism: usize,
@@ -42,7 +42,7 @@ impl RealWatcherBuilder {
     pub fn new(db: Arc<ArenaDatabase>) -> Self {
         Self {
             db,
-            exclude: Vec::new(),
+            exclude: PathSet::new(),
             initial_scan: false,
             debounce: Duration::ZERO,
             max_parallelism: 0,
@@ -110,7 +110,7 @@ impl RealWatcher {
     }
 
     async fn spawn(
-        exclude: Vec<realize_types::Path>,
+        exclude: PathSet,
         db: Arc<ArenaDatabase>,
         initial_scan: bool,
         debounce: Duration,
@@ -236,7 +236,7 @@ struct RealWatcherWorker {
     /// Paths that should be excluded from the index. These may be
     /// files or directories. For directories, the whole directory
     /// content is excluded.
-    exclude: Arc<Vec<realize_types::Path>>,
+    exclude: Arc<PathSet>,
 }
 
 impl RealWatcherWorker {
@@ -290,7 +290,7 @@ impl RealWatcherWorker {
                 self.process_path(watch_tx, path, false).await?;
             }
             FsEvent::Index(path, mtime, size) => {
-                if path.matches_any(&self.exclude) {
+                if self.exclude.matches(path) {
                     return Ok(());
                 }
                 debouncer.spawn_limited(path.clone(), *size > 0, {
@@ -431,7 +431,7 @@ fn choose_actions(
     path: &Path,
     fs_status: &FsNodeStatus,
     cache_status: &CacheEntryStatus,
-    exclude: &Vec<Path>,
+    exclude: &PathSet,
 ) -> Vec<WatcherAction> {
     match (fs_status, cache_status) {
         (FsNodeStatus::Dir, CacheEntryStatus::Dir { local: true, .. }) => {
@@ -478,7 +478,7 @@ fn choose_actions(
                 size: size_b,
             },
         ) => {
-            if path.matches_any(exclude) {
+            if exclude.matches(path) {
                 vec![WatcherAction::Unindex]
             } else if mtime_a == mtime_b && size_a == size_b {
                 vec![]
@@ -488,7 +488,7 @@ fn choose_actions(
             }
         }
         (FsNodeStatus::ReadableRegularFile(mtime, size), CacheEntryStatus::Preindexed) => {
-            if path.matches_any(exclude) {
+            if exclude.matches(path) {
                 vec![]
             } else {
                 vec![WatcherAction::Index(*mtime, *size)]
@@ -500,7 +500,7 @@ fn choose_actions(
         ) => vec![WatcherAction::Preindex, WatcherAction::Index(*mtime, *size)],
         (FsNodeStatus::ReadableRegularFile(mtime, size), CacheEntryStatus::Dir { .. }) => {
             let mut actions = vec![WatcherAction::Remove, WatcherAction::Preindex];
-            if !path.matches_any(exclude) {
+            if !exclude.matches(path) {
                 actions.push(WatcherAction::Index(*mtime, *size));
             }
 
@@ -522,7 +522,7 @@ fn process_path_read(
     cache: &impl CacheReadOperations,
     path: &Path,
     scan: bool,
-    exclude: &Vec<Path>,
+    exclude: &PathSet,
     tx: &mpsc::Sender<FsEvent>,
 ) -> anyhow::Result<bool> {
     let metadata = fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).ok();
@@ -558,7 +558,7 @@ fn process_path_write(
     db: &Arc<ArenaDatabase>,
     path: &Path,
     scan: bool,
-    exclude: &Vec<Path>,
+    exclude: &PathSet,
     tx: &mpsc::Sender<FsEvent>,
 ) -> anyhow::Result<()> {
     let metadata = fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).ok();
