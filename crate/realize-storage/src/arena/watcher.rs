@@ -78,10 +78,8 @@ impl RealWatcherBuilder {
     }
 
     /// Add multiple paths to exclude from watching.
-    pub fn exclude_all<'a>(mut self, paths: impl Iterator<Item = &'a realize_types::Path>) -> Self {
-        for path in paths {
-            self.exclude.push(path.clone());
-        }
+    pub fn exclude(mut self, pathset: PathSet) -> Self {
+        self.exclude = pathset;
 
         self
     }
@@ -465,12 +463,22 @@ fn choose_actions(
         (FsNodeStatus::Missing, CacheEntryStatus::Preindexed) => vec![WatcherAction::Remove],
         (FsNodeStatus::Missing, CacheEntryStatus::Indexed { .. }) => vec![WatcherAction::Remove],
         (FsNodeStatus::OtherFile, CacheEntryStatus::Dir { .. }) => {
-            vec![WatcherAction::Remove, WatcherAction::Preindex]
+            let mut ret = vec![WatcherAction::Remove];
+            if !exclude.matches(path) {
+                ret.push(WatcherAction::Preindex);
+            }
+
+            ret
         }
         (FsNodeStatus::OtherFile, CacheEntryStatus::Indexed { .. }) => vec![WatcherAction::Unindex],
         (FsNodeStatus::OtherFile, CacheEntryStatus::Preindexed) => vec![],
-        (FsNodeStatus::OtherFile, CacheEntryStatus::Missing) => vec![WatcherAction::Preindex],
-        (FsNodeStatus::OtherFile, CacheEntryStatus::Remote) => vec![WatcherAction::Preindex],
+        (FsNodeStatus::OtherFile, CacheEntryStatus::Missing | CacheEntryStatus::Remote) => {
+            if exclude.matches(path) {
+                vec![]
+            } else {
+                vec![WatcherAction::Preindex]
+            }
+        }
         (
             FsNodeStatus::ReadableRegularFile(mtime_a, size_a),
             CacheEntryStatus::Indexed {
@@ -497,10 +505,17 @@ fn choose_actions(
         (
             FsNodeStatus::ReadableRegularFile(mtime, size),
             CacheEntryStatus::Missing | CacheEntryStatus::Remote,
-        ) => vec![WatcherAction::Preindex, WatcherAction::Index(*mtime, *size)],
+        ) => {
+            if exclude.matches(path) {
+                vec![]
+            } else {
+                vec![WatcherAction::Preindex, WatcherAction::Index(*mtime, *size)]
+            }
+        }
         (FsNodeStatus::ReadableRegularFile(mtime, size), CacheEntryStatus::Dir { .. }) => {
-            let mut actions = vec![WatcherAction::Remove, WatcherAction::Preindex];
+            let mut actions = vec![WatcherAction::Remove];
             if !exclude.matches(path) {
+                actions.push(WatcherAction::Preindex);
                 actions.push(WatcherAction::Index(*mtime, *size));
             }
 
@@ -758,7 +773,7 @@ mod tests {
         db: Arc<ArenaDatabase>,
         root: ChildPath,
         tempdir: TempDir,
-        exclude: Vec<realize_types::Path>,
+        exclude: PathSet,
     }
 
     impl Fixture {
@@ -775,7 +790,7 @@ mod tests {
                 root,
                 db,
                 tempdir,
-                exclude: vec![],
+                exclude: PathSet::new(),
             })
         }
 
@@ -788,7 +803,7 @@ mod tests {
         async fn scan_and_watch(&self) -> anyhow::Result<RealWatcher> {
             RealWatcher::builder(Arc::clone(&self.db))
                 .with_initial_scan()
-                .exclude_all(self.exclude.iter())
+                .exclude(self.exclude.clone())
                 .spawn()
                 .await
         }
@@ -799,7 +814,7 @@ mod tests {
         /// is called might still get reported.
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
             RealWatcher::builder(Arc::clone(&self.db))
-                .exclude_all(self.exclude.iter())
+                .exclude(self.exclude.clone())
                 .spawn()
                 .await
         }
@@ -1701,9 +1716,12 @@ mod tests {
                 .is_some()
         );
 
-        assert!(index::has_local_file_async(db, &excluded).await?);
-        assert!(index::has_local_file_async(db, &also_excluded).await?);
-        assert!(index::has_local_file_async(db, &not_excluded).await?);
+        assert_eq!(false, index::has_local_file_async(db, &excluded).await?);
+        assert_eq!(
+            false,
+            index::has_local_file_async(db, &also_excluded).await?
+        );
+        assert_eq!(true, index::has_local_file_async(db, &not_excluded).await?);
 
         Ok(())
     }
@@ -1810,9 +1828,12 @@ mod tests {
                 .is_some()
         );
 
-        assert!(index::has_local_file_async(db, &excluded).await?);
-        assert!(index::has_local_file_async(db, &also_excluded).await?);
-        assert!(index::has_local_file_async(db, &not_excluded).await?);
+        assert_eq!(false, index::has_local_file_async(db, &excluded).await?);
+        assert_eq!(
+            false,
+            index::has_local_file_async(db, &also_excluded).await?
+        );
+        assert_eq!(true, index::has_local_file_async(db, &not_excluded).await?);
 
         Ok(())
     }

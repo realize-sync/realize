@@ -15,7 +15,7 @@ use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
 use crate::types::{PartialInode, PathId};
 use crate::utils::holder::Holder;
-use realize_types::Arena;
+use realize_types::{Arena, PathSet};
 use redb::TableDefinition;
 use std::cell::RefCell;
 use std::panic::Location;
@@ -195,6 +195,7 @@ impl ArenaDatabase {
             arena,
             blob_dir,
             datadir,
+            PathSet::new(),
         )?)
     }
 
@@ -203,6 +204,7 @@ impl ArenaDatabase {
         arena: Arena,
         blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
+        exclude: PathSet,
     ) -> Result<Arc<Self>, StorageError> {
         let tree = Tree::new(arena);
         let cache: Cache;
@@ -241,7 +243,7 @@ impl ArenaDatabase {
             uuid = settings.borrow().uuid;
             tag = Tag::new(uuid, arena);
             blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
-            cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref())?;
+            cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref(), exclude)?;
         }
         txn.commit()?;
 
@@ -844,14 +846,26 @@ mod tests {
         let blob_dir = tempdir.join("blobs");
         let datadir = tempdir.join("data");
         let arena = Arena::from("myarena");
-        let db = ArenaDatabase::new(redb::Database::create(&dbpath)?, arena, &blob_dir, &datadir)?;
+        let db = ArenaDatabase::new(
+            redb::Database::create(&dbpath)?,
+            arena,
+            &blob_dir,
+            &datadir,
+            PathSet::new(),
+        )?;
         let uuid = db.uuid().clone();
         assert!(!uuid.is_nil());
         assert_eq!(db.settings().borrow().uuid, *db.uuid());
 
         drop(db);
 
-        let db = ArenaDatabase::new(redb::Database::create(&dbpath)?, arena, &blob_dir, &datadir)?;
+        let db = ArenaDatabase::new(
+            redb::Database::create(&dbpath)?,
+            arena,
+            &blob_dir,
+            &datadir,
+            PathSet::new(),
+        )?;
         assert_eq!(uuid, *db.uuid());
         assert_eq!(db.settings().borrow().uuid, *db.uuid());
 

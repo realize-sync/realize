@@ -4,7 +4,7 @@ use anyhow::Context;
 use db::ArenaDatabase;
 use engine::Engine;
 use fs::ArenaFilesystem;
-use realize_types::Arena;
+use realize_types::{Arena, PathSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -51,21 +51,22 @@ impl ArenaStorage {
         let shutdown = CancellationToken::new();
         let dbpath = arena_config.workdir.join("arena.db");
         let datadir = &arena_config.datadir;
+        let exclude = exclude
+            .iter()
+            .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir).ok())
+            .collect::<PathSet>();
         let db = ArenaDatabase::new(
             redb_utils::open(&dbpath).await?,
             arena,
             &arena_config.workdir.join("blobs"),
             datadir,
+            exclude.clone(),
         )
         .with_context(|| format!("Arena {arena} database in {dbpath:?}",))?;
         let tag = db.tag();
         log::debug!("[{tag}] Arena setup with database {dbpath:?} and datadir {datadir:?}",);
 
         let arena_fs = ArenaFilesystem::new(arena, Arc::clone(&db))?;
-        let exclude = exclude
-            .iter()
-            .filter_map(|p| realize_types::Path::from_real_path_in(p, &datadir).ok())
-            .collect::<Vec<_>>();
         log::info!(
             "[{tag}] Watching {datadir:?}{}",
             exclude
@@ -76,7 +77,7 @@ impl ArenaStorage {
         );
         let watcher = RealWatcher::builder(Arc::clone(&db))
             .with_initial_scan()
-            .exclude_all(exclude.iter())
+            .exclude(exclude)
             .debounce(
                 watcher_config
                     .debounce
