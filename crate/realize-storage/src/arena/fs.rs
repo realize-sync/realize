@@ -47,11 +47,14 @@ impl ArenaFilesystem {
         blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
+        use realize_types::PathSet;
+
         let db = ArenaDatabase::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
             blob_dir,
             datadir,
+            PathSet::new(),
         )?;
 
         Ok(ArenaFilesystem::new(Arc::clone(&db)))

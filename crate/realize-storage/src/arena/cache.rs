@@ -14,11 +14,12 @@ use crate::arena::tree::{self, TreeLoc};
 use crate::arena::types::{CacheEntryStatus, DirMetadata, FileAlternative, Version};
 use crate::global::types::PathAssignment;
 use crate::types::{PartialInode, PathId};
+use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use crate::utils::inhibit::{self, Inhibit};
-use realize_types::{Hash, Path, Peer, UnixTime};
+use realize_types::{Hash, Path, PathSet, Peer, UnixTime};
 use redb::{ReadableTable, Table};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Read operations for cache. See also [CacheExt].
@@ -155,7 +156,7 @@ where
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<crate::Metadata>, StorageError> {
-        return metadata(&self.table, tree, &self.cache.datadir, loc);
+        return metadata(self.cache, &self.table, tree, loc);
     }
 
     fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -189,13 +190,7 @@ where
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
-        let loc = loc.into();
-        ReadDirIterator::new(
-            &self.table,
-            tree,
-            self.local_path(tree, loc.borrow()).ok(),
-            loc,
-        )
+        ReadDirIterator::new(&self.cache, &self.table, tree, loc, true)
     }
 
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -253,7 +248,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<crate::Metadata>, StorageError> {
-        return metadata(&self.table, tree, &self.cache.datadir, loc);
+        return metadata(self.cache, &self.table, tree, loc);
     }
 
     fn file_realm<'b, L: Into<TreeLoc<'b>>>(
@@ -288,12 +283,7 @@ impl<'a> CacheReadOperations for WritableOpenCache<'a> {
         loc: L,
     ) -> impl Iterator<Item = Result<(String, Option<PathId>, crate::Metadata), StorageError>> {
         let loc = loc.into();
-        ReadDirIterator::new(
-            &self.table,
-            tree,
-            self.local_path(tree, loc.borrow()).ok(),
-            loc,
-        )
+        ReadDirIterator::new(&self.cache, &self.table, tree, loc, true)
     }
 
     fn file_at_pathid(&self, pathid: PathId) -> Result<Option<FileTableEntry>, StorageError> {
@@ -1120,7 +1110,7 @@ impl<'a> WritableOpenCache<'a> {
                         // Get rid of unnecessary parent dirs. This only happens when
                         // files are removed due to remote notifications and when
                         // dirs have no local equivalent.
-                        delete_empty_remote_dir(&mut self.table, tree, parent)?;
+                        delete_empty_remote_dir(&self.cache, &mut self.table, tree, parent)?;
                     }
                 }
             }
@@ -1161,7 +1151,7 @@ impl<'a> WritableOpenCache<'a> {
                     let parent = tree.parent(pathid)?;
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
                     if let Some(parent) = parent {
-                        delete_empty_remote_dir(&mut self.table, tree, parent)?;
+                        delete_empty_remote_dir(&self.cache, &mut self.table, tree, parent)?;
                     }
                 }
             }
@@ -1403,7 +1393,7 @@ impl<'a> WritableOpenCache<'a> {
                     }
                     if entry.local {
                         if entry.mtime.is_some()
-                            && ReadDirIterator::new(&self.table, tree, None, pathid)
+                            && ReadDirIterator::new(&self.cache, &self.table, tree, pathid, false)
                                 .next()
                                 .is_some()
                         {
@@ -1527,15 +1517,20 @@ impl<'a> WritableOpenCache<'a> {
 pub(crate) struct Cache {
     datadir: PathBuf,
     inhibit_watcher: Inhibit,
+    exclude: PathSet,
 }
 
 impl Cache {
     /// Initialize the database. This should be called at startup, in the
     /// transaction that crates new tables.
+    ///
+    /// Local paths that match `exclude` are not automatically
+    /// taken into account by readdir or lookup.
     pub(crate) fn setup(
         cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
         root_pathid: PathId,
         datadir: &std::path::Path,
+        exclude: PathSet,
     ) -> Result<Self, StorageError> {
         if cache_table.get((root_pathid, Layer::Default))?.is_none() {
             // Exceptionally not using write_dir and not going
@@ -1553,6 +1548,7 @@ impl Cache {
         Ok(Cache {
             datadir: datadir.to_path_buf(),
             inhibit_watcher: Inhibit::new(),
+            exclude,
         })
     }
 
@@ -1577,15 +1573,18 @@ impl Cache {
 
 /// Get metadata for a file or directory.
 fn metadata<'b, L: Into<TreeLoc<'b>>>(
+    cache: &Cache,
     cache_table: &impl ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
     tree: &impl TreeReadOperations,
-    datadir: &std::path::Path,
     loc: L,
 ) -> Result<Option<crate::Metadata>, StorageError> {
     let loc = loc.into();
-    let m = local_path(datadir, tree, loc.borrow())
-        .ok()
-        .and_then(|p| p.symlink_metadata().ok());
+    let mut m = None;
+    if let Ok(path) = tree.backtrack(loc.borrow()) {
+        if !cache.exclude.matches(&path) {
+            m = fs_utils::metadata_no_symlink_blocking(&cache.datadir, path).ok();
+        }
+    };
     let pathid = tree.resolve(loc)?;
 
     expand_metadata(cache_table, pathid, m)
@@ -1755,7 +1754,7 @@ where
 {
     table: &'a T,
     iter: tree::ReadDirIterator<'b>,
-    realentries: Option<(PathBuf, HashSet<String>)>,
+    realentries: Option<HashMap<String, std::fs::Metadata>>,
 }
 
 impl<'a, 'b, T> ReadDirIterator<'a, 'b, T>
@@ -1763,15 +1762,20 @@ where
     T: ReadableTable<(PathId, Layer), Holder<'static, CacheTableEntry>>,
 {
     fn new<'l, L: Into<TreeLoc<'l>>>(
+        cache: &Cache,
         table: &'a T,
         tree: &'b impl TreeReadOperations,
-        realpath: Option<PathBuf>,
         loc: L,
+        merge_with_local: bool,
     ) -> Self {
-        let realentries = realpath.and_then(|p| {
-            let res = build_realentries(p);
-            res.ok()
-        });
+        let loc = loc.into();
+        let mut realentries = None;
+        if merge_with_local
+            && let Ok(path) = tree.backtrack(loc.borrow())
+            && !cache.exclude.matches(&path)
+        {
+            realentries = build_realentries(cache, &path).ok();
+        }
         let iter = match tree.expect(loc) {
             Ok(pathid) => tree.readdir_pathid(pathid),
             Err(StorageError::NotFound) => {
@@ -1792,18 +1796,24 @@ where
     }
 }
 
-fn build_realentries(realpath: PathBuf) -> Result<(PathBuf, HashSet<String>), std::io::Error> {
-    let mut entries = HashSet::new();
-    let readdir = std::fs::read_dir(&realpath)?;
+fn build_realentries(
+    cache: &Cache,
+    dir_path: &Path,
+) -> Result<HashMap<String, std::fs::Metadata>, std::io::Error> {
+    let mut entries = HashMap::new();
+    let readdir = std::fs::read_dir(dir_path.within(&cache.datadir))?;
     for entry in readdir {
         let entry = entry?;
-        if let Ok(name) = entry.file_name().into_string() {
-            // ignore files with invalid (non-unicode) names
-            entries.insert(name);
+        // Ignore files with non-utf8 names or anything Path finds invalid.
+        if let Ok(name) = entry.file_name().into_string()
+            && let Ok(entry_path) = dir_path.join(&name)
+            && !cache.exclude.matches(&entry_path)
+            && let Ok(m) = fs_utils::metadata_no_symlink_blocking(&cache.datadir, entry_path)
+        {
+            entries.insert(name, m);
         }
     }
-
-    Ok((realpath, entries))
+    Ok(entries)
 }
 
 impl<'a, 'b, T> Iterator for ReadDirIterator<'a, 'b, T>
@@ -1818,13 +1828,7 @@ where
                 Err(err) => return Some(Err(err)),
                 Ok(ret) => ret,
             };
-            let real = if let Some((realpath, names)) = self.realentries.as_mut() {
-                names
-                    .take(&name)
-                    .and_then(|n| realpath.join(n).symlink_metadata().ok())
-            } else {
-                None
-            };
+            let real = self.realentries.as_mut().and_then(|e| e.remove(&name));
             match expand_metadata(self.table, Some(pathid), real) {
                 Ok(None) => {}
                 Ok(Some(m)) => return Some(Ok((name, Some(pathid), m))),
@@ -1832,14 +1836,10 @@ where
             }
         }
 
-        if let Some((realpath, entries)) = &mut self.realentries {
-            let name = entries.iter().next().cloned();
-            if let Some(name) = name {
-                entries.remove(&name);
-                if let Some(m) = realpath.join(&name).symlink_metadata().ok() {
-                    return Some(Ok((name, None, m.into())));
-                }
-            }
+        if let Some(entries) = &mut self.realentries
+            && let Some((name, m)) = pop_first(entries)
+        {
+            return Some(Ok((name, None, m.into())));
         }
 
         None
@@ -2041,6 +2041,7 @@ fn write_dir(
 }
 
 fn delete_empty_remote_dir(
+    cache: &Cache,
     cache_table: &mut redb::Table<'_, (PathId, Layer), Holder<CacheTableEntry>>,
     tree: &mut WritableOpenTree,
     pathid: PathId,
@@ -2049,13 +2050,13 @@ fn delete_empty_remote_dir(
         let parent = tree.parent(pathid)?;
         let entry = existing.expect_dir()?;
         if !entry.local
-            && ReadDirIterator::new(cache_table, tree, None, pathid)
+            && ReadDirIterator::new(cache, cache_table, tree, pathid, false)
                 .next()
                 .is_none()
         {
             tree.remove_and_decref(pathid, cache_table, (pathid, Layer::Default))?;
             if let Some(parent) = parent {
-                return delete_empty_remote_dir(cache_table, tree, parent);
+                return delete_empty_remote_dir(cache, cache_table, tree, parent);
             }
         }
     }
@@ -2173,6 +2174,23 @@ fn entry_status<'b, L: Into<TreeLoc<'b>>>(
             }
         },
     }
+}
+
+/// Remove and return the first element of the map.
+///
+/// "first" here is whatever the map iterator returns first.
+fn pop_first<K, V>(map: &mut HashMap<K, V>) -> Option<(K, V)>
+where
+    K: Clone + Eq + std::hash::Hash,
+{
+    let next_key = map.keys().next().cloned();
+    if let Some(next_key) = next_key {
+        // unwrap is safe, since we know next_key is there
+        let value = map.remove(&next_key).unwrap();
+        return Some((next_key, value));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -3427,6 +3445,63 @@ mod tests {
         assert_eq!(5, m.size);
         assert_eq!(UnixTime::mtime(&file_child.metadata().unwrap()), m.mtime);
         assert_eq!(Version::Modified(Some(hash::digest("cached"))), m.version);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn skip_excluded() -> anyhow::Result<()> {
+        let datadir = TempDir::new()?;
+        let arena = test_arena();
+        let db = ArenaDatabase::new(
+            crate::utils::redb_utils::in_memory()?,
+            arena,
+            datadir.join("blobs").as_path(),
+            datadir.path(),
+            PathSet::from([
+                Path::parse("dir/dir2")?,
+                Path::parse("blobs")?,
+                Path::parse("dir/file1")?,
+            ]),
+        )?;
+        datadir.child("dir/file1").write_str("test")?;
+        datadir.child("dir/file2").write_str("test")?;
+        datadir.child("dir/dir2/file3").write_str("test")?;
+
+        let txn = db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+
+        // blobs is excluded
+        let entries = cache
+            .readdir(&tree, Path::root())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            vec!["dir"],
+            entries
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(cache.metadata(&tree, Path::parse("dir")?)?.is_some());
+        assert!(cache.metadata(&tree, Path::parse("blobs")?)?.is_none());
+
+        // dir/file1 and dir/dir2 are excluded, leaving only dir/file2
+        let entries = cache
+            .readdir(&tree, Path::parse("dir")?)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            vec!["file2"],
+            entries
+                .iter()
+                .map(|(name, _, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(cache.metadata(&tree, Path::parse("dir/file1")?)?.is_none());
+        assert!(cache.metadata(&tree, Path::parse("dir/file2")?)?.is_some());
+        assert!(cache.metadata(&tree, Path::parse("dir/dir2")?)?.is_none());
 
         Ok(())
     }
@@ -4944,7 +5019,7 @@ mod tests {
         // Test error cases
         let nonexistent_pathid = PathId(99999);
         let result = cache.metadata(&tree, nonexistent_pathid);
-        assert!(matches!(result, Ok(None)), "result.ok:{:?}", result.ok());
+        assert!(matches!(result, Ok(None)), "result:{result:?}");
 
         Ok(())
     }

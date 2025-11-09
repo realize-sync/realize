@@ -146,17 +146,15 @@ impl Path {
     /// `Path::parts("foo")?` even though "foobar" start with
     /// "foo".
     pub fn starts_with<T: AsRef<Path>>(&self, other: T) -> bool {
-        if let Some(rest) = self.str.strip_prefix(other.as_ref().as_str()) {
+        let other = other.as_ref();
+        if other.as_str() == "" {
+            return true;
+        }
+        if let Some(rest) = self.str.strip_prefix(other.as_str()) {
             return rest == "" || rest.starts_with('/');
         }
 
         false
-    }
-
-    /// Returns true if any member of `paths` starts with or is the
-    /// same as this path.
-    pub fn matches_any(&self, paths: &Vec<Path>) -> bool {
-        paths.iter().any(|e| self.starts_with(e))
     }
 }
 
@@ -188,10 +186,71 @@ impl std::fmt::Display for Path {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSet {
+    paths: Vec<Path>,
+}
+
+impl PathSet {
+    pub fn new() -> Self {
+        Self { paths: vec![] }
+    }
+
+    pub fn push(&mut self, path: Path) {
+        self.paths.push(path);
+    }
+
+    /// Iterate over the paths in this set.
+    pub fn iter(&self) -> impl Iterator<Item = &Path> {
+        self.paths.iter()
+    }
+
+    /// Transform this PathSet into an iterator.
+    ///
+    /// Note: PathSet doesn't implement `IntoIterator` because that
+    /// interferes with the implementation of `From<T>` where `T:
+    /// IntoIterator<Item=Path>`.
+    pub fn into_iter(self) -> impl Iterator<Item = Path> {
+        self.paths.into_iter()
+    }
+
+    /// Returns true if any member of the set starts with or is the
+    /// same as the given path.
+    pub fn matches(&self, path: impl AsRef<Path>) -> bool {
+        // Since this does a start_with, This could be optimized by
+        // sorting paths and doing some kind of binary search.
+        let path = path.as_ref();
+
+        self.paths.iter().any(|e| path.starts_with(e))
+    }
+}
+
+impl<T: IntoIterator<Item = Path>> From<T> for PathSet {
+    fn from(value: T) -> Self {
+        let mut set = PathSet::new();
+        for path in value.into_iter() {
+            set.push(path)
+        }
+
+        set
+    }
+}
+
+impl FromIterator<Path> for PathSet {
+    fn from_iter<T: IntoIterator<Item = Path>>(iter: T) -> Self {
+        let mut set = PathSet::new();
+        for path in iter {
+            set.push(path)
+        }
+
+        set
+    }
+}
+
 /// Errors returned by Path functions
 #[derive(Debug, thiserror::Error)]
 pub enum PathError {
-    #[error("Paths must not contain . or ..")]
+    #[error("Paths must be regular relative paths with no . or .. components")]
     Invalid,
     #[error("Paths must be valid unicode")]
     BadEncoding,
@@ -411,14 +470,16 @@ mod tests {
 
     #[test]
     fn starts_with_file_or_dir() -> anyhow::Result<()> {
-        assert!(Path::parse("test/foo")?.starts_with(&Path::parse("test")?));
-        assert!(Path::parse("test/foo")?.starts_with(&Path::parse("test/foo")?));
-        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("test/foo/bar")?));
-        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("test/foobar")?));
+        assert!(Path::parse("test/foo")?.starts_with(Path::parse("test")?));
+        assert!(Path::parse("test/foo")?.starts_with(Path::parse("test/foo")?));
+        assert!(!Path::parse("test/foo")?.starts_with(Path::parse("test/foo/bar")?));
+        assert!(!Path::parse("test/foo")?.starts_with(Path::parse("test/foobar")?));
 
-        assert!(!Path::parse("test/foo")?.starts_with(&Path::parse("t")?));
-        assert!(!Path::parse("test/foobar")?.starts_with(&Path::parse("test/foo")?));
+        assert!(!Path::parse("test/foo")?.starts_with(Path::parse("t")?));
+        assert!(!Path::parse("test/foobar")?.starts_with(Path::parse("test/foo")?));
 
+        assert!(Path::parse("any")?.starts_with(Path::root()));
+        assert!(!Path::root().starts_with(Path::parse("any")?));
         Ok(())
     }
 
@@ -445,6 +506,26 @@ mod tests {
             Path::parse("foo/bar")?.join("../baz"),
             Err(PathError::Invalid),
         ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn pathset() -> anyhow::Result<()> {
+        assert_eq!(false, PathSet::new().matches(Path::parse("any")?));
+        assert_eq!(false, PathSet::new().matches(Path::root()));
+        assert_eq!(
+            true,
+            PathSet::from([Path::root()]).matches(Path::parse("any")?)
+        );
+
+        let foobar = PathSet::from([Path::parse("foo")?, Path::parse("bar")?]);
+        assert_eq!(true, foobar.matches(Path::parse("foo")?));
+        assert_eq!(true, foobar.matches(Path::parse("foo/and/more")?));
+        assert_eq!(true, foobar.matches(Path::parse("bar")?));
+        assert_eq!(true, foobar.matches(Path::parse("bar/and/more")?));
+        assert_eq!(false, foobar.matches(Path::parse("notfoo")?));
+        assert_eq!(false, foobar.matches(Path::parse("food/and/drinks")?));
 
         Ok(())
     }

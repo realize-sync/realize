@@ -2,6 +2,7 @@ use crate::config::{self, HumanDuration};
 use anyhow::Context;
 use db::ArenaDatabase;
 use engine::Engine;
+use realize_types::PathSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -51,7 +52,7 @@ impl ArenaStorage {
             .with_initial_scan()
             // This can be configured differently in the .toml, but we don't have access
             // to it here. TODO: fix
-            .exclude_all([realize_types::Path::parse(".realize")?].iter())
+            .exclude(PathSet::from([realize_types::Path::parse(".realize")?]))
             .debounce(
                 watcher_config
                     .debounce

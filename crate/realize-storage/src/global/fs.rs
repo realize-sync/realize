@@ -9,7 +9,7 @@ use crate::types::{InodePrefix, PartialInode, PathId};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, StorageError};
 use bimap::BiMap;
-use realize_types::{Arena, Path, Peer};
+use realize_types::{Arena, Path, PathSet, Peer};
 use redb::ReadableTable;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -731,6 +731,7 @@ fn build_arena_db(
         arena,
         blob_dir,
         datadir,
+        PathSet::from([Path::parse(".realize")?]),
     )
 }
 
