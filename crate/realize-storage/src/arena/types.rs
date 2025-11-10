@@ -1471,7 +1471,7 @@ impl From<&FileTableEntry> for Option<IndexedFile> {
 }
 
 /// Status of a entry in the cache.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CacheEntryStatus {
     /// There are no such entry.
     Missing,

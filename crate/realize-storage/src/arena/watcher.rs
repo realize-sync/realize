@@ -31,7 +31,6 @@ pub struct RealWatcher {
 /// Builder for creating a RealWatcher with convenient configuration options.
 pub struct RealWatcherBuilder {
     db: Arc<ArenaDatabase>,
-    exclude: PathSet,
     initial_scan: bool,
     debounce: Duration,
     max_parallelism: usize,
@@ -42,7 +41,6 @@ impl RealWatcherBuilder {
     pub fn new(db: Arc<ArenaDatabase>) -> Self {
         Self {
             db,
-            exclude: PathSet::new(),
             initial_scan: false,
             debounce: Duration::ZERO,
             max_parallelism: 0,
@@ -77,13 +75,6 @@ impl RealWatcherBuilder {
         self
     }
 
-    /// Add multiple paths to exclude from watching.
-    pub fn exclude(mut self, pathset: PathSet) -> Self {
-        self.exclude = pathset;
-
-        self
-    }
-
     /// Spawn the watcher with the current configuration.
     ///
     /// To stop the background work cleanly, call [RealWatcher::shutdown].
@@ -91,7 +82,6 @@ impl RealWatcherBuilder {
     /// Background work is also stopped at some point after the instance is dropped.
     pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
         RealWatcher::spawn(
-            self.exclude,
             Arc::clone(&self.db),
             self.initial_scan,
             self.debounce,
@@ -108,7 +98,6 @@ impl RealWatcher {
     }
 
     async fn spawn(
-        exclude: PathSet,
         db: Arc<ArenaDatabase>,
         initial_scan: bool,
         debounce: Duration,
@@ -147,10 +136,7 @@ impl RealWatcher {
 
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        let worker = Arc::new(RealWatcherWorker {
-            db: db.clone(),
-            exclude: Arc::new(exclude),
-        });
+        let worker = Arc::new(RealWatcherWorker { db: db.clone() });
 
         task::spawn({
             let watch_tx = watch_tx.clone();
@@ -230,11 +216,6 @@ impl FsEvent {
 
 struct RealWatcherWorker {
     db: Arc<ArenaDatabase>,
-
-    /// Paths that should be excluded from the index. These may be
-    /// files or directories. For directories, the whole directory
-    /// content is excluded.
-    exclude: Arc<PathSet>,
 }
 
 impl RealWatcherWorker {
@@ -288,7 +269,7 @@ impl RealWatcherWorker {
                 self.process_path(watch_tx, path, false).await?;
             }
             FsEvent::Index(path, mtime, size) => {
-                if self.exclude.matches(path) {
+                if self.db.cache().exclude().matches(path) {
                     return Ok(());
                 }
                 debouncer.spawn_limited(path.clone(), *size > 0, {
@@ -325,7 +306,6 @@ impl RealWatcherWorker {
     ) -> Result<(), anyhow::Error> {
         let db = self.db.clone();
         let watch_tx = watch_tx.clone();
-        let exclude = self.exclude.clone();
         let path = path.clone();
         tokio::task::spawn_blocking(move || {
             let mut needs_writing = false;
@@ -333,7 +313,15 @@ impl RealWatcherWorker {
                 let txn = db.begin_read()?;
                 let tree = txn.read_tree()?;
                 let cache = txn.read_cache()?;
-                if !process_path_read(db.tag(), &tree, &cache, &path, scan, &exclude, &watch_tx)? {
+                if !process_path_read(
+                    db.tag(),
+                    &tree,
+                    &cache,
+                    &path,
+                    scan,
+                    db.cache().exclude(),
+                    &watch_tx,
+                )? {
                     needs_writing = true;
                 }
             }
@@ -354,7 +342,6 @@ impl RealWatcherWorker {
                         &db,
                         &path,
                         scan,
-                        &exclude,
                         &watch_tx,
                     )?;
                 }
@@ -436,23 +423,27 @@ fn choose_actions(
             vec![WatcherAction::ProcessDirContent]
         }
         (FsNodeStatus::Dir, CacheEntryStatus::Dir { local: false, .. }) => {
-            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+            if exclude.matches(path) {
+                vec![]
+            } else {
+                vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+            }
         }
-        (FsNodeStatus::Dir, CacheEntryStatus::Preindexed) => vec![
-            WatcherAction::Remove,
-            WatcherAction::CreateDir,
-            WatcherAction::ProcessDirContent,
-        ],
-        (FsNodeStatus::Dir, CacheEntryStatus::Indexed { .. }) => vec![
-            WatcherAction::Remove,
-            WatcherAction::CreateDir,
-            WatcherAction::ProcessDirContent,
-        ],
-        (FsNodeStatus::Dir, CacheEntryStatus::Missing) => {
-            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+        (FsNodeStatus::Dir, CacheEntryStatus::Preindexed | CacheEntryStatus::Indexed { .. }) => {
+            let mut actions = vec![WatcherAction::Remove];
+            if !exclude.matches(path) {
+                actions.push(WatcherAction::CreateDir);
+                actions.push(WatcherAction::ProcessDirContent);
+            }
+
+            actions
         }
-        (FsNodeStatus::Dir, CacheEntryStatus::Remote) => {
-            vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+        (FsNodeStatus::Dir, CacheEntryStatus::Missing | CacheEntryStatus::Remote) => {
+            if exclude.matches(path) {
+                vec![]
+            } else {
+                vec![WatcherAction::CreateDir, WatcherAction::ProcessDirContent]
+            }
         }
         (FsNodeStatus::Missing, CacheEntryStatus::Missing) => vec![],
         (FsNodeStatus::Missing, CacheEntryStatus::Remote) => vec![],
@@ -573,14 +564,13 @@ fn process_path_write(
     db: &Arc<ArenaDatabase>,
     path: &Path,
     scan: bool,
-    exclude: &PathSet,
     tx: &mpsc::Sender<FsEvent>,
 ) -> anyhow::Result<()> {
     let metadata = fs_utils::metadata_no_symlink_blocking(cache.datadir(), &path).ok();
     let realpath = path.within(cache.datadir());
     let fs_status = FsNodeStatus::new_blocking(&realpath, metadata.as_ref());
     let cache_status = cache.entry_status(tree, path)?;
-    let actions = choose_actions(path, &fs_status, &cache_status, exclude);
+    let actions = choose_actions(path, &fs_status, &cache_status, db.cache().exclude());
     let tag = db.tag();
     if !actions.is_empty() {
         log::debug!("[{tag}](w) {path} ({fs_status:?}, {cache_status:?}) -> actions {actions:?}");
@@ -773,7 +763,6 @@ mod tests {
         db: Arc<ArenaDatabase>,
         root: ChildPath,
         tempdir: TempDir,
-        exclude: PathSet,
     }
 
     impl Fixture {
@@ -784,26 +773,14 @@ mod tests {
             root.create_dir_all()?;
 
             let arena = Arena::from("test");
-            let db =
-                ArenaDatabase::for_testing(arena, &std::path::Path::new("/dev/null"), root.path())?;
-            Ok(Self {
-                root,
-                db,
-                tempdir,
-                exclude: PathSet::new(),
-            })
-        }
-
-        /// Add to the exclusion list of any future watcher.
-        fn exclude(&mut self, path: realize_types::Path) {
-            self.exclude.push(path);
+            let db = ArenaDatabase::for_testing(arena, root.path())?;
+            Ok(Self { root, db, tempdir })
         }
 
         /// Catch up to any previous changes and watch for anything new.
         async fn scan_and_watch(&self) -> anyhow::Result<RealWatcher> {
             RealWatcher::builder(Arc::clone(&self.db))
                 .with_initial_scan()
-                .exclude(self.exclude.clone())
                 .spawn()
                 .await
         }
@@ -813,10 +790,7 @@ mod tests {
         /// Note that filesystem modifications made just before this
         /// is called might still get reported.
         async fn watch(&self) -> anyhow::Result<RealWatcher> {
-            RealWatcher::builder(Arc::clone(&self.db))
-                .exclude(self.exclude.clone())
-                .spawn()
-                .await
+            RealWatcher::builder(Arc::clone(&self.db)).spawn().await
         }
 
         /// Wait for the given history entry to have been written.
@@ -836,6 +810,12 @@ mod tests {
             })??;
 
             Ok(())
+        }
+
+        fn entry_status(&self, path: impl AsRef<Path>) -> Result<CacheEntryStatus, StorageError> {
+            let txn = self.db.begin_read()?;
+            txn.read_cache()?
+                .entry_status(&txn.read_tree()?, path.as_ref())
         }
     }
 
@@ -1686,95 +1666,92 @@ mod tests {
 
     #[tokio::test]
     async fn ignore_excluded() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.exclude(realize_types::Path::parse("a/b")?);
-        fixture.exclude(realize_types::Path::parse("excluded")?);
-
+        let fixture = Fixture::setup().await?;
         let _watcher = fixture.watch().await?;
 
-        fixture.root.child("excluded").write_str("test")?;
-        fixture.root.child("a/b/also_excluded").write_str("test")?;
-        fixture.root.child("a/not_excluded").write_str("test")?;
+        fixture
+            .root
+            .child(".realize/also_excluded")
+            .write_str("test")?;
+        fixture.root.child("dir/not_excluded").write_str("test")?;
 
         fixture.wait_for_history_event(1).await?;
 
-        let db = &fixture.db;
-        let excluded = realize_types::Path::parse("excluded")?;
-        let also_excluded = realize_types::Path::parse("a/b/also_excluded")?;
-        let not_excluded = realize_types::Path::parse("a/not_excluded")?;
+        let excluded_dir = realize_types::Path::parse(".realize")?;
+        let excluded_file = realize_types::Path::parse(".realize/also_excluded")?;
+        let not_excluded_dir = realize_types::Path::parse("dir")?;
+        let not_excluded_file = realize_types::Path::parse("dir/not_excluded")?;
 
-        // excluded are not indexed, but they are preindexed
-        assert!(index::indexed_file_async(db, &excluded).await?.is_none());
-        assert!(
-            index::indexed_file_async(db, &also_excluded)
-                .await?
-                .is_none()
-        );
-        assert!(
-            index::indexed_file_async(db, &not_excluded)
-                .await?
-                .is_some()
-        );
-
-        assert_eq!(false, index::has_local_file_async(db, &excluded).await?);
         assert_eq!(
-            false,
-            index::has_local_file_async(db, &also_excluded).await?
+            CacheEntryStatus::Missing,
+            fixture.entry_status(excluded_dir)?
         );
-        assert_eq!(true, index::has_local_file_async(db, &not_excluded).await?);
+        assert_eq!(
+            CacheEntryStatus::Missing,
+            fixture.entry_status(excluded_file)?
+        );
+        assert_eq!(
+            CacheEntryStatus::Dir { local: true },
+            fixture.entry_status(not_excluded_dir)?,
+        );
+        assert!(matches!(
+            fixture.entry_status(not_excluded_file)?,
+            CacheEntryStatus::Indexed { .. }
+        ));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn initial_scan_ignores_excluded() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.exclude(realize_types::Path::parse("a/b")?);
-        fixture.exclude(realize_types::Path::parse("excluded")?);
-        let db = &fixture.db;
-
-        fixture.root.child("excluded").write_str("test")?;
-        fixture.root.child("a/b/excluded_too").write_str("test")?;
-        fixture.root.child("not_excluded").write_str("test")?;
+        let fixture = Fixture::setup().await?;
+        fixture
+            .root
+            .child(".realize/excluded_too")
+            .write_str("test")?;
+        fixture.root.child("dir/not_excluded").write_str("test")?;
 
         let _watcher = fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(1).await?;
-        let not_excluded = realize_types::Path::parse("not_excluded")?;
-        assert!(
-            index::indexed_file_async(db, &not_excluded)
-                .await?
-                .is_some()
+
+        let excluded_dir = realize_types::Path::parse(".realize")?;
+        let excluded_file = realize_types::Path::parse(".realize/also_excluded")?;
+        let not_excluded_dir = realize_types::Path::parse("dir")?;
+        let not_excluded_file = realize_types::Path::parse("dir/not_excluded")?;
+
+        assert_eq!(
+            CacheEntryStatus::Missing,
+            fixture.entry_status(excluded_dir)?
         );
+        assert_eq!(
+            CacheEntryStatus::Missing,
+            fixture.entry_status(excluded_file)?
+        );
+        assert_eq!(
+            CacheEntryStatus::Dir { local: true },
+            fixture.entry_status(not_excluded_dir)?,
+        );
+        assert!(matches!(
+            fixture.entry_status(not_excluded_file)?,
+            CacheEntryStatus::Indexed { .. }
+        ));
 
         Ok(())
     }
 
     #[tokio::test]
     async fn initial_scan_unindexes_excluded() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.exclude(realize_types::Path::parse("a/b")?);
-        fixture.exclude(realize_types::Path::parse("excluded")?);
+        let fixture = Fixture::setup().await?;
         let db = &fixture.db;
 
-        let excluded_child = fixture.root.child("excluded");
-        excluded_child.write_str("test")?;
-        let excluded_too_child = fixture.root.child("a/b/excluded_too");
+        let excluded_too_child = fixture.root.child(".realize/excluded_too");
         excluded_too_child.write_str("test")?;
 
-        let excluded = realize_types::Path::parse("excluded")?;
-        let excluded_too = realize_types::Path::parse("a/b/excluded_too")?;
+        let excluded_file = realize_types::Path::parse(".realize/excluded_too")?;
         index::add_file_async(
             db,
-            &excluded,
-            4,
-            UnixTime::mtime(&fs::metadata(excluded_child.path()).await?),
-            hash::digest("test".as_bytes()),
-        )
-        .await?;
-        index::add_file_async(
-            db,
-            &excluded_too,
+            &excluded_file,
             4,
             UnixTime::mtime(&fs::metadata(excluded_too_child.path()).await?),
             hash::digest("test".as_bytes()),
@@ -1783,37 +1760,33 @@ mod tests {
 
         let _watcher = fixture.scan_and_watch().await?;
 
-        fixture.wait_for_history_event(4).await?;
-        assert!(index::indexed_file_async(db, &excluded).await?.is_none());
+        fixture.wait_for_history_event(2).await?;
         assert!(
-            index::indexed_file_async(db, &excluded_too)
+            index::indexed_file_async(db, &excluded_file)
                 .await?
                 .is_none()
         );
-        assert!(index::has_local_file_async(db, &excluded).await?);
-        assert!(index::has_local_file_async(db, &excluded_too).await?);
 
         Ok(())
     }
 
     #[tokio::test]
     async fn capture_ignore_and_removes_excluded() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup().await?;
-        fixture.exclude(realize_types::Path::parse("a/b")?);
-        fixture.exclude(realize_types::Path::parse("excluded")?);
-
+        let fixture = Fixture::setup().await?;
         let _watcher = fixture.scan_and_watch().await?;
 
-        fixture.root.child("excluded").write_str("test")?;
-        fixture.root.child("a/b/also_excluded").write_str("test")?;
-        fixture.root.child("a/not_excluded").write_str("test")?;
+        fixture
+            .root
+            .child(".realize/also_excluded")
+            .write_str("test")?;
+        fixture.root.child("not_excluded").write_str("test")?;
 
         fixture.wait_for_history_event(1).await?;
 
         let db = &fixture.db;
-        let excluded = realize_types::Path::parse("excluded")?;
-        let also_excluded = realize_types::Path::parse("a/b/also_excluded")?;
-        let not_excluded = realize_types::Path::parse("a/not_excluded")?;
+        let excluded = realize_types::Path::parse(".realize")?;
+        let also_excluded = realize_types::Path::parse(".realize/also_excluded")?;
+        let not_excluded = realize_types::Path::parse("not_excluded")?;
 
         // excluded files are not indexed, but they are preindexed
         assert!(index::indexed_file_async(db, &excluded).await?.is_none());

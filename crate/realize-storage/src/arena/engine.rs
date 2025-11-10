@@ -610,10 +610,8 @@ mod tests {
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
     use crate::utils::hash;
-    use crate::utils::redb_utils;
     use assert_fs::TempDir;
     use futures::StreamExt as _;
-    use realize_types::PathSet;
     use realize_types::{Arena, Peer, UnixTime};
     use std::sync::Arc;
     use std::time::Duration;
@@ -638,18 +636,8 @@ mod tests {
 
             let tempdir = TempDir::new()?;
             let arena = Arena::from("myarena");
-            let blob_dir = tempdir.path().join("blobs");
-            std::fs::create_dir_all(&blob_dir)?;
             let datadir = tempdir.path().join("data");
-            std::fs::create_dir_all(&datadir)?;
-
-            let db = ArenaDatabase::new(
-                redb_utils::in_memory()?,
-                arena,
-                &blob_dir,
-                &datadir,
-                PathSet::new(),
-            )?;
+            let db = ArenaDatabase::for_testing(arena, &datadir)?;
             let acache = ArenaFilesystem::new(Arc::clone(&db));
             let engine = Engine::new(Arc::clone(&db), |attempt| {
                 if attempt < 3 {

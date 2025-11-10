@@ -10,6 +10,6 @@ where
 
 // Create an in-memory database, for testing.
 #[cfg(any(test, feature = "testing"))]
-pub fn in_memory() -> anyhow::Result<redb::Database> {
+pub fn in_memory() -> Result<redb::Database, crate::StorageError> {
     Ok(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?)
 }

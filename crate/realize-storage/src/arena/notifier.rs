@@ -470,11 +470,9 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = test_arena();
             let tempdir = TempDir::new()?;
-            let blob_dir = tempdir.child("blobs");
-            blob_dir.create_dir_all()?;
             let datadir = tempdir.child("data");
             datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing(arena, blob_dir.path(), datadir.path())?;
+            let db = ArenaDatabase::for_testing(arena, datadir.path())?;
             Ok(Self {
                 db,
                 current_time: UnixTime::from_secs(1234567890),

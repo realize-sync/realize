@@ -15,7 +15,7 @@ use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
 use crate::types::{PartialInode, PathId};
 use crate::utils::holder::Holder;
-use realize_types::{Arena, PathSet};
+use realize_types::{Arena, Path, PathSet};
 use redb::TableDefinition;
 use std::cell::RefCell;
 use std::panic::Location;
@@ -184,22 +184,60 @@ struct Subsystems {
 }
 
 impl ArenaDatabase {
+    pub const WORKDIR_NAME: &str = ".realize";
+    pub const BLOBDIR_NAME: &str = "blobs";
+    pub const DB_NAME: &str = "arena.db";
+
+    #[cfg(test)]
+    pub fn for_testing_no_blobs(arena: realize_types::Arena) -> Result<Arc<Self>, StorageError> {
+        Self::new(
+            crate::utils::redb_utils::in_memory()?,
+            arena,
+            std::path::Path::new("/dev/null"),
+            std::path::Path::new("/dev/null"),
+            PathSet::new(),
+        )
+    }
+
     #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
-        blob_dir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<Arc<Self>> {
-        Ok(ArenaDatabase::new(
+    ) -> Result<Arc<Self>, StorageError> {
+        let datadir = datadir.as_ref();
+        let workdir = datadir.join(Self::WORKDIR_NAME);
+        let blob_dir = workdir.join(Self::BLOBDIR_NAME);
+        std::fs::create_dir_all(&blob_dir)?;
+
+        Self::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
             blob_dir,
             datadir,
-            PathSet::new(),
-        )?)
+            PathSet::from([Path::parse(Self::WORKDIR_NAME)?]),
+        )
     }
 
-    pub fn new(
+    pub(crate) fn open(
+        arena: Arena,
+        datadir: impl AsRef<std::path::Path>,
+    ) -> Result<Arc<Self>, StorageError> {
+        let datadir = datadir.as_ref();
+        let workdir = datadir.join(Self::WORKDIR_NAME);
+        let blob_dir = workdir.join(Self::BLOBDIR_NAME);
+        std::fs::create_dir_all(&blob_dir)?;
+        let dbpath = workdir.join(Self::DB_NAME);
+
+        Self::new(
+            redb::Database::create(dbpath)?,
+            arena,
+            blob_dir,
+            datadir,
+            PathSet::from([Path::parse(Self::WORKDIR_NAME)?]),
+        )
+    }
+
+    pub(crate) fn new(
         db: redb::Database,
         arena: Arena,
         blob_dir: impl AsRef<std::path::Path>,
@@ -735,11 +773,7 @@ mod tests {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
 
-            let db = ArenaDatabase::for_testing(
-                Arena::from("myarena"),
-                std::path::Path::new("/dev/null"),
-                std::path::Path::new("/dev/null"),
-            )?;
+            let db = ArenaDatabase::for_testing_no_blobs(Arena::from("myarena"))?;
 
             Ok(Self { db })
         }

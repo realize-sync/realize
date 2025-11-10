@@ -35,27 +35,17 @@ impl ArenaFilesystem {
     #[allow(dead_code)]
     pub fn for_testing_single_arena(
         arena: realize_types::Arena,
-        blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
-        ArenaFilesystem::for_testing(arena, blob_dir, datadir)
+        ArenaFilesystem::for_testing(arena, datadir)
     }
 
     #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
-        blob_dir: &std::path::Path,
         datadir: &std::path::Path,
     ) -> anyhow::Result<Arc<Self>> {
-        use realize_types::PathSet;
-
-        let db = ArenaDatabase::new(
-            crate::utils::redb_utils::in_memory()?,
-            arena,
-            blob_dir,
-            datadir,
-            PathSet::new(),
-        )?;
+        let db = ArenaDatabase::for_testing(arena, datadir)?;
 
         Ok(ArenaFilesystem::new(Arc::clone(&db)))
     }
@@ -580,12 +570,9 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
             let tempdir = TempDir::new()?;
-            let blob_dir = tempdir.child(format!("{arena}/blobs"));
-            let datadir = tempdir.child(format!("{arena}/blobs"));
-            blob_dir.create_dir_all()?;
+            let datadir = tempdir.child(format!("{arena}"));
             datadir.create_dir_all()?;
-            let fs =
-                ArenaFilesystem::for_testing_single_arena(arena, blob_dir.path(), datadir.path())?;
+            let fs = ArenaFilesystem::for_testing_single_arena(arena, datadir.path())?;
             let db = Arc::clone(&fs.db);
             Ok(Self {
                 fs,

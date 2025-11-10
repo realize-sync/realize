@@ -9,7 +9,7 @@ use crate::types::{InodePrefix, PartialInode, PathId};
 use crate::utils::holder::Holder;
 use crate::{Blob, FileMetadata, Inode, StorageError};
 use bimap::BiMap;
-use realize_types::{Arena, Path, PathSet, Peer};
+use realize_types::{Arena, Path, Peer};
 use redb::ReadableTable;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -147,7 +147,7 @@ impl Filesystem {
             prefixes = build_prefix_map(&arena_table)?;
             globals = build_globals(&path_table)?;
         }
-        let db = build_arena_db(arena, datadir)?;
+        let db = ArenaDatabase::open(arena, datadir)?;
         let fs = ArenaFilesystem::new(Arc::clone(&db));
 
         txn.commit()?;
@@ -712,27 +712,11 @@ fn build_missing_arena_fs(
             continue;
         }
         let entry = entry.value().parse()?;
-        let db = build_arena_db(arena, &entry.datadir)?;
+        let db = ArenaDatabase::open(arena, &entry.datadir)?;
         arena_fs.insert(arena, ArenaFilesystem::new(db));
     }
 
     Ok(())
-}
-
-fn build_arena_db(
-    arena: Arena,
-    datadir: &std::path::Path,
-) -> Result<Arc<ArenaDatabase>, StorageError> {
-    let datadir = datadir.canonicalize()?;
-    let blob_dir = datadir.join(".realize/blobs");
-    std::fs::create_dir_all(&blob_dir)?;
-    ArenaDatabase::new(
-        redb::Database::create(datadir.join(".realize/arena.db"))?,
-        arena,
-        blob_dir,
-        datadir,
-        PathSet::from([Path::parse(".realize")?]),
-    )
 }
 
 /// Store arena into the database.
@@ -1029,7 +1013,7 @@ mod tests {
         }
 
         assert_eq!(
-            vec![".realize"],
+            Vec::<String>::new(),
             fs.readdir((Arena::from("arenas/test1"), Path::root()))
                 .await?
                 .into_iter()
@@ -1037,7 +1021,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(
-            vec![".realize"],
+            Vec::<String>::new(),
             fs.readdir((Arena::from("arenas/test2"), Path::root()))
                 .await?
                 .into_iter()
@@ -1045,7 +1029,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(
-            vec![".realize"],
+            Vec::<String>::new(),
             fs.readdir((Arena::from("other"), Path::root()))
                 .await?
                 .into_iter()

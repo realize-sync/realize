@@ -1512,11 +1512,10 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = test_arena();
             let tempdir = TempDir::new()?;
-            let blob_dir = tempdir.child(format!("{arena}/blobs"));
-            blob_dir.create_dir_all()?;
-            let datadir = tempdir.child(format!("{arena}/data"));
+            let datadir = tempdir.child(format!("{arena}"));
+            let blob_dir = tempdir.child(format!("{arena}/.realize/blobs"));
             datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing(arena, blob_dir.path(), datadir.path())?;
+            let db = ArenaDatabase::for_testing(arena, datadir.path())?;
 
             Ok(Self {
                 arena,
@@ -1529,9 +1528,7 @@ mod tests {
 
         /// Return the path to a blob file for test use.
         fn blob_path(&self, pathid: PathId) -> std::path::PathBuf {
-            self.tempdir
-                .child(format!("{}/blobs/{}", self.arena, pathid.hex()))
-                .to_path_buf()
+            self.blob_dir.join(pathid.hex()).to_path_buf()
         }
 
         fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction<'_>> {

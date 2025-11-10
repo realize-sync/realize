@@ -540,11 +540,9 @@ mod tests {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
             let tempdir = TempDir::new()?;
-            let blob_dir = tempdir.child("blobs");
-            blob_dir.create_dir_all()?;
             let datadir = tempdir.child("data");
             datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing(arena, blob_dir, datadir.path())?;
+            let db = ArenaDatabase::for_testing(arena, datadir.path())?;
 
             Ok(Self {
                 db,

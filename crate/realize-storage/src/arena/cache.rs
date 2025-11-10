@@ -1556,6 +1556,11 @@ impl Cache {
         &self.datadir
     }
 
+    /// Return the set of excluded paths
+    pub(crate) fn exclude(&self) -> &PathSet {
+        &self.exclude
+    }
+
     /// Return a barrier the file watcher should check before
     /// processing a filesystem change.
     ///
@@ -2272,11 +2277,8 @@ mod tests {
             if let Some(p) = child.parent() {
                 std::fs::create_dir_all(p)?;
             }
-            let blob_dir = tempdir.child(format!("{arena}/blobs"));
-            blob_dir.create_dir_all()?;
-            let datadir = tempdir.child(format!("{arena}/data"));
-            datadir.create_dir_all()?;
-            let db = ArenaDatabase::for_testing(arena, blob_dir.path(), datadir.path())?;
+            let datadir = tempdir.child(format!("{arena}"));
+            let db = ArenaDatabase::for_testing(arena, datadir.path())?;
             Ok(Self {
                 arena,
                 db,
