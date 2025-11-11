@@ -49,6 +49,30 @@ pub fn metadata_no_symlink_blocking(
     std::fs::symlink_metadata(&current_path)
 }
 
+/// Check whether the given path is an accessible directory.
+pub fn is_readable_dir<P: AsRef<std::path::Path>>(path: P) -> bool {
+    std::fs::read_dir(path).is_ok()
+}
+
+/// Check whether the given path is an writable directory.
+///
+/// This function writes a special temporary file into the directory.
+pub fn is_writable_dir<P: AsRef<std::path::Path>>(path: P, testfilename: &str) -> bool {
+    let path = path.as_ref();
+    let testfile = path.join(testfilename);
+    if let Ok(_) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&testfile)
+    {
+        let _ = std::fs::remove_file(&testfile);
+
+        return true;
+    }
+
+    false
+}
+
 /// Find a file at the given path within the root directory, but
 /// reject if any symlink is encountered (async version).
 ///

@@ -14,10 +14,12 @@ use super::types::{
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
 use crate::types::{PartialInode, PathId};
+use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use realize_types::{Arena, Path, PathSet};
 use redb::TableDefinition;
 use std::cell::RefCell;
+use std::os::unix::fs::MetadataExt;
 use std::panic::Location;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -187,6 +189,10 @@ impl ArenaDatabase {
     pub const WORKDIR_NAME: &str = ".realize";
     pub const BLOBDIR_NAME: &str = "blobs";
     pub const DB_NAME: &str = "arena.db";
+    /// Special file used to execute write tests. It must be possible
+    /// to safely write it to the data and blob directories. That file
+    /// should ideally be excluded.
+    const TEST_FILENAME: &str = ".realize_writetest";
 
     #[cfg(test)]
     pub fn for_testing_no_blobs(arena: realize_types::Arena) -> Result<Arc<Self>, StorageError> {
@@ -214,7 +220,10 @@ impl ArenaDatabase {
             arena,
             blob_dir,
             datadir,
-            PathSet::from([Path::parse(Self::WORKDIR_NAME)?]),
+            PathSet::from([
+                Path::parse(Self::WORKDIR_NAME)?,
+                Path::parse(Self::TEST_FILENAME)?,
+            ]),
         )
     }
 
@@ -225,15 +234,21 @@ impl ArenaDatabase {
         let datadir = datadir.as_ref();
         let workdir = datadir.join(Self::WORKDIR_NAME);
         let blob_dir = workdir.join(Self::BLOBDIR_NAME);
-        std::fs::create_dir_all(&blob_dir)?;
         let dbpath = workdir.join(Self::DB_NAME);
+
+        sanity_check_dirs(datadir, &blob_dir)
+            .with_prefix(&format!("[{arena}]"))
+            .fail_if_error()?;
 
         Self::new(
             redb::Database::create(dbpath)?,
             arena,
             blob_dir,
             datadir,
-            PathSet::from([Path::parse(Self::WORKDIR_NAME)?]),
+            PathSet::from([
+                Path::parse(Self::WORKDIR_NAME)?,
+                Path::parse(Self::TEST_FILENAME)?,
+            ]),
         )
     }
 
@@ -364,6 +379,159 @@ impl ArenaDatabase {
             subsystems: &self.subsystems,
         })
     }
+
+    /// Check the database and directory setup and reports the result
+    /// as a series of log entries.
+    #[allow(dead_code)] // for later
+    pub fn sanity_checks(&self) -> SanityCheckResult {
+        let mut result = sanity_check_dirs(
+            self.subsystems.cache.datadir(),
+            self.subsystems.blobs.blob_dir(),
+        );
+        if !result.is_empty() {
+            result.add_prefix(self.tag.as_str())
+        }
+        return result;
+    }
+}
+
+/// Result of [ArenaDatabase::sanity_checks] and [sanity_check_dirs].
+pub struct SanityCheckResult {
+    prefix: String,
+    messages: Vec<(log::Level, String)>,
+}
+
+impl SanityCheckResult {
+    pub fn new() -> Self {
+        Self {
+            prefix: String::new(),
+            messages: vec![],
+        }
+    }
+
+    /// Build sanity check results using a callback , capturing any
+    /// error returned by the callback.
+    fn build(cb: impl FnOnce(&mut SanityCheckResult) -> Result<(), StorageError>) -> Self {
+        let mut result = SanityCheckResult::new();
+        if let Err(err) = (cb)(&mut result) {
+            result.err(format!("sanity checks failed with: {err:?}"));
+        }
+
+        result
+    }
+
+    /// Add a new message at the given level.
+    pub fn add(&mut self, level: log::Level, message: String) {
+        self.messages.push((level, message))
+    }
+
+    /// Add an error message.
+    pub fn err(&mut self, message: String) {
+        self.add(log::Level::Error, message)
+    }
+
+    /// Add a warning message
+    pub fn warn(&mut self, message: String) {
+        self.add(log::Level::Warn, message)
+    }
+
+    /// Add a prefix to messages when they're logged or included into an error.
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.add_prefix(prefix);
+
+        self
+    }
+
+    /// Add a prefix to messages when they're logged or included into an error.
+    pub fn add_prefix(&mut self, prefix: &str) {
+        self.prefix.push_str(prefix);
+        self.prefix.push(' ');
+    }
+
+    /// Check whether there are messages to report
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// Check whether there are errors
+    #[cfg(test)]
+    pub fn has_errors(&self) -> bool {
+        self.messages.iter().any(|(l, _)| *l <= log::Level::Error)
+    }
+
+    /// Log all messages
+    #[cfg(test)]
+    pub fn log_all(&self) {
+        for (level, message) in &self.messages {
+            log::log!(*level, "{}{message}", self.prefix);
+        }
+    }
+
+    /// Fail if the result has an error, log everything else.
+    pub fn fail_if_error(&self) -> Result<(), StorageError> {
+        let mut error = None;
+        for (level, message) in &self.messages {
+            if *level == log::Level::Error && error.is_none() {
+                error = Some(message);
+            } else {
+                log::log!(*level, "{}{message}", self.prefix);
+            }
+        }
+        if let Some(error) = error {
+            return Err(StorageError::ConsistencyChecksFailed(format!(
+                "{}{error}",
+                self.prefix
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Perform sanity checks on datadir and report the result.
+fn sanity_check_dirs(datadir: &std::path::Path, blobdir: &std::path::Path) -> SanityCheckResult {
+    SanityCheckResult::build(|result| {
+        if !datadir.exists() {
+            result.err(format!("Arena directory doesn't exist: {datadir:?}"));
+            return Ok(());
+        }
+        if !fs_utils::is_readable_dir(datadir) {
+            result.err(format!(
+                "Arena directory is not a readable directory: {datadir:?}"
+            ));
+            return Ok(());
+        }
+        if !fs_utils::is_writable_dir(datadir, ArenaDatabase::TEST_FILENAME) {
+            result.warn(format!(
+                "Arena directory is not writable; realize and unrealize won't work: {datadir:?}"
+            ));
+        }
+
+        let _ = std::fs::create_dir_all(blobdir);
+        if !fs_utils::is_readable_dir(blobdir) {
+            result.err(format!(
+                "Blob directory is not a readable directory: {blobdir:?}"
+            ));
+            return Ok(());
+        }
+
+        if !fs_utils::is_writable_dir(blobdir, ArenaDatabase::TEST_FILENAME) {
+            result.err(format!(
+                "Blob directory is not writable; accessing remote files won't work: {blobdir:?}"
+            ));
+        }
+
+        if let (Ok(m1), Ok(m2)) = (datadir.metadata(), blobdir.metadata())
+            && m1.dev() != m2.dev()
+        {
+            result.warn(
+                format!(
+                    "Arena directory and blob directory are not on the same filesystem; realize and unrealize won't work: {datadir:?} vs. {blobdir:?}"
+                ),
+        );
+        }
+        Ok(())
+    })
 }
 
 /// A short tag that represents the database for logging.
@@ -378,6 +546,10 @@ impl Tag {
         Self {
             inner: internment::Intern::new(format!("{:02x?}{:02x?}/{arena}", bytes[14], bytes[15])),
         }
+    }
+
+    fn as_str(&self) -> &str {
+        self.inner.as_str()
     }
 }
 impl std::fmt::Display for Tag {
@@ -758,8 +930,13 @@ impl BeforeCommit {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
-    use assert_fs::TempDir;
+    use assert_fs::{
+        TempDir,
+        prelude::{FileWriteStr, PathChild, PathCreateDir},
+    };
     use realize_types::Arena;
     use redb::{ReadOnlyTable, ReadableTable};
 
@@ -902,6 +1079,141 @@ mod tests {
         )?;
         assert_eq!(uuid, *db.uuid());
         assert_eq!(db.settings().borrow().uuid, *db.uuid());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_create_workdir() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        datadir.create_dir_all()?;
+        let blobdir = tempdir.child(".realize/blobs");
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.is_empty());
+        assert!(blobdir.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_missing_datadir() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        let blobdir = tempdir.child(".realize/blobs");
+        blobdir.create_dir_all()?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.has_errors());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_accepts_all() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        datadir.create_dir_all()?;
+        let blobdir = tempdir.child(".realize/blobs");
+        blobdir.create_dir_all()?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_nondirectory_datadir() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        let blobdir = tempdir.child(".realize/blobs");
+
+        // Create a file instead of directory
+        datadir.write_str("not a directory")?;
+        blobdir.create_dir_all()?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.has_errors());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_datadir_not_accessible() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        let blobdir = tempdir.child(".realize/blobs");
+
+        datadir.create_dir_all()?;
+        blobdir.create_dir_all()?;
+
+        let mut perms = datadir.path().metadata()?.permissions();
+        perms.set_mode(0o000); // No permissions
+        std::fs::set_permissions(datadir.path(), perms)?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.has_errors());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_warns_datadir_not_writable() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        let blobdir = tempdir.child(".realize/blobs");
+
+        datadir.create_dir_all()?;
+        blobdir.create_dir_all()?;
+
+        let mut perms = datadir.path().metadata()?.permissions();
+        perms.set_mode(0o444); // Read-only
+        std::fs::set_permissions(datadir.path(), perms)?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(!result.is_empty());
+        assert!(!result.has_errors());
+
+        Ok(())
+    }
+
+    #[test]
+    fn check_rejects_blobdir_not_writable() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+
+        let datadir = tempdir.child("datadir");
+        datadir.create_dir_all()?;
+        let blobdir = tempdir.child(".realize/blobs");
+        blobdir.create_dir_all()?;
+
+        let mut perms = blobdir.path().metadata()?.permissions();
+        perms.set_mode(0o444); // Read-only
+        std::fs::set_permissions(blobdir.path(), perms)?;
+
+        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        result.log_all();
+        assert!(result.has_errors());
 
         Ok(())
     }

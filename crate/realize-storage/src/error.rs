@@ -90,6 +90,9 @@ pub enum StorageError {
 
     #[error("no pathid available")]
     PathIdSpaceExhausted,
+
+    #[error("{0}")]
+    ConsistencyChecksFailed(String),
 }
 
 impl StorageError {
@@ -142,6 +145,7 @@ impl StorageError {
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
             StorageError::PathIdSpaceExhausted => Other,
+            StorageError::ConsistencyChecksFailed(_) => Other,
         }
     }
 

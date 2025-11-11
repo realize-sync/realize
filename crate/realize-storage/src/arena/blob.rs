@@ -110,6 +110,10 @@ impl Blobs {
         })
     }
 
+    pub(crate) fn blob_dir(&self) -> &std::path::Path {
+        &self.blob_dir
+    }
+
     /// Get a watch channel that reports changes to disk usage.
     ///
     /// The current value is also available as

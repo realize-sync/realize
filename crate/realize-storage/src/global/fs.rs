@@ -866,6 +866,7 @@ mod tests {
             let fs = Filesystem::with_db(GlobalDatabase::new(redb_utils::in_memory()?)?).await?;
             for arena in arenas.into_iter() {
                 let datadir = tempdir.child(format!("{arena}"));
+                datadir.create_dir_all()?;
                 fs.add_arena(arena, datadir.path())?;
             }
             Ok(Self {
