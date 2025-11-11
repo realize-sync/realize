@@ -1,7 +1,7 @@
 use crate::utils::holder::ByteConversionError;
 use realize_types::{self, Arena};
 use redb::TableError;
-use std::panic::Location;
+use std::{panic::Location, path::PathBuf};
 use tokio::task::JoinError;
 
 /// Error returned types in this crate.
@@ -91,8 +91,27 @@ pub enum StorageError {
     #[error("no pathid available")]
     PathIdSpaceExhausted,
 
-    #[error("{0}")]
-    ConsistencyChecksFailed(String),
+    #[error("[0] {2}: {1:?}")]
+    SanityCheckFailed(Arena, PathBuf, SanityCheck),
+}
+
+#[derive(Clone, Debug, Copy, Eq, PartialEq)]
+pub enum SanityCheck {
+    Exists,
+    ReadableDir,
+    WritableDir,
+    SameDevice,
+}
+
+impl std::fmt::Display for SanityCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SanityCheck::Exists => "Directory not found",
+            SanityCheck::ReadableDir => "Not a readable directory",
+            SanityCheck::WritableDir => "Directory is not writable",
+            SanityCheck::SameDevice => "On a different filesystem",
+        })
+    }
 }
 
 impl StorageError {
@@ -145,7 +164,7 @@ impl StorageError {
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
             StorageError::PathIdSpaceExhausted => Other,
-            StorageError::ConsistencyChecksFailed(_) => Other,
+            StorageError::SanityCheckFailed(_, _, _) => Other,
         }
     }
 

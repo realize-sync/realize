@@ -242,7 +242,7 @@ async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
-        stderr.contains("Arena directory doesn't exist"),
+        stderr.contains("Directory not found"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
 
@@ -259,7 +259,7 @@ async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
     assert!(
-        stderr.contains("Arena directory is not a readable directory"),
+        stderr.contains("Not a readable directory"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
 
@@ -285,7 +285,7 @@ async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
 
     let stderr = stderr.await??;
     assert!(
-        stderr.contains("Arena directory is not writable"),
+        stderr.contains("Directory is not writable"),
         "stderr<<EOF\n{stderr}\nEOF"
     );
     Ok(())

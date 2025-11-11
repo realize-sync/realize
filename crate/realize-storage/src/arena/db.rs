@@ -13,6 +13,7 @@ use super::types::{
 };
 use crate::StorageError;
 use crate::arena::types::SettingsTableEntry;
+use crate::error::SanityCheck;
 use crate::types::{PartialInode, PathId};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
@@ -236,9 +237,7 @@ impl ArenaDatabase {
         let blob_dir = workdir.join(Self::BLOBDIR_NAME);
         let dbpath = workdir.join(Self::DB_NAME);
 
-        sanity_check_dirs(datadir, &blob_dir)
-            .with_prefix(&format!("[{arena}]"))
-            .fail_if_error()?;
+        sanity_check_dirs(arena, datadir, &blob_dir).fail_if_error()?;
 
         Self::new(
             redb::Database::create(dbpath)?,
@@ -384,104 +383,88 @@ impl ArenaDatabase {
     /// as a series of log entries.
     #[allow(dead_code)] // for later
     pub fn sanity_checks(&self) -> SanityCheckResult {
-        let mut result = sanity_check_dirs(
+        sanity_check_dirs(
+            self.arena,
             self.subsystems.cache.datadir(),
             self.subsystems.blobs.blob_dir(),
-        );
-        if !result.is_empty() {
-            result.add_prefix(self.tag.as_str())
-        }
-        return result;
+        )
     }
 }
 
 /// Result of [ArenaDatabase::sanity_checks] and [sanity_check_dirs].
 pub struct SanityCheckResult {
-    prefix: String,
-    messages: Vec<(log::Level, String)>,
+    arena: Arena,
+    issues: Vec<(log::Level, StorageError)>,
 }
 
 impl SanityCheckResult {
-    pub fn new() -> Self {
+    pub fn new(arena: Arena) -> Self {
         Self {
-            prefix: String::new(),
-            messages: vec![],
+            arena,
+            issues: vec![],
         }
     }
 
     /// Build sanity check results using a callback , capturing any
     /// error returned by the callback.
-    fn build(cb: impl FnOnce(&mut SanityCheckResult) -> Result<(), StorageError>) -> Self {
-        let mut result = SanityCheckResult::new();
+    fn build(
+        arena: Arena,
+        cb: impl FnOnce(&mut SanityCheckResult) -> Result<(), StorageError>,
+    ) -> Self {
+        let mut result = SanityCheckResult::new(arena);
         if let Err(err) = (cb)(&mut result) {
-            result.err(format!("sanity checks failed with: {err:?}"));
+            result.issues.push((log::Level::Error, err));
         }
 
         result
     }
 
-    /// Add a new message at the given level.
-    pub fn add(&mut self, level: log::Level, message: String) {
-        self.messages.push((level, message))
+    /// Register a new issue at the given level.
+    pub fn add(&mut self, level: log::Level, path: &std::path::Path, check: SanityCheck) {
+        self.issues.push((
+            level,
+            StorageError::SanityCheckFailed(self.arena, path.to_path_buf(), check),
+        ));
     }
 
-    /// Add an error message.
-    pub fn err(&mut self, message: String) {
-        self.add(log::Level::Error, message)
+    /// Register an error.
+    pub fn err(&mut self, path: &std::path::Path, check: SanityCheck) {
+        self.add(log::Level::Error, path, check)
     }
 
-    /// Add a warning message
-    pub fn warn(&mut self, message: String) {
-        self.add(log::Level::Warn, message)
-    }
-
-    /// Add a prefix to messages when they're logged or included into an error.
-    pub fn with_prefix(mut self, prefix: &str) -> Self {
-        self.add_prefix(prefix);
-
-        self
-    }
-
-    /// Add a prefix to messages when they're logged or included into an error.
-    pub fn add_prefix(&mut self, prefix: &str) {
-        self.prefix.push_str(prefix);
-        self.prefix.push(' ');
+    /// Register a warning
+    pub fn warn(&mut self, path: &std::path::Path, check: SanityCheck) {
+        self.add(log::Level::Warn, path, check)
     }
 
     /// Check whether there are messages to report
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        self.issues.is_empty()
     }
 
     /// Check whether there are errors
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn has_errors(&self) -> bool {
-        self.messages.iter().any(|(l, _)| *l <= log::Level::Error)
+        self.issues.iter().any(|(l, _)| *l <= log::Level::Error)
     }
 
     /// Log all messages
-    #[cfg(test)]
     pub fn log_all(&self) {
-        for (level, message) in &self.messages {
-            log::log!(*level, "{}{message}", self.prefix);
+        for (level, err) in &self.issues {
+            log::log!(*level, "[{}] {err}", self.arena);
         }
     }
 
     /// Fail if the result has an error, log everything else.
-    pub fn fail_if_error(&self) -> Result<(), StorageError> {
-        let mut error = None;
-        for (level, message) in &self.messages {
-            if *level == log::Level::Error && error.is_none() {
-                error = Some(message);
-            } else {
-                log::log!(*level, "{}{message}", self.prefix);
-            }
-        }
-        if let Some(error) = error {
-            return Err(StorageError::ConsistencyChecksFailed(format!(
-                "{}{error}",
-                self.prefix
-            )));
+    pub fn fail_if_error(self) -> Result<(), StorageError> {
+        self.log_all();
+        if let Some((_, err)) = self
+            .issues
+            .into_iter()
+            .find(|(level, _)| *level <= log::Level::Error)
+        {
+            return Err(err);
         }
 
         Ok(())
@@ -489,46 +472,38 @@ impl SanityCheckResult {
 }
 
 /// Perform sanity checks on datadir and report the result.
-fn sanity_check_dirs(datadir: &std::path::Path, blobdir: &std::path::Path) -> SanityCheckResult {
-    SanityCheckResult::build(|result| {
+fn sanity_check_dirs(
+    arena: Arena,
+    datadir: &std::path::Path,
+    blobdir: &std::path::Path,
+) -> SanityCheckResult {
+    SanityCheckResult::build(arena, |result| {
         if !datadir.exists() {
-            result.err(format!("Arena directory doesn't exist: {datadir:?}"));
+            result.err(datadir, SanityCheck::Exists);
             return Ok(());
         }
         if !fs_utils::is_readable_dir(datadir) {
-            result.err(format!(
-                "Arena directory is not a readable directory: {datadir:?}"
-            ));
+            result.err(datadir, SanityCheck::ReadableDir);
             return Ok(());
         }
         if !fs_utils::is_writable_dir(datadir, ArenaDatabase::TEST_FILENAME) {
-            result.warn(format!(
-                "Arena directory is not writable; realize and unrealize won't work: {datadir:?}"
-            ));
+            result.warn(datadir, SanityCheck::WritableDir);
         }
 
         let _ = std::fs::create_dir_all(blobdir);
         if !fs_utils::is_readable_dir(blobdir) {
-            result.err(format!(
-                "Blob directory is not a readable directory: {blobdir:?}"
-            ));
+            result.err(blobdir, SanityCheck::ReadableDir);
             return Ok(());
         }
 
         if !fs_utils::is_writable_dir(blobdir, ArenaDatabase::TEST_FILENAME) {
-            result.err(format!(
-                "Blob directory is not writable; accessing remote files won't work: {blobdir:?}"
-            ));
+            result.err(blobdir, SanityCheck::WritableDir);
         }
 
         if let (Ok(m1), Ok(m2)) = (datadir.metadata(), blobdir.metadata())
             && m1.dev() != m2.dev()
         {
-            result.warn(
-                format!(
-                    "Arena directory and blob directory are not on the same filesystem; realize and unrealize won't work: {datadir:?} vs. {blobdir:?}"
-                ),
-        );
+            result.warn(blobdir, SanityCheck::SameDevice);
         }
         Ok(())
     })
@@ -546,10 +521,6 @@ impl Tag {
         Self {
             inner: internment::Intern::new(format!("{:02x?}{:02x?}/{arena}", bytes[14], bytes[15])),
         }
-    }
-
-    fn as_str(&self) -> &str {
-        self.inner.as_str()
     }
 }
 impl std::fmt::Display for Tag {
@@ -1092,7 +1063,8 @@ mod tests {
         datadir.create_dir_all()?;
         let blobdir = tempdir.child(".realize/blobs");
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let arena = Arena::from("myarena");
+        let result = super::sanity_check_dirs(arena, datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.is_empty());
         assert!(blobdir.exists());
@@ -1109,7 +1081,8 @@ mod tests {
         let blobdir = tempdir.child(".realize/blobs");
         blobdir.create_dir_all()?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.has_errors());
 
@@ -1126,7 +1099,8 @@ mod tests {
         let blobdir = tempdir.child(".realize/blobs");
         blobdir.create_dir_all()?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.is_empty());
 
@@ -1145,7 +1119,8 @@ mod tests {
         datadir.write_str("not a directory")?;
         blobdir.create_dir_all()?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.has_errors());
 
@@ -1167,7 +1142,8 @@ mod tests {
         perms.set_mode(0o000); // No permissions
         std::fs::set_permissions(datadir.path(), perms)?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.has_errors());
 
@@ -1189,7 +1165,8 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         std::fs::set_permissions(datadir.path(), perms)?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(!result.is_empty());
         assert!(!result.has_errors());
@@ -1211,7 +1188,8 @@ mod tests {
         perms.set_mode(0o444); // Read-only
         std::fs::set_permissions(blobdir.path(), perms)?;
 
-        let result = super::sanity_check_dirs(datadir.path(), blobdir.path());
+        let result =
+            super::sanity_check_dirs(Arena::from("myarena"), datadir.path(), blobdir.path());
         result.log_all();
         assert!(result.has_errors());
 
