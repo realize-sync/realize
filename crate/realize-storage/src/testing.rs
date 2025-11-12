@@ -1,7 +1,7 @@
-use crate::config::{ArenaConfig, WatcherConfig};
+use crate::config::WatcherConfig;
 
 use super::Storage;
-use super::config::{CacheConfig, HumanDuration, NamedArenaConfig, StorageConfig};
+use super::config::{CacheConfig, HumanDuration, StorageConfig};
 use realize_types::Arena;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,48 +15,37 @@ where
     T: IntoIterator<Item = Arena>,
     P: AsRef<std::path::Path>,
 {
-    let config = config(dir, arenas)?;
-    Storage::from_config(&config).await
+    let dir = dir.as_ref();
+    let config = config(dir);
+    std::fs::create_dir_all(dir)?;
+    let storage = Storage::from_config(&config).await?;
+    for arena in arenas {
+        let datadir = arena_root(dir, arena);
+        std::fs::create_dir_all(&datadir)?;
+        storage.create_arena(arena, &datadir).await?;
+    }
+    Ok(storage)
 }
 
 /// Create a test configuration with the given arenas.
 ///
 /// The database and arena roots are put into the provided directory.
 /// Use [arena_root] to get the root path of a specific arena.
-pub fn config<T, P>(dir: P, arenas: T) -> anyhow::Result<StorageConfig>
+pub fn config<P>(dir: P) -> StorageConfig
 where
-    T: IntoIterator<Item = Arena>,
     P: AsRef<std::path::Path>,
 {
-    let dir = dir.as_ref();
-    let config = StorageConfig {
-        arenas: arenas
-            .into_iter()
-            .map(|arena| {
-                let arena_datadir = arena_root(dir, arena);
-                NamedArenaConfig {
-                    arena,
-                    config: ArenaConfig {
-                        datadir: arena_datadir,
-                    },
-                }
-            })
-            .collect(),
+    StorageConfig {
+        arenas: vec![],
         cache: CacheConfig {
-            db: dir.join("cache.db"),
+            db: dir.as_ref().join("cache.db"),
         },
         watcher: WatcherConfig {
             // Disabled in tests
             debounce: Some(HumanDuration(Duration::ZERO)),
             max_parallel_hashers: Some(0),
         },
-    };
-
-    for NamedArenaConfig { config, .. } in &config.arenas {
-        std::fs::create_dir_all(&config.datadir)?;
     }
-
-    Ok(config)
 }
 
 /// Returns a directory in the given dir to store the files of the

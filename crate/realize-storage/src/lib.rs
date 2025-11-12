@@ -6,7 +6,7 @@ use futures::Stream;
 use global::db::GlobalDatabase;
 use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
 use tokio_stream::{StreamExt, StreamMap};
@@ -29,16 +29,18 @@ pub use arena::notifier::Progress;
 pub use arena::types::{
     CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability, Version,
 };
-pub use error::StorageError;
+pub use error::{SanityCheck, StorageError};
 pub use global::fs::{FileContent, Filesystem, FsLoc};
 pub use types::{Inode, JobId};
 
-use crate::config::NamedArenaConfig;
+use crate::arena::db::ArenaDatabase;
+use crate::config::{NamedArenaConfig, WatcherConfig};
 
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
     cache: Arc<Filesystem>,
-    arena_storage: HashMap<Arena, ArenaStorage>,
+    arena_storage: Arc<RwLock<HashMap<Arena, ArenaStorage>>>,
+    watcher_config: WatcherConfig,
 }
 
 impl Storage {
@@ -59,14 +61,13 @@ impl Storage {
             let arena_db = if let Some(db) = cache.arena_db(arena) {
                 db
             } else {
-                cache.add_arena(arena, &arena_config.datadir)?
+                cache.add_arena(arena, &arena_config.datadir).await?
             };
             log::debug!(
                 "[{}] Arena setup with datadir {:?}",
                 arena_db.tag(),
                 arena_db.cache().datadir()
             );
-
             arena_storage.insert(
                 arena,
                 ArenaStorage::with_db(arena_db, &config.watcher)
@@ -77,8 +78,24 @@ impl Storage {
 
         Ok(Arc::new(Self {
             cache,
-            arena_storage,
+            watcher_config: config.watcher.clone(),
+            arena_storage: Arc::new(RwLock::new(arena_storage)),
         }))
+    }
+
+    pub async fn create_arena(
+        &self,
+        arena: Arena,
+        datadir: &std::path::Path,
+    ) -> Result<(), StorageError> {
+        log::debug!("[{}] Create arena with directory {:?}", arena, datadir);
+        let db = self.cache.add_arena(arena, datadir).await?;
+        // TODO: deal with the situation where db is created but
+        // ArenaStorage::with_db fails.
+        let storage = ArenaStorage::with_db(db, &self.watcher_config).await?;
+        self.arena_storage.write().unwrap().insert(arena, storage);
+
+        Ok(())
     }
 
     /// Return a handle on the unreal cache.
@@ -88,7 +105,13 @@ impl Storage {
 
     /// Return an iterator over registered arenas.
     pub fn arenas(&self) -> impl Iterator<Item = Arena> {
-        self.arena_storage.iter().map(|(a, _)| *a)
+        self.arena_storage
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Subscribe to files in the given arena.
@@ -100,7 +123,7 @@ impl Storage {
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-        arena::notifier::subscribe(Arc::clone(&self.arena_storage(arena)?.db), tx, progress).await
+        arena::notifier::subscribe(self.arena_db(arena)?, tx, progress).await
     }
 
     /// Take into account notification from a remote peer.
@@ -114,7 +137,7 @@ impl Storage {
         arena: Arena,
         mark: Mark,
     ) -> Result<(), StorageError> {
-        let db = self.arena_storage(arena)?.db.clone();
+        let db = self.arena_db(arena)?;
         task::spawn_blocking(move || arena::mark::set_arena_mark(&db, mark)).await?
     }
 
@@ -125,7 +148,7 @@ impl Storage {
         path: &Path,
         mark: Mark,
     ) -> Result<(), StorageError> {
-        let db = self.arena_storage(arena)?.db.clone();
+        let db = self.arena_db(arena)?;
         let path = path.clone();
         task::spawn_blocking(move || arena::mark::set(&db, &path, mark)).await?
     }
@@ -136,14 +159,14 @@ impl Storage {
         arena: Arena,
         path: &Path,
     ) -> Result<Mark, StorageError> {
-        let db = self.arena_storage(arena)?.db.clone();
+        let db = self.arena_db(arena)?;
         let path = path.clone();
         task::spawn_blocking(move || arena::mark::get(&db, &path)).await?
     }
 
     /// Get the default mark for the files in the given arena.
     pub async fn get_arena_mark(self: &Arc<Self>, arena: Arena) -> Result<Mark, StorageError> {
-        let db = self.arena_storage(arena)?.db.clone();
+        let db = self.arena_db(arena)?;
         task::spawn_blocking(move || arena::mark::get_arena_mark(&db)).await?
     }
 
@@ -153,9 +176,7 @@ impl Storage {
         arena: Arena,
         path: &realize_types::Path,
     ) -> Result<Reader, StorageError> {
-        let arena_storage = self.arena_storage(arena)?;
-
-        Reader::open(&arena_storage.db, path).await
+        Reader::open(&self.arena_db(arena)?, path).await
     }
 
     pub async fn rsync(
@@ -165,9 +186,9 @@ impl Storage {
         range: &ByteRange,
         sig: Signature,
     ) -> anyhow::Result<Delta, StorageError> {
-        let arena_storage = self.arena_storage(arena)?;
+        let db = self.arena_db(arena)?;
 
-        indexed_store::rsync(&arena_storage.db, path, range, sig).await
+        indexed_store::rsync(&db, path, range, sig).await
     }
 
     /// Return an infinite stream of jobs.
@@ -185,14 +206,13 @@ impl Storage {
     /// Multiple streams will return the same results, even in the
     /// same process, as long as no job is marked done or failed.
     pub fn job_stream(&self) -> impl Stream<Item = (Arena, JobId, Job)> {
-        self.arena_storage
-            .iter()
-            .map(|(arena, storage)| {
+        self.engines()
+            .into_iter()
+            .map(|(arena, engine)| {
                 (
-                    *arena,
+                    arena,
                     Box::pin(
-                        storage
-                            .engine
+                        engine
                             .job_stream()
                             .filter_map(|(job_id, job)| job.into_external().map(|j| (job_id, j))),
                     ),
@@ -206,8 +226,8 @@ impl Storage {
     ///
     /// This should be called after a new peer has become available.
     pub fn retry_jobs_missing_peers(&self) {
-        for storage in self.arena_storage.values() {
-            storage.engine.retry_jobs_missing_peers();
+        for (_, engine) in self.engines() {
+            engine.retry_jobs_missing_peers();
         }
     }
 
@@ -221,7 +241,7 @@ impl Storage {
         job_id: JobId,
         status: anyhow::Result<JobStatus>,
     ) -> Result<(), StorageError> {
-        let engine = Arc::clone(self.engine(arena)?);
+        let engine = self.engine(arena)?;
         task::spawn(async move { engine.job_finished(job_id, status) }).await?
     }
 
@@ -251,15 +271,37 @@ impl Storage {
     /// Return the engine for an arena.
     ///
     /// Only indexed arenas have engines.
-    fn engine(&self, arena: Arena) -> Result<&Arc<Engine>, StorageError> {
-        Ok(&self.arena_storage(arena)?.engine)
+    fn engine(&self, arena: Arena) -> Result<Arc<Engine>, StorageError> {
+        Ok(self
+            .arena_storage
+            .read()
+            .unwrap()
+            .get(&arena)
+            .ok_or_else(|| StorageError::UnknownArena(arena))?
+            .engine
+            .clone())
     }
 
-    /// Return the index for the given arena, if one exists.
-    fn arena_storage(&self, arena: Arena) -> Result<&ArenaStorage, StorageError> {
-        self.arena_storage
+    /// Return the [ArenaDatabase] for te given arena.
+    fn arena_db(&self, arena: Arena) -> Result<Arc<ArenaDatabase>, StorageError> {
+        Ok(self
+            .arena_storage
+            .read()
+            .unwrap()
             .get(&arena)
-            .ok_or_else(|| StorageError::UnknownArena(arena))
+            .ok_or_else(|| StorageError::UnknownArena(arena))?
+            .db
+            .clone())
+    }
+
+    /// Return all engines
+    fn engines(&self) -> Vec<(Arena, Arc<Engine>)> {
+        self.arena_storage
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(arena, storage)| (*arena, Arc::clone(&storage.engine)))
+            .collect::<Vec<_>>()
     }
 }
 

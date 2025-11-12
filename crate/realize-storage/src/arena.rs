@@ -1,5 +1,5 @@
+use crate::StorageError;
 use crate::config::{self, HumanDuration};
-use anyhow::Context;
 use db::ArenaDatabase;
 use engine::Engine;
 use std::sync::Arc;
@@ -41,7 +41,7 @@ impl ArenaStorage {
     pub(crate) async fn with_db(
         db: Arc<ArenaDatabase>,
         watcher_config: &config::WatcherConfig,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, StorageError> {
         let shutdown = CancellationToken::new();
         let tag = db.tag();
         let datadir = db.cache().datadir();
@@ -58,8 +58,7 @@ impl ArenaStorage {
             )
             .max_parallel_hashers(watcher_config.max_parallel_hashers.unwrap_or(4))
             .spawn()
-            .await
-            .with_context(|| format!("{datadir:?}"))?;
+            .await?;
         tokio::spawn({
             let db = Arc::clone(&db);
             let shutdown = shutdown.clone();

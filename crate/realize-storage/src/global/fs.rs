@@ -122,42 +122,48 @@ impl Filesystem {
     }
 
     /// Add a new arena to the filesystem
-    pub(crate) fn add_arena(
-        &self,
+    pub(crate) async fn add_arena(
+        self: &Arc<Filesystem>,
         arena: Arena,
         datadir: &std::path::Path,
     ) -> Result<Arc<ArenaDatabase>, StorageError> {
-        let txn = self.db.begin_write()?;
+        let this = Arc::clone(self);
+        let datadir = datadir.to_path_buf();
 
-        let prefixes;
-        let globals;
-        {
-            let mut arena_table = txn.arena_table()?;
-            let mut path_table = txn.path_table()?;
-            let mut pathid_range_table = txn.pathid_range_table()?;
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_write()?;
 
-            add_arena_to_database(
-                &mut arena_table,
-                &mut path_table,
-                &mut pathid_range_table,
-                arena,
-                datadir,
-            )?;
+            let prefixes;
+            let globals;
+            {
+                let mut arena_table = txn.arena_table()?;
+                let mut path_table = txn.path_table()?;
+                let mut pathid_range_table = txn.pathid_range_table()?;
 
-            prefixes = build_prefix_map(&arena_table)?;
-            globals = build_globals(&path_table)?;
-        }
-        let db = ArenaDatabase::open(arena, datadir)?;
-        let fs = ArenaFilesystem::new(Arc::clone(&db));
+                add_arena_to_database(
+                    &mut arena_table,
+                    &mut path_table,
+                    &mut pathid_range_table,
+                    arena,
+                    &datadir,
+                )?;
 
-        txn.commit()?;
+                prefixes = build_prefix_map(&arena_table)?;
+                globals = build_globals(&path_table)?;
+            }
+            let db = ArenaDatabase::open(arena, datadir)?;
+            let fs = ArenaFilesystem::new(Arc::clone(&db));
 
-        let mut state = self.state.write().unwrap();
-        state.arena_fs.insert(arena, fs);
-        state.prefixes = prefixes;
-        state.globals = globals;
+            txn.commit()?;
 
-        Ok(db)
+            let mut state = this.state.write().unwrap();
+            state.arena_fs.insert(arena, fs);
+            state.prefixes = prefixes;
+            state.globals = globals;
+
+            Ok(db)
+        })
+        .await?
     }
 
     /// Convert a [GlobalTreeLoc] into an arena or global location.
@@ -867,7 +873,7 @@ mod tests {
             for arena in arenas.into_iter() {
                 let datadir = tempdir.child(format!("{arena}"));
                 datadir.create_dir_all()?;
-                fs.add_arena(arena, datadir.path())?;
+                fs.add_arena(arena, datadir.path()).await?;
             }
             Ok(Self {
                 fs,

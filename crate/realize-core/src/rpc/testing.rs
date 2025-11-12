@@ -9,7 +9,6 @@ use realize_network::testing::TestingPeers;
 use realize_storage::Blob;
 use realize_storage::Storage;
 use realize_storage::Version;
-use realize_storage::config::StorageConfig;
 use realize_storage::utils::hash;
 use realize_storage::{self, Filesystem};
 use realize_types::Path;
@@ -35,56 +34,6 @@ pub struct HouseholdFixture {
     servers: HashMap<Peer, Arc<Server>>,
 }
 
-pub struct HouseholdFixtureBuilder {
-    tempdir: TempDir,
-    config: HashMap<Peer, StorageConfig>,
-}
-
-impl HouseholdFixtureBuilder {
-    fn new() -> Self {
-        let tempdir = TempDir::new().unwrap();
-        let mut config = HashMap::new();
-        for peer in [
-            HouseholdFixture::a(),
-            HouseholdFixture::b(),
-            HouseholdFixture::c(),
-        ] {
-            config.insert(
-                peer,
-                realize_storage::testing::config(
-                    tempdir.child(peer.as_str()).path(),
-                    [HouseholdFixture::test_arena()],
-                )
-                .expect("config for {peer}"),
-            );
-        }
-
-        Self { tempdir, config }
-    }
-
-    /// Return a modifiable [StorageConfig] for the peer.
-    pub fn config_mut(&mut self, peer: Peer) -> &mut StorageConfig {
-        self.config
-            .get_mut(&peer)
-            .expect("StorageConfig for {peer}")
-    }
-
-    pub async fn setup(self) -> anyhow::Result<HouseholdFixture> {
-        let _ = env_logger::try_init();
-
-        let mut peer_storage = HashMap::new();
-        for (peer, config) in self.config.into_iter() {
-            peer_storage.insert(peer, Storage::from_config(&config).await?);
-        }
-        Ok(HouseholdFixture {
-            peers: TestingPeers::new()?,
-            peer_storage,
-            tempdir: self.tempdir,
-            servers: HashMap::new(),
-        })
-    }
-}
-
 impl HouseholdFixture {
     pub fn a() -> Peer {
         TestingPeers::a()
@@ -99,15 +48,31 @@ impl HouseholdFixture {
         Arena::from("myarena")
     }
 
-    /// Create a builder that allows tweaking [StorageConfig] for the
-    /// different peers.
-    pub fn builder() -> HouseholdFixtureBuilder {
-        HouseholdFixtureBuilder::new()
-    }
-
     /// Setup the fixture.
     pub async fn setup() -> anyhow::Result<Self> {
-        HouseholdFixture::builder().setup().await
+        let _ = env_logger::try_init();
+
+        let tempdir = TempDir::new()?;
+        let mut peer_storage = HashMap::new();
+        for peer in [
+            HouseholdFixture::a(),
+            HouseholdFixture::b(),
+            HouseholdFixture::c(),
+        ] {
+            let peer_dir = tempdir.child(peer.as_str());
+            let storage = realize_storage::testing::storage(
+                peer_dir.path(),
+                [HouseholdFixture::test_arena()],
+            )
+            .await?;
+            peer_storage.insert(peer, storage);
+        }
+        Ok(HouseholdFixture {
+            peers: TestingPeers::new()?,
+            peer_storage,
+            tempdir,
+            servers: HashMap::new(),
+        })
     }
 
     pub fn server(&self, peer: Peer) -> Option<&Arc<Server>> {

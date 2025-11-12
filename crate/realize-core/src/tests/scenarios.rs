@@ -12,7 +12,7 @@ async fn file_drop() -> anyhow::Result<()> {
     let a = HouseholdFixture::a();
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
-    let mut fixture = HouseholdFixture::builder().setup().await?;
+    let mut fixture = HouseholdFixture::setup().await?;
     fixture
         .with_two_peers()
         .await?
@@ -84,7 +84,7 @@ async fn link_to_own() -> anyhow::Result<()> {
     let a = HouseholdFixture::a();
     let b = HouseholdFixture::b();
     let arena = HouseholdFixture::test_arena();
-    let mut fixture = HouseholdFixture::builder().setup().await?;
+    let mut fixture = HouseholdFixture::setup().await?;
     fixture
         .with_two_peers()
         .await?

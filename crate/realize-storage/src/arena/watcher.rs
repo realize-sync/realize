@@ -80,7 +80,7 @@ impl RealWatcherBuilder {
     /// To stop the background work cleanly, call [RealWatcher::shutdown].
     ///
     /// Background work is also stopped at some point after the instance is dropped.
-    pub async fn spawn(self) -> anyhow::Result<RealWatcher> {
+    pub async fn spawn(self) -> Result<RealWatcher, StorageError> {
         RealWatcher::spawn(
             Arc::clone(&self.db),
             self.initial_scan,
@@ -102,7 +102,7 @@ impl RealWatcher {
         initial_scan: bool,
         debounce: Duration,
         max_parallelism: usize,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, StorageError> {
         let root = fs::canonicalize(db.cache().datadir()).await?;
         let tag = db.tag();
 
@@ -150,7 +150,7 @@ impl RealWatcher {
         });
 
         if initial_scan {
-            watch_tx.send(FsEvent::Scan(Path::root())).await?;
+            let _ = watch_tx.send(FsEvent::Scan(Path::root())).await;
         }
 
         Ok(Self { shutdown_tx })
@@ -778,7 +778,7 @@ mod tests {
         }
 
         /// Catch up to any previous changes and watch for anything new.
-        async fn scan_and_watch(&self) -> anyhow::Result<RealWatcher> {
+        async fn scan_and_watch(&self) -> Result<RealWatcher, StorageError> {
             RealWatcher::builder(Arc::clone(&self.db))
                 .with_initial_scan()
                 .spawn()
@@ -789,7 +789,7 @@ mod tests {
         ///
         /// Note that filesystem modifications made just before this
         /// is called might still get reported.
-        async fn watch(&self) -> anyhow::Result<RealWatcher> {
+        async fn watch(&self) -> Result<RealWatcher, StorageError> {
             RealWatcher::builder(Arc::clone(&self.db)).spawn().await
         }
 

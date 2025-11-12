@@ -22,6 +22,9 @@ pub enum StorageError {
     #[error("bincode error: {0}")]
     ByteConversion(#[from] ByteConversionError),
 
+    #[error("notify error: {0}")]
+    NotifyError(#[from] notify::Error),
+
     #[error{"data not available at this time"}]
     Unavailable,
 
@@ -147,6 +150,7 @@ impl StorageError {
             StorageError::NotADirectory => NotADirectory,
             StorageError::IsADirectory => IsADirectory,
             StorageError::JoinError(_) => Other,
+            StorageError::NotifyError(_) => Other,
             StorageError::InvalidRsyncSignature => InvalidInput,
             StorageError::DatabaseOutdated(_) => InvalidData,
             StorageError::UnknownArena(_) => NotFound,
