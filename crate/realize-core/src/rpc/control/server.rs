@@ -412,6 +412,7 @@ mod tests {
     use realize_network::unixsocket;
     use realize_storage::{Job, JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1282,8 +1283,8 @@ mod tests {
                 ));
 
                 assert_unordered::assert_eq_unordered!(
-                    vec![HouseholdFixture::test_arena(), Arena::from("newarena")],
-                    storage.arenas().collect::<Vec<_>>()
+                    BTreeSet::from([HouseholdFixture::test_arena(), Arena::from("newarena")]),
+                    storage.arenas()
                 );
 
                 Ok::<(), anyhow::Error>(())
@@ -1339,8 +1340,8 @@ mod tests {
 
                 // No new arena was added.
                 assert_eq!(
-                    vec![HouseholdFixture::test_arena()],
-                    storage.arenas().collect::<Vec<_>>()
+                    BTreeSet::from([HouseholdFixture::test_arena()]),
+                    storage.arenas()
                 );
 
                 Ok::<(), anyhow::Error>(())

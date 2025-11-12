@@ -41,6 +41,7 @@ impl SetupHelper {
             "Indexed arenas: {:?}",
             storage
                 .arenas()
+                .iter()
                 .map(|a| a.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")

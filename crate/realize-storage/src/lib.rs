@@ -5,9 +5,9 @@ use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
 use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinHandle};
 use tokio_stream::{StreamExt, StreamMap};
 use utils::redb_utils;
@@ -41,6 +41,8 @@ pub struct Storage {
     cache: Arc<Filesystem>,
     arena_storage: Arc<RwLock<HashMap<Arena, ArenaStorage>>>,
     watcher_config: WatcherConfig,
+    arena_set_watch_tx: watch::Sender<BTreeSet<Arena>>,
+    _arena_set_watch_rx: watch::Receiver<BTreeSet<Arena>>,
 }
 
 impl Storage {
@@ -51,6 +53,7 @@ impl Storage {
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
         let cache = Filesystem::with_db(globaldb).await?;
+        let (arena_set_watch_tx, arena_set_watch_rx) = watch::channel(BTreeSet::new());
 
         for NamedArenaConfig {
             arena,
@@ -80,6 +83,8 @@ impl Storage {
             cache,
             watcher_config: config.watcher.clone(),
             arena_storage: Arc::new(RwLock::new(arena_storage)),
+            arena_set_watch_tx,
+            _arena_set_watch_rx: arena_set_watch_rx,
         }))
     }
 
@@ -93,7 +98,11 @@ impl Storage {
         // TODO: deal with the situation where db is created but
         // ArenaStorage::with_db fails.
         let storage = ArenaStorage::with_db(db, &self.watcher_config).await?;
-        self.arena_storage.write().unwrap().insert(arena, storage);
+        let mut lock = self.arena_storage.write().unwrap();
+        lock.insert(arena, storage);
+        let _ = self
+            .arena_set_watch_tx
+            .send(lock.keys().map(|a| *a).collect());
 
         Ok(())
     }
@@ -103,20 +112,25 @@ impl Storage {
         &self.cache
     }
 
-    /// Return an iterator over registered arenas.
-    pub fn arenas(&self) -> impl Iterator<Item = Arena> {
+    /// Return the set of registered arenas.
+    ///
+    /// This is a snapshot. Call [Storage::watch_arenas] to be kept
+    /// up-to-date.
+    pub fn arenas(&self) -> BTreeSet<Arena> {
         self.arena_storage
             .read()
             .unwrap()
             .iter()
             .map(|(a, _)| *a)
-            .collect::<Vec<_>>()
-            .into_iter()
+            .collect()
     }
 
-    /// Subscribe to files in the given arena.
-    ///
-    /// The arena must have an index; check with [Storage::indexed_arenas] first.
+    /// Watch for changes in set of arenas.
+    pub fn watch_arenas(&self) -> watch::Receiver<BTreeSet<Arena>> {
+        self.arena_set_watch_tx.subscribe()
+    }
+
+    /// Subscribe to shared file notifications in the given arena.
     pub async fn subscribe(
         &self,
         arena: Arena,
@@ -307,4 +321,60 @@ impl Storage {
 
 async fn create_globaldb(path: &std::path::Path) -> anyhow::Result<Arc<GlobalDatabase>> {
     Ok(GlobalDatabase::new(redb_utils::open(path).await?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use assert_fs::{
+        TempDir,
+        prelude::{PathChild, PathCreateDir},
+    };
+
+    use super::*;
+
+    struct Fixture {
+        tempdir: TempDir,
+        arena: Arena,
+        storage: Arc<Storage>,
+    }
+
+    impl Fixture {
+        async fn setup() -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
+            let arena = Arena::from("myarena");
+            let datadir = tempdir.child(arena.as_str());
+            datadir.create_dir_all()?;
+            let storage = testing::storage(datadir.path(), [arena]).await?;
+
+            Ok(Self {
+                tempdir,
+                arena,
+                storage,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_arena_set() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        assert_eq!(BTreeSet::from([fixture.arena]), fixture.storage.arenas());
+
+        let mut watch = fixture.storage.watch_arenas();
+        assert_eq!(BTreeSet::from([fixture.arena]), *watch.borrow_and_update());
+
+        let new = Arena::from("new");
+        let datadir = fixture.tempdir.child(new.as_str());
+        datadir.create_dir_all()?;
+        fixture.storage.create_arena(new, &datadir).await?;
+
+        watch.changed().await.unwrap();
+        assert_eq!(BTreeSet::from([fixture.arena, new]), *watch.borrow());
+        assert_eq!(
+            BTreeSet::from([fixture.arena, new]),
+            fixture.storage.arenas()
+        );
+        Ok(())
+    }
 }
