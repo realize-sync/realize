@@ -1,13 +1,16 @@
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use realize_core::config::Config;
+use realize_core::rpc::result_capnp;
 use realize_network::config::PeerConfig;
 use realize_network::unixsocket;
-use realize_storage::config::{CacheConfig, NamedArenaConfig};
+use realize_storage::config::CacheConfig;
+use realize_storage::config::NamedArenaConfig;
 use realize_types;
 use realize_types::{Arena, Peer};
 use std::env;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -203,6 +206,32 @@ impl Fixture {
 
     async fn assert_listening(&self) {
         assert_listening_to(&self.server_address).await;
+    }
+
+    async fn create_arena(&self, arena: Arena, datadir: &std::path::Path) -> anyhow::Result<()> {
+        let datadir = datadir.to_path_buf();
+        let socket = self.socket.clone();
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let control: realize_core::rpc::control::control_capnp::control::Client =
+                    unixsocket::connect(&socket).await?;
+
+                let mut request = control.create_arena_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_dir(datadir.as_path().as_os_str().as_bytes());
+                let result = request.send().promise.await?;
+                assert!(matches!(
+                    result.get()?.get_res()?.which()?,
+                    result_capnp::result::Which::Ok(_)
+                ));
+
+                Ok::<_, anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -459,8 +488,25 @@ async fn daemon_binds_socket() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn daemon_creates_arena() -> anyhow::Result<()> {
+    let mut fixture = Fixture::setup().await?;
+    fixture.config.storage.arenas.clear();
+
+    let daemon = fixture.command()?.spawn()?;
+    let pid = daemon.id();
+    scopeguard::defer! { let _ = kill(pid); }
+
+    fixture.assert_listening().await;
+    fixture
+        .create_arena(Arena::from("testdir"), &fixture.testdir)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_exports_fuse() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
+    let mut fixture = Fixture::setup().await?;
+    fixture.config.storage.arenas.clear();
 
     // Create a mount point for FUSE
     let mount_point = fixture.tempdir.child("fuse-mount");
@@ -488,7 +534,7 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
     }
     assert_ne!(fs::metadata(mount_point.path())?.dev(), original_dev);
 
-    // List the root directory content - the arena must appear
+    // List the root directory content - the arena must not appear
     let entries = std::fs::read_dir(mount_point.path())?;
     let entry_names: Vec<String> = entries
         .filter_map(|entry| {
@@ -497,8 +543,25 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
                 .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
         })
         .collect();
+    assert!(
+        entry_names.is_empty(),
+        "Expected to find no arenas in FUSE mount, found: {:?}",
+        entry_names
+    );
 
-    // The arena "testdir" should be visible in the FUSE mount
+    fixture
+        .create_arena(Arena::from("testdir"), &fixture.testdir)
+        .await?;
+
+    // List the root directory content - the arena must now appear
+    let entries = std::fs::read_dir(mount_point.path())?;
+    let entry_names: Vec<String> = entries
+        .filter_map(|entry| {
+            entry
+                .ok()
+                .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
+        })
+        .collect();
     assert!(
         entry_names.contains(&"testdir".to_string()),
         "Expected to find 'testdir' arena in FUSE mount, found: {:?}",

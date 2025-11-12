@@ -1,6 +1,8 @@
 @0xe3dce7cd32acae48;
 
 using Rust = import "/capnpc/rust.capnp";
+using import "result.capnp".Result;
+
 $Rust.parentModule("rpc::control");
 
 # Control the local realize server.
@@ -18,6 +20,9 @@ interface Control {
   
   disconnect @5 (peer: Text) -> ();
   # disconnect to the given peer or stop trying to connect
+
+  createArena @6 (req: CreateArenaRequest) -> (res: Result(CreateArenaResponse, CreateArenaError));
+  # create a new local arena
 }
 
 struct PeerConnectionInfo {
@@ -148,3 +153,28 @@ enum JobAction {
   verify @2;
   repair @3;
 }
+
+struct CreateArenaRequest {
+  arena @0: Text; # name of the arena to create
+  dir @1: Data; # path to the arena's local directory 
+}
+
+struct CreateArenaResponse {}
+
+struct CreateArenaError {
+  
+  issue @0: SanityCheckIssue;
+}
+
+struct SanityCheckIssue {
+  check @0: Check;
+  path @1: Data;
+
+  enum Check {
+    exists @0;
+    readableDir @1;
+    writableDir @2;
+    sameDevice @3;
+  }
+}
+

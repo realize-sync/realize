@@ -6,17 +6,19 @@ use super::control_capnp::churten::{
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
-    self, ChurtenParams, ChurtenResults, DisconnectParams, DisconnectResults, GetMarkParams,
-    GetMarkResults, KeepConnectedParams, KeepConnectedResults, ListPeersParams, ListPeersResults,
-    SetMarkParams, SetMarkResults,
+    self, ChurtenParams, ChurtenResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
+    DisconnectResults, GetMarkParams, GetMarkResults, KeepConnectedParams, KeepConnectedResults,
+    ListPeersParams, ListPeersResults, SetMarkParams, SetMarkResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
 use crate::rpc::{Household, household::ConnectionStatus};
 use capnp::capability::Promise;
-use realize_storage::{Mark, Storage, StorageError};
+use realize_storage::{Mark, SanityCheck, Storage, StorageError};
 use realize_types::{Arena, Hash, Path, Peer};
 use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -178,6 +180,56 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
             Ok(())
         })
     }
+
+    fn create_arena(
+        &mut self,
+        params: CreateArenaParams,
+        mut results: CreateArenaResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let dir = std::path::Path::new(&OsStr::from_bytes(req.get_dir()?)).to_path_buf();
+
+            let result = tokio::task::spawn_local(async move {
+                let ret = storage.create_arena(arena, &dir).await;
+
+                ret
+            })
+            .await
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            match result {
+                Ok(()) => {
+                    results.get().init_res().init_ok();
+                }
+                Err(StorageError::SanityCheckFailed(_, path, check)) => {
+                    fill_issue(
+                        &path,
+                        check,
+                        results.get().init_res().init_err().init_issue(),
+                    );
+                }
+                Err(err) => return Err(from_storage_err(err)),
+            }
+            Ok(())
+        })
+    }
+}
+
+fn fill_issue(
+    path: &std::path::Path,
+    check: SanityCheck,
+    mut dest: control_capnp::sanity_check_issue::Builder<'_>,
+) {
+    dest.set_path(path.as_os_str().as_bytes());
+    dest.set_check(match check {
+        SanityCheck::Exists => control_capnp::sanity_check_issue::Check::Exists,
+        SanityCheck::ReadableDir => control_capnp::sanity_check_issue::Check::ReadableDir,
+        SanityCheck::WritableDir => control_capnp::sanity_check_issue::Check::WritableDir,
+        SanityCheck::SameDevice => control_capnp::sanity_check_issue::Check::SameDevice,
+    });
 }
 
 #[derive(Clone)]
@@ -354,8 +406,9 @@ mod tests {
     use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
     use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
     use crate::rpc::testing::{self, HouseholdFixture};
-    use crate::rpc::{Household, PeerStatus};
+    use crate::rpc::{Household, PeerStatus, result_capnp};
     use assert_fs::TempDir;
+    use assert_fs::prelude::PathChild;
     use realize_network::unixsocket;
     use realize_storage::{Job, JobId, JobStatus, Mark, Notification};
     use realize_types::{Peer, UnixTime};
@@ -1191,6 +1244,105 @@ mod tests {
                         Ok::<(), anyhow::Error>(())
                     })
                     .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_arena() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                let newarena = TempDir::new()?;
+                let mut request = control.create_arena_request();
+                let mut req = request.get().init_req();
+                req.set_arena("newarena");
+                req.set_dir(newarena.path().as_os_str().as_bytes());
+                let result = request.send().promise.await?;
+                assert!(matches!(
+                    result.get()?.get_res()?.which()?,
+                    result_capnp::result::Which::Ok(_)
+                ));
+
+                assert_unordered::assert_eq_unordered!(
+                    vec![HouseholdFixture::test_arena(), Arena::from("newarena")],
+                    storage.arenas().collect::<Vec<_>>()
+                );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_arena_dir_not_found() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                let tempdir = TempDir::new()?;
+                let newarena = tempdir.child("doesnotexist");
+                let mut request = control.create_arena_request();
+                let mut req = request.get().init_req();
+                req.set_arena("newarena");
+                req.set_dir(newarena.path().as_os_str().as_bytes());
+                let result = request.send().promise.await?;
+
+                // T response mentions the appropriate error.
+                match result.get()?.get_res()?.which()? {
+                    result_capnp::result::Which::Ok(_) => panic!("Unexpected success response"),
+                    result_capnp::result::Which::Err(err) => {
+                        let err = err?;
+                        let issue = err.get_issue()?;
+                        assert_eq!(
+                            control_capnp::sanity_check_issue::Check::Exists,
+                            issue.get_check()?
+                        );
+                        assert_eq!(
+                            newarena.path(),
+                            std::path::Path::new(&OsStr::from_bytes(issue.get_path()?))
+                        );
+                    }
+                }
+
+                // No new arena was added.
+                assert_eq!(
+                    vec![HouseholdFixture::test_arena()],
+                    storage.arenas().collect::<Vec<_>>()
+                );
+
                 Ok::<(), anyhow::Error>(())
             })
             .await?;
