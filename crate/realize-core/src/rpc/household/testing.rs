@@ -1,7 +1,7 @@
 use crate::rpc::peer_capnp::connected_peer;
 use crate::rpc::store_capnp::store::{
     self, ArenasParams, ArenasResults, ReadParams, ReadResults, RsyncParams, RsyncResults,
-    SubscribeParams, SubscribeResults, WithRateLimitParams, WithRateLimitResults,
+    SubscriptionsParams, SubscriptionsResults, WithRateLimitParams, WithRateLimitResults,
 };
 use crate::rpc::testing::HouseholdFixture;
 use capnp::capability::Promise;
@@ -54,10 +54,14 @@ impl store::Server for FakeStore {
         Promise::ok(())
     }
 
-    fn subscribe(&mut self, _: SubscribeParams, _: SubscribeResults) -> Promise<(), capnp::Error> {
+    fn subscriptions(
+        &mut self,
+        _: SubscriptionsParams,
+        _: SubscriptionsResults,
+    ) -> Promise<(), capnp::Error> {
         self.0
             .borrow_mut()
-            .push(format!("Store.subscribe() rate_limit={:?}", self.1));
+            .push(format!("Store.subscriptions() rate_limit={:?}", self.1));
 
         Promise::ok(())
     }

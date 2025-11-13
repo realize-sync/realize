@@ -13,7 +13,7 @@ interface Store {
   
   # Subscribe to notifications to receive and be kept 
   # up-to-date on the store file list
-  subscribe @1 (req: SubscribeRequest) -> (result: Result(SubscribeResponse, SubscribeError));
+  subscriptions @1 (subscriber: Subscriber) -> (subscriptions: Subscriptions);
 
   # Read data from a file
   #
@@ -98,15 +98,6 @@ struct IoError {
   }
 }
 
-struct SubscribeRequest {
-  subscriber @0: Subscriber;
-  arena @1: Text;
-  progress @2: SubscriberProgress;
-}
-
-struct SubscribeResponse {
-}
-
 struct SubscriberProgress {
   uuid @0: Uuid;
   lastSeen @1: UInt64;
@@ -114,6 +105,17 @@ struct SubscriberProgress {
 
 struct SubscribeError {
  message @0:Text;
+}
+
+interface Subscriptions {
+  subscribe @0 (req: SubscribeRequest) -> (res: SubscribeResponse);
+}
+struct SubscribeRequest {
+  arena @0: Text;
+  progress @1: SubscriberProgress;
+}
+
+struct SubscribeResponse {
 }
 
 interface Subscriber {

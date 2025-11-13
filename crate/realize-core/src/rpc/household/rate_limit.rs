@@ -68,7 +68,7 @@ mod tests {
                     vec![
                         "ConnectedPeer.store()".to_string(),
                         "Store.with_rate_limit(1024)".to_string(),
-                        "Store.subscribe() rate_limit=Some(1024.0)".to_string(),
+                        "Store.subscriptions() rate_limit=Some(1024.0)".to_string(),
                     ],
                     calls.borrow().clone()
                 );

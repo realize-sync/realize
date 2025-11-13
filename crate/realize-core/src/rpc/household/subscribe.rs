@@ -1,10 +1,11 @@
 use super::convert;
 use super::rate_limit;
-use crate::rpc::result_capnp;
-use crate::rpc::store_capnp::store::{self, SubscribeParams, SubscribeResults};
+use crate::rpc::store_capnp::store::{self, SubscriptionsParams, SubscriptionsResults};
 use crate::rpc::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
+use crate::rpc::store_capnp::subscriptions::{self, SubscribeParams, SubscribeResults};
 use async_speed_limit::Limiter;
 use capnp::capability::Promise;
+use realize_storage::Notification;
 use realize_storage::{Progress, Storage, StorageError};
 use realize_types::Peer;
 use std::collections::HashMap;
@@ -65,24 +66,23 @@ pub(crate) async fn subscribe_self(
     })
     .await??;
 
-    let subscriber = SubscriberServer::new(peer, Arc::clone(storage)).into_client();
+    let mut request = store.subscriptions_request();
+    request
+        .get()
+        .set_subscriber(SubscriberServer::new(peer, Arc::clone(storage)).into_client());
+    let subscriptions = request.send().promise.await?.get()?.get_subscriptions()?;
+
     for arena in goal_arenas {
-        let mut request = store.subscribe_request();
+        let mut request = subscriptions.subscribe_request();
         let mut request_builder = request.get().init_req();
         request_builder.set_arena(arena.as_str());
-        request_builder.set_subscriber(subscriber.clone());
         if let Some(progress) = progress.remove(&arena) {
             let mut builder = request_builder.init_progress();
             builder.set_last_seen(progress.last_seen);
             convert::fill_uuid(builder.init_uuid(), &progress.uuid);
         }
 
-        let reply = request.send().promise.await?;
-        let result = reply.get()?.get_result()?;
-
-        if let result_capnp::result::Err(err) = result.which()? {
-            return Err(anyhow::anyhow!(err?.get_message()?.to_string()?));
-        }
+        request.send().promise.await?;
     }
 
     Ok(())
@@ -140,46 +140,20 @@ async fn do_notify(
     Ok(())
 }
 
-pub(crate) async fn do_subscribe(
+pub(crate) async fn do_subscriptions(
     peer: Peer,
     storage: Arc<Storage>,
     limiter: Option<Limiter>,
-    params: SubscribeParams,
-    mut results: SubscribeResults,
+    params: SubscriptionsParams,
+    mut results: SubscriptionsResults,
 ) -> Result<(), capnp::Error> {
-    let req = params.get()?.get_req()?;
-    let arena = convert::parse_arena(req.get_arena()?)?;
-
-    let result = results.get().init_result();
-    let progress = if req.has_progress() {
-        let progress = req.get_progress()?;
-        Some(Progress::new(
-            convert::parse_uuid(progress.get_uuid()?),
-            progress.get_last_seen(),
-        ))
-    } else {
-        None
-    };
-
-    let subscriber = req.get_subscriber()?;
+    let subscriber = params.get()?.get_subscriber()?;
 
     let (tx, mut rx) = mpsc::channel(100);
 
-    if let Err(err) = tokio::spawn({
-        let storage = storage.clone();
-        async move {
-            storage.subscribe(arena, tx, progress).await?;
-
-            Ok::<(), anyhow::Error>(())
-        }
-    })
-    .await
-    {
-        result.init_err().set_message(err.to_string());
-        return Ok(());
-    }
-
-    log::debug!("[{arena}]@{peer} Will report local changes to peer",);
+    results
+        .get()
+        .set_subscriptions(Subscriptions::new(tx, Arc::clone(&storage)).into_client());
     tokio::task::spawn_local(async move {
         let mut notifications = Vec::new();
         loop {
@@ -188,11 +162,11 @@ pub(crate) async fn do_subscribe(
                 // Channel has been closed
                 return;
             }
-            log::trace!("[{arena}@{peer}] Notify: {notifications:?}");
 
             let mut request = subscriber.notify_request();
             let mut builder = request.get().init_notifications(notifications.len() as u32);
             for (i, n) in std::mem::take(&mut notifications).into_iter().enumerate() {
+                log::trace!("[{}@{peer}] Notify: {n:?}", n.arena());
                 convert::fill_notification(&n, builder.reborrow().get(i as u32));
             }
 
@@ -205,9 +179,54 @@ pub(crate) async fn do_subscribe(
         }
     });
 
-    result.init_ok();
-
     Ok(())
+}
+
+/// Track another peer's arena subscriptions.
+struct Subscriptions {
+    storage: Arc<Storage>,
+    tx: mpsc::Sender<Notification>,
+}
+
+impl Subscriptions {
+    fn new(tx: mpsc::Sender<Notification>, storage: Arc<Storage>) -> Self {
+        Self { tx, storage }
+    }
+
+    fn into_client(self) -> subscriptions::Client {
+        capnp_rpc::new_client(self)
+    }
+}
+
+impl subscriptions::Server for Subscriptions {
+    fn subscribe(
+        &mut self,
+        params: SubscribeParams,
+        _: SubscribeResults,
+    ) -> capnp::capability::Promise<(), capnp::Error> {
+        let tx = self.tx.clone();
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+
+            let arena = convert::parse_arena(req.get_arena()?)?;
+            let progress = if req.has_progress() {
+                let progress = req.get_progress()?;
+                Some(Progress::new(
+                    convert::parse_uuid(progress.get_uuid()?),
+                    progress.get_last_seen(),
+                ))
+            } else {
+                None
+            };
+            storage
+                .subscribe(arena, tx, progress)
+                .await
+                .map_err(convert::anyhow_to_capnp_err)?;
+
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

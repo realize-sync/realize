@@ -3,7 +3,7 @@ use super::result_capnp;
 use super::store_capnp::read_callback::{ChunkParams, FinishParams, FinishResults};
 use super::store_capnp::store::{
     self, ArenasParams, ArenasResults, ReadParams, ReadResults, RsyncParams, RsyncResults,
-    SubscribeParams, SubscribeResults, WithRateLimitParams, WithRateLimitResults,
+    SubscriptionsParams, SubscriptionsResults, WithRateLimitParams, WithRateLimitResults,
 };
 use super::store_capnp::{io_error, read_callback};
 use async_speed_limit::Limiter;
@@ -917,7 +917,7 @@ impl StoreServer {
             .storage
             .rsync(arena, &path, &range, sig)
             .await
-            .map_err(storage_to_capnp_err)?;
+            .map_err(convert::storage_to_capnp_err)?;
 
         results.get().init_res().set_delta(&delta.0);
 
@@ -990,16 +990,16 @@ impl store::Server for StoreServer {
         Promise::ok(())
     }
 
-    fn subscribe(
+    fn subscriptions(
         &mut self,
-        params: SubscribeParams,
-        results: SubscribeResults,
+        params: SubscriptionsParams,
+        results: SubscriptionsResults,
     ) -> Promise<(), capnp::Error> {
         let peer = self.peer;
         let storage = Arc::clone(&self.storage);
         let limiter = self.limiter.clone();
         Promise::from_future(async move {
-            subscribe::do_subscribe(peer, storage, limiter, params, results).await
+            subscribe::do_subscriptions(peer, storage, limiter, params, results).await
         })
     }
 
@@ -1022,10 +1022,6 @@ async fn get_connected_peer_store(
     let store = reply.get()?.get_store()?;
 
     Ok(store)
-}
-
-fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
-    capnp::Error::failed(err.to_string())
 }
 
 #[cfg(test)]
