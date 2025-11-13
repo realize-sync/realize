@@ -8,7 +8,6 @@ use capnp::capability::Promise;
 use realize_storage::Notification;
 use realize_storage::{Progress, Storage, StorageError};
 use realize_types::Peer;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -20,63 +19,18 @@ pub(crate) async fn subscribe_self(
     store: store::Client,
 ) -> anyhow::Result<()> {
     let cache = storage.cache();
-    let request = store.arenas_request();
-    let reply = request.send().promise.await?;
-    let arenas = reply.get()?.get_arenas()?;
-    let peer_arenas = convert::parse_arena_set(arenas)?;
-    log::debug!(
-        "@{peer} Arenas: {}",
-        peer_arenas
-            .iter()
-            .map(|a| a.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    let goal_arenas = cache
-        .arenas()
-        .filter(|a| peer_arenas.contains(a))
-        .map(|a| a.clone())
-        .collect::<Vec<_>>();
-    if goal_arenas.is_empty() {
-        log::debug!(
-            "@{peer} No common arenas. peer: {:?} vs local: {:?}",
-            peer_arenas,
-            cache.arenas().collect::<Vec<_>>(),
-        );
-
-        return Ok(());
-    }
-    for arena in &goal_arenas {
-        log::debug!("[{arena}]@{peer} Tracking")
-    }
-    let mut progress = tokio::spawn({
-        let goal_arenas = goal_arenas.clone();
-        let cache = cache.clone();
-        async move {
-            let mut map = HashMap::new();
-            for arena in goal_arenas {
-                if let Some(progress) = cache.peer_progress(peer, arena).await? {
-                    map.insert(arena, progress);
-                }
-            }
-
-            Ok::<_, anyhow::Error>(map)
-        }
-    })
-    .await??;
-
     let mut request = store.subscriptions_request();
     request
         .get()
         .set_subscriber(SubscriberServer::new(peer, Arc::clone(storage)).into_client());
     let subscriptions = request.send().promise.await?.get()?.get_subscriptions()?;
 
-    for arena in goal_arenas {
+    for arena in storage.arenas() {
+        log::debug!("{arena}@{peer} Tracking");
         let mut request = subscriptions.subscribe_request();
         let mut request_builder = request.get().init_req();
         request_builder.set_arena(arena.as_str());
-        if let Some(progress) = progress.remove(&arena) {
+        if let Some(progress) = cache.peer_progress(peer, arena).await? {
             let mut builder = request_builder.init_progress();
             builder.set_last_seen(progress.last_seen);
             convert::fill_uuid(builder.init_uuid(), &progress.uuid);
@@ -219,10 +173,11 @@ impl subscriptions::Server for Subscriptions {
             } else {
                 None
             };
-            storage
-                .subscribe(arena, tx, progress)
-                .await
-                .map_err(convert::storage_to_capnp_err)?;
+            match storage.subscribe(arena, tx, progress).await {
+                Ok(_) => {}
+                Err(StorageError::UnknownArena(_)) => {}
+                Err(err) => return Err(convert::storage_to_capnp_err(err)),
+            };
 
             Ok(())
         })

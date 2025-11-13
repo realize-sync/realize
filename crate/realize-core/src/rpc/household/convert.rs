@@ -2,7 +2,6 @@ use crate::rpc::store_capnp;
 use crate::rpc::store_capnp::notification;
 use realize_storage::{Notification, StorageError};
 use realize_types::{self, Arena, ByteRange, Hash, Path, UnixTime};
-use std::collections::HashSet;
 use uuid::Uuid;
 
 pub(crate) fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
@@ -11,16 +10,6 @@ pub(crate) fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
 
 pub(crate) fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
     Ok(Arena::from(reader.to_str()?))
-}
-
-pub(crate) fn parse_arena_set(
-    arenas: capnp::text_list::Reader<'_>,
-) -> Result<HashSet<Arena>, capnp::Error> {
-    let mut set = HashSet::new();
-    for arena in arenas.iter() {
-        set.insert(parse_arena(arena?)?);
-    }
-    Ok(set)
 }
 
 pub(crate) fn parse_uuid(reader: store_capnp::uuid::Reader<'_>) -> Uuid {

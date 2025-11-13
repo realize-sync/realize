@@ -109,6 +109,9 @@ struct SubscribeError {
 
 interface Subscriptions {
   subscribe @0 (req: SubscribeRequest) -> (res: SubscribeResponse);
+  # subscribe to notifications for the given arena. This is not an
+  # error if the arena isn't supported by the server; there will
+  # just not be any notifications sent.
 }
 struct SubscribeRequest {
   arena @0: Text;
