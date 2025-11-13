@@ -1,5 +1,7 @@
 #![allow(dead_code)] // work in progress
 
+use crate::StorageError;
+
 use super::db::ArenaDatabase;
 use super::index::{self};
 use super::types::HistoryTableEntry;
@@ -255,7 +257,7 @@ pub async fn subscribe(
     db: Arc<ArenaDatabase>,
     tx: mpsc::Sender<Notification>,
     progress: Option<Progress>,
-) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+) -> Result<JoinHandle<anyhow::Result<()>>, StorageError> {
     let mut last_seen = if let Some(progress) = progress
         && progress.uuid == *db.uuid()
     {
@@ -268,7 +270,8 @@ pub async fn subscribe(
         arena: db.arena(),
         uuid: *db.uuid(),
     })
-    .await?;
+    .await
+    .map_err(|_| StorageError::ChannelSendError)?;
 
     let mut watch_rx = db.history().watch();
     let current = *watch_rx.borrow_and_update();

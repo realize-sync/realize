@@ -9,10 +9,6 @@ pub(crate) fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
     capnp::Error::failed(err.to_string())
 }
 
-pub(crate) fn anyhow_to_capnp_err(err: anyhow::Error) -> capnp::Error {
-    capnp::Error::failed(err.to_string())
-}
-
 pub(crate) fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
     Ok(Arena::from(reader.to_str()?))
 }

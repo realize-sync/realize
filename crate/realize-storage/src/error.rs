@@ -96,6 +96,9 @@ pub enum StorageError {
 
     #[error("[0] {2}: {1:?}")]
     SanityCheckFailed(Arena, PathBuf, SanityCheck),
+
+    #[error("attempted to send message to a closed or invalid channel")]
+    ChannelSendError,
 }
 
 #[derive(Clone, Debug, Copy, Eq, PartialEq)]
@@ -168,6 +171,7 @@ impl StorageError {
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
             StorageError::PathIdSpaceExhausted => Other,
+            StorageError::ChannelSendError => Other,
             StorageError::SanityCheckFailed(_, _, _) => Other,
         }
     }

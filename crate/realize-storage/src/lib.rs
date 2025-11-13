@@ -136,7 +136,7 @@ impl Storage {
         arena: Arena,
         tx: mpsc::Sender<Notification>,
         progress: Option<Progress>,
-    ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+    ) -> Result<JoinHandle<anyhow::Result<()>>, StorageError> {
         arena::notifier::subscribe(self.arena_db(arena)?, tx, progress).await
     }
 

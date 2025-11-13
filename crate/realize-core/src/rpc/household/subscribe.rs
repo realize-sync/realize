@@ -222,7 +222,7 @@ impl subscriptions::Server for Subscriptions {
             storage
                 .subscribe(arena, tx, progress)
                 .await
-                .map_err(convert::anyhow_to_capnp_err)?;
+                .map_err(convert::storage_to_capnp_err)?;
 
             Ok(())
         })
