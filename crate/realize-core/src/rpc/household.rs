@@ -5,16 +5,15 @@ use super::store_capnp::store::{
     self, ArenasParams, ArenasResults, ReadParams, ReadResults, RsyncParams, RsyncResults,
     SubscribeParams, SubscribeResults, WithRateLimitParams, WithRateLimitResults,
 };
-use super::store_capnp::subscriber::{self, NotifyParams, NotifyResults};
-use super::store_capnp::{io_error, notification, read_callback};
+use super::store_capnp::{io_error, read_callback};
 use async_speed_limit::Limiter;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker};
 use realize_network::{Networking, Server};
-use realize_storage::{Notification, Progress, Storage, StorageError};
-use realize_types::{self, Arena, ByteRange, Delta, Hash, Path, Peer, Signature, UnixTime};
+use realize_storage::{Storage, StorageError};
+use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, SeekFrom};
@@ -26,7 +25,12 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::LocalSet;
 use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
+
+mod convert;
+mod rate_limit;
+mod subscribe;
+#[cfg(test)]
+mod testing;
 
 /// Identifies Cap'n Proto ConnectedPeer connections.
 const TAG: &[u8; 4] = b"PEER";
@@ -538,7 +542,7 @@ impl TrackedClientMap {
             let _ = self.connection_tx.send(PeerStatus::Connected(peer));
         }
 
-        if let Err(err) = subscribe_self(storage, peer, store_for_subscribe).await {
+        if let Err(err) = subscribe::subscribe_self(storage, peer, store_for_subscribe).await {
             log::warn!("@{peer} ConnectedPeer::subscribe failed: {err}");
         }
 
@@ -675,7 +679,7 @@ async fn execute_rsync(
     req.set_arena(arena.as_str());
     req.set_path(path.as_str());
     req.set_sig(sig.0.as_slice());
-    fill_byterange(req.init_range(), range);
+    convert::fill_byterange(req.init_range(), range);
     let reply = request.send().promise.await?;
     let delta = Delta(reply.get()?.get_res()?.get_delta()?.into());
     log::debug!(
@@ -766,83 +770,6 @@ fn channel_closed<T>(_: mpsc::error::SendError<T>) -> capnp::Error {
     capnp::Error::failed("channel closed".to_string())
 }
 
-/// Subscribe to notifications from the given client and use it to
-/// update the cache.
-async fn subscribe_self(
-    storage: &Arc<Storage>,
-    peer: Peer,
-    store: store::Client,
-) -> anyhow::Result<()> {
-    let cache = storage.cache();
-    let request = store.arenas_request();
-    let reply = request.send().promise.await?;
-    let arenas = reply.get()?.get_arenas()?;
-    let peer_arenas = parse_arena_set(arenas)?;
-    log::debug!(
-        "@{peer} Arenas: {}",
-        peer_arenas
-            .iter()
-            .map(|a| a.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    let goal_arenas = cache
-        .arenas()
-        .filter(|a| peer_arenas.contains(a))
-        .map(|a| a.clone())
-        .collect::<Vec<_>>();
-    if goal_arenas.is_empty() {
-        log::debug!(
-            "@{peer} No common arenas. peer: {:?} vs local: {:?}",
-            peer_arenas,
-            cache.arenas().collect::<Vec<_>>(),
-        );
-
-        return Ok(());
-    }
-    for arena in &goal_arenas {
-        log::debug!("[{arena}]@{peer} Tracking")
-    }
-    let mut progress = tokio::spawn({
-        let goal_arenas = goal_arenas.clone();
-        let cache = cache.clone();
-        async move {
-            let mut map = HashMap::new();
-            for arena in goal_arenas {
-                if let Some(progress) = cache.peer_progress(peer, arena).await? {
-                    map.insert(arena, progress);
-                }
-            }
-
-            Ok::<_, anyhow::Error>(map)
-        }
-    })
-    .await??;
-
-    let subscriber = SubscriberServer::new(peer, storage.clone()).into_client();
-    for arena in goal_arenas {
-        let mut request = store.subscribe_request();
-        let mut request_builder = request.get().init_req();
-        request_builder.set_arena(arena.as_str());
-        request_builder.set_subscriber(subscriber.clone());
-        if let Some(progress) = progress.remove(&arena) {
-            let mut builder = request_builder.init_progress();
-            builder.set_last_seen(progress.last_seen);
-            fill_uuid(builder.init_uuid(), &progress.uuid);
-        }
-
-        let reply = request.send().promise.await?;
-        let result = reply.get()?.get_result()?;
-
-        if let result_capnp::result::Err(err) = result.which()? {
-            return Err(anyhow::anyhow!(err?.get_message()?.to_string()?));
-        }
-    }
-
-    Ok(())
-}
-
 /// Implement capnp interface ConnectedPeer, defined in
 /// `capnp/peer.capnp`.
 #[derive(Clone)]
@@ -915,82 +842,12 @@ impl StoreServer {
         capnp_rpc::new_client(self)
     }
 
-    async fn do_subscribe(
-        &self,
-        params: SubscribeParams,
-        mut results: SubscribeResults,
-    ) -> Result<(), capnp::Error> {
-        let req = params.get()?.get_req()?;
-        let arena = parse_arena(req.get_arena()?)?;
-
-        let result = results.get().init_result();
-        let progress = if req.has_progress() {
-            let progress = req.get_progress()?;
-            Some(Progress::new(
-                parse_uuid(progress.get_uuid()?),
-                progress.get_last_seen(),
-            ))
-        } else {
-            None
-        };
-
-        let subscriber = req.get_subscriber()?;
-
-        let (tx, mut rx) = mpsc::channel(100);
-
-        if let Err(err) = tokio::spawn({
-            let storage = self.storage.clone();
-            async move {
-                storage.subscribe(arena, tx, progress).await?;
-
-                Ok::<(), anyhow::Error>(())
-            }
-        })
-        .await
-        {
-            result.init_err().set_message(err.to_string());
-            return Ok(());
-        }
-
-        let peer = self.peer;
-        let limiter = self.limiter.clone();
-        log::debug!("[{arena}]@{peer} Will report local changes to peer",);
-        tokio::task::spawn_local(async move {
-            let mut notifications = Vec::new();
-            loop {
-                let count = rx.recv_many(&mut notifications, 25).await;
-                if count == 0 {
-                    // Channel has been closed
-                    return;
-                }
-                log::trace!("[{arena}@{peer}] Notify: {notifications:?}");
-
-                let mut request = subscriber.notify_request();
-                let mut builder = request.get().init_notifications(notifications.len() as u32);
-                for (i, n) in std::mem::take(&mut notifications).into_iter().enumerate() {
-                    fill_notification(&n, builder.reborrow().get(i as u32));
-                }
-
-                apply_rate_limit(&limiter, request.get().total_size()).await;
-                if let Err(err) = request.send().promise.await
-                    && err.kind == capnp::ErrorKind::Disconnected
-                {
-                    return;
-                }
-            }
-        });
-
-        result.init_ok();
-
-        Ok(())
-    }
-
     async fn do_read(&self, params: ReadParams) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let req = params.get_req()?;
 
-        let arena = parse_arena(req.get_arena()?)?;
-        let path = parse_path(req.get_path()?)?;
+        let arena = convert::parse_arena(req.get_arena()?)?;
+        let path = convert::parse_path(req.get_path()?)?;
         let offset = req.get_start_offset();
         let limit = req.get_limit();
         let cb = params.get_cb()?;
@@ -1010,7 +867,7 @@ impl StoreServer {
                 }
             }
         }
-        apply_rate_limit(&self.limiter, req.total_size()).await;
+        rate_limit::apply(&self.limiter, req.total_size()).await;
         request.send().promise.await?;
 
         Ok(())
@@ -1049,9 +906,9 @@ impl StoreServer {
         let params = params.get()?;
         let req = params.get_req()?;
 
-        let arena = parse_arena(req.get_arena()?)?;
-        let path = parse_path(req.get_path()?)?;
-        let range = parse_range(req.get_range()?);
+        let arena = convert::parse_arena(req.get_arena()?)?;
+        let path = convert::parse_path(req.get_path()?)?;
+        let range = convert::parse_range(req.get_range()?);
         if range.bytecount() > 1024 * 1024 {
             return Err(capnp::Error::failed("range too large".to_string()));
         }
@@ -1064,7 +921,7 @@ impl StoreServer {
 
         results.get().init_res().set_delta(&delta.0);
 
-        apply_rate_limit(&self.limiter, results.get().total_size()).await;
+        rate_limit::apply(&self.limiter, results.get().total_size()).await;
         Ok(())
     }
     async fn send_chunks(
@@ -1086,7 +943,7 @@ impl StoreServer {
             req.set_offset(offset);
             offset += n as u64;
 
-            apply_rate_limit(&self.limiter, req.total_size()).await;
+            rate_limit::apply(&self.limiter, req.total_size()).await;
             if request.send().await.is_err() {
                 return Ok(false);
             }
@@ -1138,8 +995,12 @@ impl store::Server for StoreServer {
         params: SubscribeParams,
         results: SubscribeResults,
     ) -> Promise<(), capnp::Error> {
-        let this = self.clone();
-        Promise::from_future(async move { this.do_subscribe(params, results).await })
+        let peer = self.peer;
+        let storage = Arc::clone(&self.storage);
+        let limiter = self.limiter.clone();
+        Promise::from_future(async move {
+            subscribe::do_subscribe(peer, storage, limiter, params, results).await
+        })
     }
 
     fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
@@ -1153,396 +1014,6 @@ impl store::Server for StoreServer {
     }
 }
 
-/// Implement capnp interface Subscriber, defined in
-/// `capnp/peer.capnp`.
-#[derive(Clone)]
-struct SubscriberServer {
-    peer: Peer,
-    storage: Arc<Storage>,
-}
-
-impl SubscriberServer {
-    fn new(peer: Peer, storage: Arc<Storage>) -> Self {
-        Self { peer, storage }
-    }
-
-    fn into_client(self) -> subscriber::Client {
-        capnp_rpc::new_client(self)
-    }
-}
-
-impl subscriber::Server for SubscriberServer {
-    fn notify(
-        &mut self,
-        params: NotifyParams,
-        _: NotifyResults,
-    ) -> capnp::capability::Promise<(), capnp::Error> {
-        Promise::from_future(do_notify(Arc::clone(&self.storage), self.peer, params))
-    }
-}
-
-async fn do_notify(
-    storage: Arc<Storage>,
-    peer: Peer,
-    params: NotifyParams,
-) -> Result<(), capnp::Error> {
-    let mut notifications = vec![];
-    for n in params.get()?.get_notifications()?.iter() {
-        notifications.push(match n.which()? {
-            notification::Which::Add(add) => {
-                let add = add?;
-
-                Notification::Add {
-                    arena: parse_arena(add.get_arena()?)?,
-                    index: add.get_index(),
-                    path: parse_path(add.get_path()?)?,
-                    size: add.get_size(),
-                    mtime: parse_mtime(add.get_mtime()?),
-                    hash: parse_hash(add.get_hash()?)?,
-                }
-            }
-            notification::Which::Replace(replace) => {
-                let replace = replace?;
-
-                Notification::Replace {
-                    arena: parse_arena(replace.get_arena()?)?,
-                    index: replace.get_index(),
-                    path: parse_path(replace.get_path()?)?,
-                    mtime: parse_mtime(replace.get_mtime()?),
-                    size: replace.get_size(),
-                    hash: parse_hash(replace.get_hash()?)?,
-                    old_hash: parse_hash(replace.get_old_hash()?)?,
-                }
-            }
-            notification::Which::Remove(remove) => {
-                let remove = remove?;
-
-                Notification::Remove {
-                    arena: parse_arena(remove.get_arena()?)?,
-                    index: remove.get_index(),
-                    path: parse_path(remove.get_path()?)?,
-                    old_hash: parse_hash(remove.get_old_hash()?)?,
-                }
-            }
-            notification::Which::Drop(drop) => {
-                let drop = drop?;
-
-                Notification::Drop {
-                    arena: parse_arena(drop.get_arena()?)?,
-                    index: drop.get_index(),
-                    path: parse_path(drop.get_path()?)?,
-                    old_hash: parse_hash(drop.get_old_hash()?)?,
-                }
-            }
-            notification::Which::CatchupStart(start) => {
-                Notification::CatchupStart(parse_arena(start?.get_arena()?)?)
-            }
-            notification::Which::Catchup(catchup) => {
-                let catchup = catchup?;
-
-                Notification::Catchup {
-                    arena: parse_arena(catchup.get_arena()?)?,
-                    path: parse_path(catchup.get_path()?)?,
-                    size: catchup.get_size(),
-                    mtime: parse_mtime(catchup.get_mtime()?),
-                    hash: parse_hash(catchup.get_hash()?)?,
-                }
-            }
-            notification::Which::CatchupComplete(complete) => {
-                let complete = complete?;
-
-                Notification::CatchupComplete {
-                    arena: parse_arena(complete.get_arena()?)?,
-                    index: complete.get_index(),
-                }
-            }
-            notification::Which::Connected(connected) => {
-                let connected = connected?;
-
-                Notification::Connected {
-                    arena: parse_arena(connected.get_arena()?)?,
-                    uuid: parse_uuid(connected.get_uuid()?),
-                }
-            }
-            notification::Which::Branch(branch) => {
-                let branch = branch?;
-
-                Notification::Branch {
-                    index: branch.get_index(),
-                    arena: parse_arena(branch.get_arena()?)?,
-                    source: parse_path(branch.get_source()?)?,
-                    dest: parse_path(branch.get_dest()?)?,
-                    hash: parse_hash(branch.get_hash()?)?,
-                }
-            }
-            notification::Which::Rename(rename) => {
-                let rename = rename?;
-
-                Notification::Rename {
-                    index: rename.get_index(),
-                    arena: parse_arena(rename.get_arena()?)?,
-                    source: parse_path(rename.get_source()?)?,
-                    dest: parse_path(rename.get_dest()?)?,
-                    hash: parse_hash(rename.get_hash()?)?,
-                }
-            }
-        });
-    }
-
-    tokio::spawn(async move {
-        for notification in notifications {
-            storage.update(peer, notification).await?;
-        }
-
-        Ok::<(), StorageError>(())
-    })
-    .await
-    .map_err(|e| capnp::Error::failed(e.to_string()))?
-    .map_err(|e| capnp::Error::failed(e.to_string()))?;
-
-    Ok(())
-}
-
-fn fill_uuid(mut builder: super::store_capnp::uuid::Builder<'_>, uuid: &Uuid) {
-    let (hi, lo) = uuid.as_u64_pair();
-    builder.set_hi(hi);
-    builder.set_lo(lo);
-}
-
-fn fill_byterange(mut builder: super::store_capnp::byte_range::Builder<'_>, range: &ByteRange) {
-    builder.set_start(range.start);
-    builder.set_end(range.end);
-}
-
-fn fill_add(
-    mut builder: super::store_capnp::add::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    path: &realize_types::Path,
-    size: u64,
-    mtime: &realize_types::UnixTime,
-    hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_path(path.as_str());
-    builder.set_size(size);
-    builder.set_hash(&hash.0);
-    fill_time(builder.init_mtime(), mtime);
-}
-
-fn fill_replace(
-    mut builder: super::store_capnp::replace::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    path: &realize_types::Path,
-    size: u64,
-    mtime: &realize_types::UnixTime,
-    hash: &realize_types::Hash,
-    old_hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_path(path.as_str());
-    builder.set_size(size);
-    builder.set_hash(&hash.0);
-    builder.set_old_hash(&old_hash.0);
-    fill_time(builder.init_mtime(), mtime);
-}
-
-fn fill_remove(
-    mut builder: super::store_capnp::remove::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    path: &realize_types::Path,
-    old_hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_path(path.as_str());
-    builder.set_old_hash(&old_hash.0);
-}
-
-fn fill_drop(
-    mut builder: super::store_capnp::drop::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    path: &realize_types::Path,
-    old_hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_path(path.as_str());
-    builder.set_old_hash(&old_hash.0);
-}
-
-fn fill_catchup(
-    mut builder: super::store_capnp::catchup::Builder<'_>,
-    arena: Arena,
-    path: &realize_types::Path,
-    size: u64,
-    mtime: &realize_types::UnixTime,
-    hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_path(path.as_str());
-    builder.set_size(size);
-    builder.set_hash(&hash.0);
-    fill_time(builder.init_mtime(), mtime);
-}
-
-fn fill_branch(
-    mut builder: super::store_capnp::branch::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    source: &realize_types::Path,
-    dest: &realize_types::Path,
-    hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_source(source.as_str());
-    builder.set_dest(dest.as_str());
-    builder.set_hash(&hash.0);
-}
-
-fn fill_rename(
-    mut builder: super::store_capnp::rename::Builder<'_>,
-    arena: Arena,
-    index: u64,
-    source: &realize_types::Path,
-    dest: &realize_types::Path,
-    hash: &realize_types::Hash,
-) {
-    builder.set_arena(arena.as_str());
-    builder.set_index(index);
-    builder.set_source(source.as_str());
-    builder.set_dest(dest.as_str());
-    builder.set_hash(&hash.0);
-}
-
-fn fill_time(
-    mut mtime_builder: super::store_capnp::time::Builder<'_>,
-    mtime: &realize_types::UnixTime,
-) {
-    mtime_builder.set_secs(mtime.as_secs());
-    mtime_builder.set_nsecs(mtime.subsec_nanos());
-}
-
-fn fill_notification(notif: &Notification, notif_builder: notification::Builder<'_>) {
-    match notif {
-        Notification::Add {
-            arena,
-            index,
-            path,
-            size,
-            mtime,
-            hash,
-        } => fill_add(
-            notif_builder.init_add(),
-            *arena,
-            *index,
-            path,
-            *size,
-            mtime,
-            hash,
-        ),
-
-        Notification::Replace {
-            arena,
-            index,
-            path,
-            size,
-            mtime,
-            hash,
-            old_hash,
-        } => fill_replace(
-            notif_builder.init_replace(),
-            *arena,
-            *index,
-            path,
-            *size,
-            mtime,
-            hash,
-            old_hash,
-        ),
-
-        Notification::Remove {
-            arena,
-            index,
-            path,
-            old_hash,
-        } => fill_remove(notif_builder.init_remove(), *arena, *index, path, old_hash),
-
-        Notification::Drop {
-            arena,
-            index,
-            path,
-            old_hash,
-        } => fill_drop(notif_builder.init_drop(), *arena, *index, path, old_hash),
-
-        Notification::Catchup {
-            arena,
-            path,
-            size,
-            mtime,
-            hash,
-        } => fill_catchup(
-            notif_builder.init_catchup(),
-            *arena,
-            path,
-            *size,
-            mtime,
-            hash,
-        ),
-
-        Notification::CatchupStart(arena) => {
-            notif_builder.init_catchup_start().set_arena(arena.as_str())
-        }
-
-        Notification::CatchupComplete { arena, index } => {
-            let mut builder = notif_builder.init_catchup_complete();
-            builder.set_arena(arena.as_str());
-            builder.set_index(*index);
-        }
-
-        Notification::Connected { arena, uuid } => {
-            let mut builder = notif_builder.init_connected();
-            builder.set_arena(arena.as_str());
-            fill_uuid(builder.init_uuid(), &uuid);
-        }
-
-        Notification::Branch {
-            arena,
-            source,
-            dest,
-            hash,
-            index,
-        } => fill_branch(
-            notif_builder.init_branch(),
-            *arena,
-            *index,
-            source,
-            dest,
-            hash,
-        ),
-        Notification::Rename {
-            arena,
-            source,
-            dest,
-            hash,
-            index,
-        } => fill_rename(
-            notif_builder.init_rename(),
-            *arena,
-            *index,
-            source,
-            dest,
-            hash,
-        ),
-    }
-}
-
 async fn get_connected_peer_store(
     client: &mut connected_peer::Client,
 ) -> anyhow::Result<store::Client> {
@@ -1553,69 +1024,19 @@ async fn get_connected_peer_store(
     Ok(store)
 }
 
-fn parse_arena(reader: capnp::text::Reader<'_>) -> Result<Arena, capnp::Error> {
-    Ok(Arena::from(reader.to_str()?))
-}
-
-fn parse_arena_set(arenas: capnp::text_list::Reader<'_>) -> Result<HashSet<Arena>, capnp::Error> {
-    let mut set = HashSet::new();
-    for arena in arenas.iter() {
-        set.insert(parse_arena(arena?)?);
-    }
-    Ok(set)
-}
-
-fn parse_uuid(reader: super::store_capnp::uuid::Reader<'_>) -> Uuid {
-    Uuid::from_u64_pair(reader.get_hi(), reader.get_lo())
-}
-
-fn parse_range(reader: super::store_capnp::byte_range::Reader<'_>) -> ByteRange {
-    ByteRange::new(reader.get_start(), reader.get_end())
-}
-
-fn parse_mtime(reader: super::store_capnp::time::Reader<'_>) -> UnixTime {
-    UnixTime::new(reader.get_secs(), reader.get_nsecs())
-}
-
-fn parse_path(reader: capnp::text::Reader<'_>) -> Result<Path, capnp::Error> {
-    Path::parse(reader.to_str()?).map_err(|e| capnp::Error::failed(e.to_string()))
-}
-
-fn parse_hash(hash: &[u8]) -> Result<Hash, capnp::Error> {
-    let hash: [u8; 32] = hash
-        .try_into()
-        .map_err(|_| capnp::Error::failed("invalid hash".to_string()))?;
-
-    Ok(Hash(hash))
-}
-
 fn storage_to_capnp_err(err: StorageError) -> capnp::Error {
     capnp::Error::failed(err.to_string())
 }
 
-/// Wait as long as needed until the rate limit allows sending a
-/// message of the given size.
-async fn apply_rate_limit(limiter: &Option<Limiter>, size: capnp::Result<::capnp::MessageSize>) {
-    if let (Ok(size), Some(limiter)) = (size, limiter) {
-        limiter.consume(size_to_bytes(size)).await;
-    }
-}
-
-/// Convert a [MessageSize] to a byte count
-fn size_to_bytes(size: capnp::MessageSize) -> usize {
-    (size.word_count as usize + size.cap_count as usize) * 8
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::rpc::testing::{self, HouseholdFixture};
+    use crate::rpc;
+    use crate::rpc::testing::HouseholdFixture;
     use fast_rsync::SignatureOptions;
     use futures::TryStreamExt as _;
-    use realize_network::testing::TestingPeers;
     use realize_storage::{Mark, utils::hash};
+    use std::time::Duration;
     use tokio::fs;
 
     async fn test_read_all(
@@ -1637,6 +1058,7 @@ mod tests {
 
         Ok(())
     }
+
     #[tokio::test]
     async fn household_subscribes() -> anyhow::Result<()> {
         let mut fixture = HouseholdFixture::setup().await?;
@@ -1924,217 +1346,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_rate_limit() -> anyhow::Result<()> {
-        // This test uses a minimal fake server to test that the
-        // client-side of Household makes the correct calls to setup a
-        // rate-limited store and use it for the subscriber as well as
-        // when execution mode is batch.
-
-        let mut fixture = HouseholdFixture::setup().await?;
-        let a = TestingPeers::a();
-        let b = TestingPeers::b();
-        let arena = HouseholdFixture::test_arena();
-        let path = Path::parse("test.txt")?;
-        fixture.peers.set_batch_rate_limit(b, 1024);
-
-        let (tx, rx) = mpsc::channel(128);
-        let (connection_tx, _) = broadcast::channel(128);
-        let handler = PeerConnectionHandler::new(
-            Arc::clone(fixture.storage(a)?),
-            &fixture.peers.networking(a)?,
-            rx,
-            connection_tx,
-        );
-
-        let local = LocalSet::new();
-        local
-            .run_until(async move {
-                let calls = Rc::new(RefCell::new(vec![]));
-                let tracker = handler.create_tracker().await;
-                tracker
-                    .register(b, capnp_rpc::new_client(FakeConnectedPeer(calls.clone())))
-                    .await?;
-
-                assert_eq!(
-                    vec![
-                        "ConnectedPeer.store()".to_string(),
-                        "Store.with_rate_limit(1024)".to_string(),
-                        "Store.subscribe() rate_limit=Some(1024.0)".to_string(),
-                    ],
-                    calls.borrow().clone()
-                );
-                calls.borrow_mut().clear();
-
-                let (read_tx, mut read_rx) = mpsc::channel(10);
-                tx.send(HouseholdOperation::Read {
-                    peers: vec![b],
-                    mode: ExecutionMode::Batch,
-                    arena,
-                    path: path.clone(),
-                    offset: 0,
-                    limit: None,
-                    tx: read_tx.clone(),
-                })
-                .await?;
-                assert!(
-                    tokio::time::timeout(Duration::from_secs(3), read_rx.recv())
-                        .await?
-                        .is_some()
-                );
-                assert_eq!(
-                    vec!["Store.read() rate_limit=Some(1024.0)".to_string(),],
-                    calls.borrow().clone()
-                );
-                calls.borrow_mut().clear();
-
-                tx.send(HouseholdOperation::Read {
-                    peers: vec![b],
-                    mode: ExecutionMode::Interactive,
-                    arena,
-                    path: path.clone(),
-                    offset: 0,
-                    limit: None,
-                    tx: read_tx.clone(),
-                })
-                .await?;
-                assert!(
-                    tokio::time::timeout(Duration::from_secs(3), read_rx.recv())
-                        .await?
-                        .is_some()
-                );
-                assert_eq!(
-                    vec!["Store.read() rate_limit=None".to_string(),],
-                    calls.borrow().clone()
-                );
-                calls.borrow_mut().clear();
-
-                let (rsync_tx, rsync_rx) = oneshot::channel();
-                tx.send(HouseholdOperation::Rsync {
-                    peers: vec![b],
-                    mode: ExecutionMode::Batch,
-                    tx: rsync_tx,
-                    arena,
-                    path: path.clone(),
-                    range: ByteRange::new(0, 100),
-                    sig: Signature(vec![]),
-                })
-                .await?;
-                rsync_rx.await??;
-                assert_eq!(
-                    vec!["Store.rsync() rate_limit=Some(1024.0)".to_string(),],
-                    calls.borrow().clone()
-                );
-                calls.borrow_mut().clear();
-
-                let (rsync_tx, rsync_rx) = oneshot::channel();
-                tx.send(HouseholdOperation::Rsync {
-                    peers: vec![b],
-                    mode: ExecutionMode::Interactive,
-                    tx: rsync_tx,
-                    arena,
-                    path: path.clone(),
-                    range: ByteRange::new(0, 100),
-                    sig: Signature(vec![]),
-                })
-                .await?;
-                rsync_rx.await??;
-                assert_eq!(
-                    vec!["Store.rsync() rate_limit=None".to_string(),],
-                    calls.borrow().clone()
-                );
-                calls.borrow_mut().clear();
-
-                Ok::<(), anyhow::Error>(())
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    struct FakeConnectedPeer(Rc<RefCell<Vec<String>>>);
-    impl connected_peer::Server for FakeConnectedPeer {
-        fn store(
-            &mut self,
-            _: connected_peer::StoreParams,
-            mut results: connected_peer::StoreResults,
-        ) -> Promise<(), capnp::Error> {
-            self.0
-                .borrow_mut()
-                .push("ConnectedPeer.store()".to_string());
-            results
-                .get()
-                .set_store(capnp_rpc::new_client(FakeStore(self.0.clone(), None)));
-
-            Promise::ok(())
-        }
-    }
-
-    struct FakeStore(Rc<RefCell<Vec<String>>>, Option<f64>);
-    impl store::Server for FakeStore {
-        fn with_rate_limit(
-            &mut self,
-            params: WithRateLimitParams,
-            mut results: WithRateLimitResults,
-        ) -> Promise<(), capnp::Error> {
-            let rate_limit = pry!(params.get()).get_rate_limit();
-            self.0
-                .borrow_mut()
-                .push(format!("Store.with_rate_limit({rate_limit})"));
-
-            results.get().set_store(capnp_rpc::new_client(FakeStore(
-                self.0.clone(),
-                Some(rate_limit),
-            )));
-
-            Promise::ok(())
-        }
-
-        fn arenas(
-            &mut self,
-            _: ArenasParams,
-            mut results: ArenasResults,
-        ) -> Promise<(), capnp::Error> {
-            let mut list = results.get().init_arenas(1);
-            list.set(0, HouseholdFixture::test_arena().as_str());
-
-            Promise::ok(())
-        }
-
-        fn subscribe(
-            &mut self,
-            _: SubscribeParams,
-            _: SubscribeResults,
-        ) -> Promise<(), capnp::Error> {
-            self.0
-                .borrow_mut()
-                .push(format!("Store.subscribe() rate_limit={:?}", self.1));
-
-            Promise::ok(())
-        }
-
-        fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
-            self.0
-                .borrow_mut()
-                .push(format!("Store.read() rate_limit={:?}", self.1));
-
-            // send one chunk so the other side knows read has started.
-            let cb = pry!(pry!(params.get()).get_cb());
-            let request = cb.chunk_request();
-            tokio::task::spawn_local(request.send());
-
-            Promise::ok(())
-        }
-
-        fn rsync(&mut self, _: RsyncParams, _: RsyncResults) -> Promise<(), capnp::Error> {
-            self.0
-                .borrow_mut()
-                .push(format!("Store.rsync() rate_limit={:?}", self.1));
-
-            Promise::ok(())
-        }
-    }
-
-    #[tokio::test]
     async fn household_peers() -> anyhow::Result<()> {
         let mut fixture = HouseholdFixture::setup().await?;
         fixture
@@ -2210,7 +1421,7 @@ mod tests {
                 let mut peer_status_b = household_b.peer_status();
 
                 // Only one side is connected, from A to B.
-                testing::connect(&household_a, b).await?;
+                rpc::testing::connect(&household_a, b).await?;
 
                 // Both sides end up being able to talk to each other
                 // thanks to reverse connections.
