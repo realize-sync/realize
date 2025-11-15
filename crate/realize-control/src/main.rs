@@ -7,6 +7,7 @@ use realize_core::utils::logging;
 use std::path::PathBuf;
 use tokio::task::LocalSet;
 
+mod arena_cmd;
 mod churten_cmd;
 mod display;
 mod mark_cmd;
@@ -46,6 +47,10 @@ enum Commands {
     Peer {
         #[command(subcommand)]
         command: PeerCommands,
+    },
+    Arena {
+        #[command(subcommand)]
+        command: ArenaCommands,
     },
 }
 
@@ -99,6 +104,16 @@ enum PeerCommands {
         /// The peer to disconnect from
         peer: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum ArenaCommands {
+    /// Create a local arena that stores its local files and local
+    /// database in PATH.
+    ///
+    /// If an arena with the same name exists on other peers, syncing
+    /// between peers starts automatically.
+    Create { name: String, path: PathBuf },
 }
 
 /// Get the default socket path by checking for the first existing socket
@@ -196,6 +211,11 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                     }
                     PeerCommands::Disconnect { peer } => {
                         peer_cmd::execute_peer_disconnect(&control, &peer, cli.output).await
+                    }
+                },
+                Commands::Arena { command } => match command {
+                    ArenaCommands::Create { name, path } => {
+                        arena_cmd::execute_arena_create(&control, cli.output, &name, &path).await
                     }
                 },
             }

@@ -24,7 +24,7 @@ fn command_path(cmd: &str) -> PathBuf {
 }
 
 struct Fixture {
-    _tempdir: TempDir,
+    tempdir: TempDir,
     socket: PathBuf,
     arena: Arena,
     setup: SetupHelper,
@@ -72,7 +72,7 @@ impl Fixture {
 
         Ok(Self {
             arena,
-            _tempdir: tempdir,
+            tempdir,
             socket,
             setup,
         })
@@ -490,6 +490,37 @@ async fn peer_disconnect() -> anyhow::Result<()> {
                 output_str.contains("Disconnected from peer: a"),
                 "Expected success message, got '{}'",
                 output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arena_create() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            let dir = fixture.tempdir.child("other");
+            dir.create_dir_all()?;
+            let mut control_cmd =
+                fixture.control_command(&["arena", "create", "other", dir.to_str().unwrap()])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+
+            assert!(
+                fixture
+                    .setup
+                    .storage
+                    .arenas()
+                    .contains(&Arena::from("other"))
             );
 
             Ok::<_, anyhow::Error>(())
