@@ -53,7 +53,6 @@ impl Storage {
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
         let cache = Filesystem::with_db(globaldb).await?;
-        let (arena_set_watch_tx, arena_set_watch_rx) = watch::channel(BTreeSet::new());
 
         for NamedArenaConfig {
             arena,
@@ -78,6 +77,9 @@ impl Storage {
                     .with_context(|| format!("in arena {arena}"))?,
             );
         }
+
+        let (arena_set_watch_tx, arena_set_watch_rx) =
+            watch::channel(config.arenas.iter().map(|c| c.arena).collect());
 
         Ok(Arc::new(Self {
             cache,

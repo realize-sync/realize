@@ -25,6 +25,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::LocalSet;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 mod convert;
 mod rate_limit;
@@ -485,6 +486,21 @@ struct TrackedClientMap {
 struct TrackedClients {
     store: store::Client,
     batch_store: Option<store::Client>,
+    token: CancellationToken,
+    _drop_guard: DropGuard,
+}
+
+impl TrackedClients {
+    fn new(store: store::Client, batch_store: Option<store::Client>) -> Self {
+        let token = CancellationToken::new();
+        let drop_guard = token.clone().drop_guard();
+        Self {
+            store,
+            batch_store,
+            token,
+            _drop_guard: drop_guard,
+        }
+    }
 }
 
 impl TrackedClientMap {
@@ -534,15 +550,16 @@ impl TrackedClientMap {
 
         let store_for_subscribe = batch_store.as_ref().unwrap_or(&store).clone();
         let was_connected = self.is_connected(peer);
-        self.stores(side)
-            .borrow_mut()
-            .insert(peer, TrackedClients { store, batch_store });
+        let tracked = TrackedClients::new(store, batch_store);
+        let token = tracked.token.clone();
+        self.stores(side).borrow_mut().insert(peer, tracked);
         if !was_connected {
             log::info!("@{peer} Peer has become available");
             let _ = self.connection_tx.send(PeerStatus::Connected(peer));
         }
 
-        if let Err(err) = subscribe::subscribe_self(storage, peer, store_for_subscribe).await {
+        if let Err(err) = subscribe::subscribe_self(storage, peer, store_for_subscribe, token).await
+        {
             log::warn!("@{peer} ConnectedPeer::subscribe failed: {err}");
         }
 

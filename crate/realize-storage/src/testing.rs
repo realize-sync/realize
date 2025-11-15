@@ -57,5 +57,5 @@ where
     P: AsRef<std::path::Path>,
 {
     let root = root.as_ref();
-    root.join(arena.as_str()).join("data")
+    root.join(arena.as_str())
 }
