@@ -36,7 +36,6 @@ where
     P: AsRef<std::path::Path>,
 {
     StorageConfig {
-        arenas: vec![],
         cache: CacheConfig {
             db: dir.as_ref().join("cache.db"),
         },

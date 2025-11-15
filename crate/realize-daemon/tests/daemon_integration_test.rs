@@ -316,9 +316,7 @@ async fn daemon_interrupted() -> anyhow::Result<()> {
 async fn daemon_updates_cache() -> anyhow::Result<()> {
     use std::time::Duration;
 
-    let mut fixture_a = Fixture::setup().await?;
-    fixture_a.config.storage.arenas.clear();
-
+    let fixture_a = Fixture::setup().await?;
     let mut daemon_a = fixture_a
         .command()?
         .stderr(Stdio::piped())
@@ -337,7 +335,6 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
         .await?;
 
     let mut fixture_b = Fixture::setup().await?;
-    fixture_b.config.storage.arenas.clear();
     fixture_b.server_privkey = fixture_b.resources.join("b.key");
     fixture_b
         .config
@@ -422,9 +419,7 @@ async fn daemon_binds_socket() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn daemon_creates_arena() -> anyhow::Result<()> {
-    let mut fixture = Fixture::setup().await?;
-    fixture.config.storage.arenas.clear();
-
+    let fixture = Fixture::setup().await?;
     let daemon = fixture.command()?.spawn()?;
     let pid = daemon.id();
     scopeguard::defer! { let _ = kill(pid); }
@@ -438,9 +433,7 @@ async fn daemon_creates_arena() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn daemon_exports_fuse() -> anyhow::Result<()> {
-    let mut fixture = Fixture::setup().await?;
-    fixture.config.storage.arenas.clear();
-
+    let fixture = Fixture::setup().await?;
     // Create a mount point for FUSE
     let mount_point = fixture.tempdir.child("fuse-mount");
     mount_point.create_dir_all()?;

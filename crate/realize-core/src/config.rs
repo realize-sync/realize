@@ -21,7 +21,6 @@ impl Config {
         Self {
             network: NetworkConfig::new(),
             storage: StorageConfig {
-                arenas: Vec::new(),
                 watcher: realize_storage::config::WatcherConfig::default(),
                 cache: realize_storage::config::CacheConfig {
                     db: PathBuf::from("cache.db"), // Default for backward compatibility
@@ -35,7 +34,7 @@ impl Config {
 mod tests {
     use super::*;
     use realize_storage::config::HumanDuration;
-    use realize_types::{Arena, Peer};
+    use realize_types::Peer;
 
     #[test]
     fn parse_config() {
@@ -48,10 +47,6 @@ mod tests {
 
             [cache]
             db = "/path/to/cache.db"
-
-            [[arena]]
-            name = "arena1"
-            datadir = "/path/to/arena1"
 
             [watcher]
             max_parallel_hashers = 4
@@ -73,14 +68,6 @@ mod tests {
                     ],
                 },
                 storage: realize_storage::config::StorageConfig {
-                    arenas: vec![
-                        realize_storage::config::NamedArenaConfig {
-                            arena: Arena::from("arena1"),
-                            config: realize_storage::config::ArenaConfig {
-                              datadir: PathBuf::from("/path/to/arena1"),
-                            }
-                        },
-                    ],
                     cache: realize_storage::config::CacheConfig {
                         db: PathBuf::from("/path/to/cache.db"),
                     },
@@ -105,7 +92,6 @@ mod tests {
             Config {
                 network: realize_network::config::NetworkConfig { peers: vec![] },
                 storage: realize_storage::config::StorageConfig {
-                    arenas: vec![],
                     cache: realize_storage::config::CacheConfig {
                         db: PathBuf::from("/path/to/cache.db"),
                     },

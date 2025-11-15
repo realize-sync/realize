@@ -4,7 +4,7 @@ use realize_core::config::Config;
 use realize_core::setup::SetupHelper;
 use realize_storage::Mark;
 use realize_storage::Notification;
-use realize_storage::config::{CacheConfig, NamedArenaConfig};
+use realize_storage::config::CacheConfig;
 use realize_types::{Arena, Hash, Path, Peer, UnixTime};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -47,12 +47,6 @@ impl Fixture {
             db: tempdir.child("cache.db").to_path_buf(),
         };
 
-        // Configure arena with required cache and optional local path
-        config
-            .storage
-            .arenas
-            .push(NamedArenaConfig::new(arena, myarena.to_path_buf()));
-
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
 
@@ -73,6 +67,8 @@ impl Fixture {
         setup
             .bind_control_socket(local, Some(&socket), 0o077)
             .await?;
+
+        setup.storage.create_arena(arena, myarena.path()).await?;
 
         Ok(Self {
             arena,

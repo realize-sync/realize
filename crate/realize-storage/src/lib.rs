@@ -1,3 +1,5 @@
+use crate::arena::db::ArenaDatabase;
+use crate::config::WatcherConfig;
 use anyhow::Context;
 use arena::engine::Engine;
 use arena::{ArenaStorage, indexed_store};
@@ -33,9 +35,6 @@ pub use error::{SanityCheck, StorageError};
 pub use global::fs::{FileContent, Filesystem, FsLoc};
 pub use types::{Inode, JobId};
 
-use crate::arena::db::ArenaDatabase;
-use crate::config::{NamedArenaConfig, WatcherConfig};
-
 /// Local storage, including the real store and an unreal cache.
 pub struct Storage {
     cache: Arc<Filesystem>,
@@ -53,33 +52,22 @@ impl Storage {
             .await
             .with_context(|| format!("global database {:?}", config.cache.db))?;
         let cache = Filesystem::with_db(globaldb).await?;
-
-        for NamedArenaConfig {
-            arena,
-            config: arena_config,
-        } in &config.arenas
-        {
-            let arena = *arena;
-            let arena_db = if let Some(db) = cache.arena_db(arena) {
-                db
-            } else {
-                cache.add_arena(arena, &arena_config.datadir).await?
-            };
-            log::debug!(
-                "[{}] Arena setup with datadir {:?}",
-                arena_db.tag(),
-                arena_db.cache().datadir()
-            );
-            arena_storage.insert(
-                arena,
-                ArenaStorage::with_db(arena_db, &config.watcher)
-                    .await
-                    .with_context(|| format!("in arena {arena}"))?,
-            );
+        let (arena_set_watch_tx, arena_set_watch_rx) = watch::channel(cache.arenas().collect());
+        for arena in cache.arenas() {
+            if let Some(db) = cache.arena_db(arena) {
+                log::debug!(
+                    "[{}] Arena setup with datadir {:?}",
+                    db.tag(),
+                    db.cache().datadir()
+                );
+                arena_storage.insert(
+                    arena,
+                    ArenaStorage::with_db(db, &config.watcher)
+                        .await
+                        .with_context(|| format!("in arena {arena}"))?,
+                );
+            }
         }
-
-        let (arena_set_watch_tx, arena_set_watch_rx) =
-            watch::channel(config.arenas.iter().map(|c| c.arena).collect());
 
         Ok(Arc::new(Self {
             cache,

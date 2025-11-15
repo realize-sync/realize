@@ -1,4 +1,3 @@
-use realize_types::Arena;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -6,8 +5,6 @@ use std::time::Duration;
 #[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StorageConfig {
-    #[serde(rename = "arena", default)]
-    pub arenas: Vec<NamedArenaConfig>,
     pub cache: CacheConfig,
     #[serde(default)]
     pub watcher: WatcherConfig,
@@ -19,28 +16,11 @@ impl StorageConfig {
         P: AsRef<std::path::Path>,
     {
         StorageConfig {
-            arenas: Vec::new(),
             watcher: WatcherConfig::default(),
             cache: CacheConfig {
                 db: cache_db.as_ref().to_path_buf(),
             },
         }
-    }
-
-    /// Get arena config by name
-    pub fn arena_config(&self, arena: Arena) -> Option<&ArenaConfig> {
-        self.arenas
-            .iter()
-            .find(|c| c.arena == arena)
-            .map(|c| &c.config)
-    }
-
-    /// Get arena config by name (mutable)
-    pub fn arena_config_mut(&mut self, arena: Arena) -> Option<&mut ArenaConfig> {
-        self.arenas
-            .iter_mut()
-            .find(|c| c.arena == arena)
-            .map(|c| &mut c.config)
     }
 }
 
@@ -75,39 +55,6 @@ pub struct WatcherConfig {
     /// Set debounce delay for hashing files. This allows some time for
     /// operations in progress to finish.
     pub debounce: Option<HumanDuration>,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct NamedArenaConfig {
-    /// The name of this arena
-    #[serde(rename = "name")]
-    pub arena: Arena,
-
-    #[serde(flatten)]
-    pub config: ArenaConfig,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Debug, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ArenaConfig {
-    /// Optional local path to the directory where files for that arena are stored.
-    /// If specified, an indexer will be created for this arena.
-    pub datadir: PathBuf,
-}
-
-impl NamedArenaConfig {
-    pub fn new<P>(arena: Arena, root: P) -> Self
-    where
-        P: AsRef<std::path::Path>,
-    {
-        Self {
-            arena,
-            config: ArenaConfig {
-                datadir: root.as_ref().to_path_buf(),
-            },
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -332,14 +279,6 @@ mod tests {
             [watcher]
             max_parallel_hashers = 4
             debounce = "500ms"
-
-            [[arena]]
-            name = "arena1"
-            datadir = "/path/to/arena1"
-
-            [[arena]]
-            name = "arena2"
-            datadir = "/path/to/arena2"
         "#;
 
         let config: StorageConfig = toml::from_str(toml_str).unwrap();
@@ -351,20 +290,6 @@ mod tests {
                 max_parallel_hashers: Some(4),
                 debounce: Some(HumanDuration::from_millis(500)),
             },
-            arenas: vec![
-                NamedArenaConfig {
-                    arena: Arena::from("arena1"),
-                    config: ArenaConfig {
-                        datadir: PathBuf::from("/path/to/arena1"),
-                    },
-                },
-                NamedArenaConfig {
-                    arena: Arena::from("arena2"),
-                    config: ArenaConfig {
-                        datadir: PathBuf::from("/path/to/arena2"),
-                    },
-                },
-            ],
         };
 
         assert_eq!(config, expected_config);
