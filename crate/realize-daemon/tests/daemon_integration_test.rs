@@ -5,14 +5,12 @@ use realize_core::rpc::result_capnp;
 use realize_network::config::PeerConfig;
 use realize_network::unixsocket;
 use realize_storage::config::CacheConfig;
-use realize_storage::config::NamedArenaConfig;
 use realize_types;
 use realize_types::{Arena, Peer};
 use std::env;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -41,7 +39,7 @@ fn command_path() -> PathBuf {
 struct Fixture {
     pub config: Config,
     pub resources: PathBuf,
-    pub testdir: PathBuf,
+    pub myarena: PathBuf,
     pub tempdir: TempDir,
     pub server_address: String,
     pub server_privkey: PathBuf,
@@ -62,24 +60,16 @@ impl Fixture {
             eprintln!("TEST_DEBUG detected");
         }
         let mut config = Config::new();
-        let arena = Arena::from("testdir");
 
         // Setup temp directory for the daemon to serve
         let tempdir = TempDir::new()?;
 
-        let testdir = tempdir.child("testdir");
-        testdir.create_dir_all()?;
+        let myarena = tempdir.child("myarena");
+        myarena.create_dir_all()?;
 
-        // Configure cache (now required)
         config.storage.cache = CacheConfig {
             db: tempdir.child("cache.db").to_path_buf(),
         };
-
-        // Configure arena with required cache and optional local path
-        config
-            .storage
-            .arenas
-            .push(NamedArenaConfig::new(arena, testdir.to_path_buf()));
 
         let resources = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("../../resources/test");
@@ -104,7 +94,7 @@ impl Fixture {
         Ok(Self {
             config,
             resources,
-            testdir: testdir.to_path_buf(),
+            myarena: myarena.to_path_buf(),
             tempdir,
             server_address,
             server_privkey,
@@ -262,65 +252,6 @@ fn kill(pid: Option<u32>) -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn daemon_fails_on_missing_directory() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-    fs::remove_dir_all(&fixture.testdir)?;
-
-    let output = fixture.command()?.output().await?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
-    assert!(
-        stderr.contains("Directory not found"),
-        "stderr<<EOF\n{stderr}\nEOF"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn daemon_fails_on_unreadable_directory() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-    std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o000))?;
-
-    let output = fixture.command()?.output().await?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "stderr<<EOF\n{stderr}\nEOF");
-    assert!(
-        stderr.contains("Not a readable directory"),
-        "stderr<<EOF\n{stderr}\nEOF"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn daemon_warns_on_unwritable_directory() -> anyhow::Result<()> {
-    let fixture = Fixture::setup().await?;
-    // Create the blob directory now, because after the permissions are set, it won't be possible.
-    std::fs::create_dir_all(&fixture.testdir.join(".realize/blobs"))?;
-    std::fs::set_permissions(&fixture.testdir, std::fs::Permissions::from_mode(0o500))?; // read+exec only
-
-    let mut daemon = fixture.command()?.stderr(Stdio::piped()).spawn()?;
-    let pid = daemon.id();
-    scopeguard::defer! { let _ = kill(pid); }
-
-    let stderr = fixture.collect_stderr("daemon", &mut daemon);
-    fixture.assert_listening().await;
-
-    // Kill to make sure stderr ends
-    daemon.start_kill()?;
-
-    let stderr = stderr.await??;
-    assert!(
-        stderr.contains("Directory is not writable"),
-        "stderr<<EOF\n{stderr}\nEOF"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn daemon_systemd_log_output_format() -> anyhow::Result<()> {
     let fixture = Fixture::setup().await?;
 
@@ -386,12 +317,7 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     use std::time::Duration;
 
     let mut fixture_a = Fixture::setup().await?;
-    let arena_config = fixture_a
-        .config
-        .storage
-        .arena_config_mut(Arena::from("testdir"))
-        .unwrap();
-    arena_config.datadir = fixture_a.testdir.clone();
+    fixture_a.config.storage.arenas.clear();
 
     let mut daemon_a = fixture_a
         .command()?
@@ -406,8 +332,12 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     fixture_a.collect_stderr("A", &mut daemon_a);
     fixture_a.collect_stdout("A", &mut daemon_a);
     fixture_a.assert_listening().await;
+    fixture_a
+        .create_arena(Arena::from("myarena"), &fixture_a.myarena)
+        .await?;
 
     let mut fixture_b = Fixture::setup().await?;
+    fixture_b.config.storage.arenas.clear();
     fixture_b.server_privkey = fixture_b.resources.join("b.key");
     fixture_b
         .config
@@ -432,12 +362,15 @@ async fn daemon_updates_cache() -> anyhow::Result<()> {
     fixture_b.collect_stderr("B", &mut daemon_b);
     fixture_b.collect_stdout("B", &mut daemon_b);
     fixture_b.assert_listening().await;
+    fixture_b
+        .create_arena(Arena::from("myarena"), &fixture_b.myarena)
+        .await?;
 
-    tokio::fs::write(fixture_a.testdir.join("hello.txt"), "Hello, world!").await?;
+    tokio::fs::write(fixture_a.myarena.join("hello.txt"), "Hello, world!").await?;
 
     // It might take a while for the new file to be reported by
     // inotify and then daemon_a, so retry.
-    let goal = mount_point.path().join("testdir/hello.txt");
+    let goal = mount_point.path().join("myarena/hello.txt");
 
     // The deadline is generous, because it can take a very long time
     // for the mountpoint to be truly available on MacOS.
@@ -498,7 +431,7 @@ async fn daemon_creates_arena() -> anyhow::Result<()> {
 
     fixture.assert_listening().await;
     fixture
-        .create_arena(Arena::from("testdir"), &fixture.testdir)
+        .create_arena(Arena::from("myarena"), &fixture.myarena)
         .await?;
     Ok(())
 }
@@ -550,7 +483,7 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
     );
 
     fixture
-        .create_arena(Arena::from("testdir"), &fixture.testdir)
+        .create_arena(Arena::from("myarena"), &fixture.myarena)
         .await?;
 
     // List the root directory content - the arena must now appear
@@ -563,13 +496,13 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
         })
         .collect();
     assert!(
-        entry_names.contains(&"testdir".to_string()),
-        "Expected to find 'testdir' arena in FUSE mount, found: {:?}",
+        entry_names.contains(&"myarena".to_string()),
+        "Expected to find 'myarena' arena in FUSE mount, found: {:?}",
         entry_names
     );
 
     // List the arena directory content - it should be empty
-    let arena_path = mount_point.path().join("testdir");
+    let arena_path = mount_point.path().join("myarena");
     let arena_entries = std::fs::read_dir(&arena_path)?;
     let arena_entry_names: Vec<String> = arena_entries
         .filter_map(|entry| {
