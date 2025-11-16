@@ -12,7 +12,7 @@ use bimap::BiMap;
 use realize_types::{Arena, Path, Peer};
 use redb::ReadableTable;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::task;
@@ -162,6 +162,38 @@ impl Filesystem {
             state.globals = globals;
 
             Ok(db)
+        })
+        .await?
+    }
+
+    /// Remove arena from the global database and from this instance.
+    ///
+    /// Does nothing if the arena is not there.
+    ///
+    /// While the arena is removed from the global database, the files
+    /// and database in the arena are left untouched and the
+    /// [ArenaDatabase] is still usable.
+    pub(crate) async fn remove_arena(self: &Arc<Self>, arena: Arena) -> Result<(), StorageError> {
+        let this = Arc::clone(self);
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_write()?;
+            let prefixes;
+            let globals;
+            {
+                let mut arena_table = txn.arena_table()?;
+                let mut path_table = txn.path_table()?;
+                remove_arena_from_database(&mut arena_table, &mut path_table, arena)?;
+                prefixes = build_prefix_map(&arena_table)?;
+                globals = build_globals(&path_table)?;
+            }
+            txn.commit()?;
+
+            let mut lock = this.state.write().unwrap();
+            lock.prefixes = prefixes;
+            lock.globals = globals;
+            lock.arena_fs.remove(&arena);
+
+            Ok(())
         })
         .await?
     }
@@ -680,6 +712,16 @@ fn get_or_create_dir(
     Ok(entry)
 }
 
+fn get_dir(
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    inode: Inode,
+) -> Result<Option<PathTableEntry>, StorageError> {
+    if let Some(existing) = path_table.get(inode)? {
+        return Ok(Some(existing.value().parse()?));
+    }
+    Ok(None)
+}
+
 fn build_prefix_map(
     arena_table: &impl ReadableTable<&'static str, Holder<'static, ArenaTableEntry>>,
 ) -> Result<BiMap<Arena, InodePrefix>, StorageError> {
@@ -754,6 +796,51 @@ fn add_arena_to_database(
     log::debug!("[{arena}]: prefix {prefix}");
 
     add_arena_path(path_table, pathid_range_table, arena, prefix)?;
+
+    Ok(())
+}
+
+fn remove_arena_from_database(
+    arena_table: &mut redb::Table<&'static str, Holder<'static, ArenaTableEntry>>,
+    path_table: &mut redb::Table<Inode, Holder<'static, PathTableEntry>>,
+    arena: Arena,
+) -> Result<(), StorageError> {
+    arena_table.remove(arena.as_str())?;
+
+    // Collect directories entries from root to arena into entries
+    let arena_path = Path::parse(arena.as_str())?;
+    let mut current = Inode::ROOT;
+    let mut entries = VecDeque::new();
+    for name in arena_path.components() {
+        let current_entry = match get_dir(path_table, current)? {
+            None => break,
+            Some(e) => e,
+        };
+        let next = current_entry.subdirs.get(name).map(|inode| *inode);
+        entries.push_front((current, name, current_entry));
+
+        if let Some(next) = next {
+            current = next;
+        } else {
+            break;
+        }
+    }
+
+    // If we reached the arena root, remove tail, until a non-empty
+    // entry is found
+    if current != Inode::ROOT && current.is_arena_root() {
+        for (current, name, mut entry) in entries {
+            entry.subdirs.remove(name);
+            if entry.subdirs.is_empty() && current != Inode::ROOT {
+                path_table.remove(current)?;
+            } else {
+                path_table.insert(current, Holder::with_content(entry)?)?;
+                break;
+            }
+        }
+    }
+
+    log::debug!("=== REMOVED {arena}");
 
     Ok(())
 }
@@ -880,13 +967,26 @@ mod tests {
                 _tempdir: tempdir,
             })
         }
+
+        async fn readdir_names(&self, loc: impl Into<FsLoc>) -> Result<Vec<String>, StorageError> {
+            Ok(self
+                .fs
+                .readdir(loc)
+                .await?
+                .into_iter()
+                .map(|(name, _, _)| name)
+                .collect::<Vec<_>>())
+        }
     }
 
     #[tokio::test]
     async fn empty_fs_readdir() -> anyhow::Result<()> {
         let fixture = Fixture::setup_with_arenas([]).await?;
 
-        assert!(fixture.fs.readdir(Inode::ROOT).await?.is_empty());
+        assert_eq!(
+            Vec::<String>::new(),
+            fixture.readdir_names(Inode::ROOT).await?
+        );
 
         Ok(())
     }
@@ -1021,27 +1121,21 @@ mod tests {
 
         assert_eq!(
             Vec::<String>::new(),
-            fs.readdir((Arena::from("arenas/test1"), Path::root()))
+            fixture
+                .readdir_names((Arena::from("arenas/test1"), Path::root()))
                 .await?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect::<Vec<_>>(),
         );
         assert_eq!(
             Vec::<String>::new(),
-            fs.readdir((Arena::from("arenas/test2"), Path::root()))
+            fixture
+                .readdir_names((Arena::from("arenas/test2"), Path::root()))
                 .await?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect::<Vec<_>>(),
         );
         assert_eq!(
             Vec::<String>::new(),
-            fs.readdir((Arena::from("other"), Path::root()))
+            fixture
+                .readdir_names((Arena::from("other"), Path::root()))
                 .await?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect::<Vec<_>>(),
         );
 
         Ok(())
@@ -1095,6 +1189,93 @@ mod tests {
             .await,
             Err(StorageError::CrossesDevices)
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_arena() -> anyhow::Result<()> {
+        let arena = Arena::from("myarena");
+        let fixture = Fixture::setup_with_arenas([arena]).await?;
+
+        assert_eq!(vec![arena], fixture.fs.arenas().collect::<Vec<_>>());
+        fixture.fs.remove_arena(arena).await?;
+        assert_eq!(Vec::<Arena>::new(), fixture.fs.arenas().collect::<Vec<_>>());
+        assert!(matches!(
+            fixture.fs.metadata((Inode::ROOT, "myarena")).await,
+            Err(StorageError::NotFound)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_arena_twice() -> anyhow::Result<()> {
+        let one = Arena::from("arenas/one");
+        let two = Arena::from("arenas/two");
+        let fixture = Fixture::setup_with_arenas([one, two]).await?;
+
+        let (arenas_inode, _) = fixture.fs.lookup((Inode::ROOT, "arenas")).await.unwrap();
+
+        fixture.fs.remove_arena(one).await?;
+        fixture.fs.remove_arena(one).await?; // no-op
+
+        // make sure two and arenas are still there.
+        assert_eq!(
+            vec!["arenas"],
+            fixture.readdir_names(Inode::ROOT).await.unwrap()
+        );
+        assert_eq!(
+            vec!["two"],
+            fixture.readdir_names(arenas_inode).await.unwrap()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_arena_removes_intemediate_dirs() -> anyhow::Result<()> {
+        let one = Arena::from("arenas/o/one");
+        let two = Arena::from("arenas/t/two");
+        let three = Arena::from("arenas/t/three");
+        let fixture = Fixture::setup_with_arenas([one, two, three]).await?;
+
+        let (arenas_inode, _) = fixture.fs.lookup((Inode::ROOT, "arenas")).await.unwrap();
+        let (t_inode, _) = fixture.fs.lookup((arenas_inode, "t")).await.unwrap();
+
+        fixture.fs.remove_arena(one).await.unwrap();
+
+        assert_eq!(
+            vec!["arenas"],
+            fixture.readdir_names(Inode::ROOT).await.unwrap()
+        );
+        assert_eq!(
+            vec!["t"],
+            fixture.readdir_names(arenas_inode).await.unwrap()
+        );
+        assert_eq!(
+            vec!["three", "two"],
+            fixture.readdir_names(t_inode).await.unwrap()
+        );
+
+        fixture.fs.remove_arena(two).await.unwrap();
+
+        assert_eq!(
+            vec!["arenas"],
+            fixture.readdir_names(Inode::ROOT).await.unwrap()
+        );
+        assert_eq!(
+            vec!["t"],
+            fixture.readdir_names(arenas_inode).await.unwrap()
+        );
+        assert_eq!(vec!["three"], fixture.readdir_names(t_inode).await.unwrap());
+
+        fixture.fs.remove_arena(three).await.unwrap();
+
+        assert_eq!(
+            Vec::<String>::new(),
+            fixture.readdir_names(Inode::ROOT).await.unwrap()
+        );
 
         Ok(())
     }
