@@ -62,7 +62,7 @@ impl Storage {
                 );
                 arena_storage.insert(
                     arena,
-                    ArenaStorage::with_db(db, &config.watcher)
+                    ArenaStorage::spawn(&&db, &config.watcher)
                         .await
                         .with_context(|| format!("in arena {arena}"))?,
                 );
@@ -87,7 +87,7 @@ impl Storage {
         let db = self.cache.add_arena(arena, datadir).await?;
         // TODO: deal with the situation where db is created but
         // ArenaStorage::with_db fails.
-        let storage = ArenaStorage::with_db(db, &self.watcher_config).await?;
+        let storage = ArenaStorage::spawn(&&db, &self.watcher_config).await?;
         let mut lock = self.arena_storage.write().unwrap();
         lock.insert(arena, storage);
         let _ = self

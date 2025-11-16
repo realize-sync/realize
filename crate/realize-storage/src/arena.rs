@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
-use watcher::RealWatcher;
+use tokio_util::task::TaskTracker;
 
 pub mod blob;
 pub mod cache;
@@ -33,21 +33,29 @@ mod xattr;
 pub(crate) struct ArenaStorage {
     pub(crate) db: Arc<ArenaDatabase>,
     pub(crate) engine: Arc<Engine>,
-    _watcher: RealWatcher,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
+
+    /// Shutdown tasks if ArenaStorage is dropped. This is meant as an
+    /// extra safety. [ArenaStorage] should normally be shutdown
+    /// cleanly with [ArenaStorage::shutdown].
     _drop_guard: DropGuard,
 }
 
 impl ArenaStorage {
-    pub(crate) async fn with_db(
-        db: Arc<ArenaDatabase>,
+    pub(crate) async fn spawn(
+        db: &Arc<ArenaDatabase>,
         watcher_config: &config::WatcherConfig,
     ) -> Result<Self, StorageError> {
+        let db = Arc::clone(db);
         let shutdown = CancellationToken::new();
+        let drop_guard = shutdown.clone().drop_guard();
+        let tasks = TaskTracker::new();
         let tag = db.tag();
         let datadir = db.cache().datadir();
         log::info!("[{tag}] Watching {datadir:?}");
 
-        let watcher = RealWatcher::builder(Arc::clone(&db))
+        watcher::builder(&db)
             .with_initial_scan()
             .debounce(
                 watcher_config
@@ -57,31 +65,51 @@ impl ArenaStorage {
                     .into(),
             )
             .max_parallel_hashers(watcher_config.max_parallel_hashers.unwrap_or(4))
-            .spawn()
+            .spawn(shutdown.clone(), tasks.clone())
             .await?;
-        tokio::spawn({
+        tasks.spawn({
             let db = Arc::clone(&db);
             let shutdown = shutdown.clone();
 
             async move { cleaner::run_loop(db, shutdown).await }
         });
-        tokio::spawn({
+        tasks.spawn({
             let db = Arc::clone(&db);
             let shutdown = shutdown.clone();
             async move { blob::mark_accessed_loop(db, Duration::from_millis(500), shutdown).await }
         });
 
         let engine = Engine::new(Arc::clone(&db), job_retry_strategy);
-
-        jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine))
-            .spawn(shutdown.clone());
+        tasks.spawn({
+            let processor =
+                jobs::StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), tasks.clone());
+            let shutdown = shutdown.clone();
+            async move { processor.process_jobs(shutdown).await }
+        });
 
         Ok(ArenaStorage {
             db,
             engine,
-            _watcher: watcher,
-            _drop_guard: shutdown.drop_guard(),
+            tasks,
+            shutdown,
+            _drop_guard: drop_guard,
         })
+    }
+
+    /// Shutdown any tasks working on the arena.
+    ///
+    /// This function doesn't wait for the shutdown to actually
+    /// happen. Call [ArenaStorage::closed] for that.
+    #[allow(dead_code)]
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.cancel();
+        self.tasks.close();
+    }
+
+    /// Wait for all tasks working on the arena to be shut down.
+    #[allow(dead_code)]
+    pub(crate) async fn closed(&self) {
+        self.tasks.wait().await
     }
 }
 
@@ -115,6 +143,11 @@ fn job_retry_strategy(attempt: u32) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+    use assert_fs::TempDir;
+    use realize_types::Arena;
+
+    use crate::config::WatcherConfig;
+
     use super::*;
 
     #[test]
@@ -133,6 +166,29 @@ mod tests {
             job_retry_strategy(9999)                 // overflow
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tempdir = TempDir::new()?;
+        let arena = Arena::from("myarena");
+        let db = db::ArenaDatabase::for_testing(arena, tempdir.path())?;
+        assert_eq!(1, Arc::strong_count(&db));
+
+        let storage = ArenaStorage::spawn(&db, &WatcherConfig::default()).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        storage.shutdown();
+
+        // make sure that all spawned tasks end after a shutdown
+        tokio::time::timeout(Duration::from_secs(15), storage.closed()).await?;
+        drop(storage);
+
+        // make sure there isn't some leftover background task holding
+        // on to the database.
+        assert_eq!(1, Arc::strong_count(&db));
+        assert!(Arc::try_unwrap(db).is_ok());
         Ok(())
     }
 }

@@ -8,38 +8,37 @@ use realize_types::Hash;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::task::{self, JoinHandle};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub(crate) struct StorageJobProcessor {
     db: Arc<ArenaDatabase>,
     engine: Arc<Engine>,
+    tasks: TaskTracker,
 }
 
 impl StorageJobProcessor {
-    pub(crate) fn new(db: Arc<ArenaDatabase>, engine: Arc<Engine>) -> Arc<Self> {
-        Arc::new(Self { db, engine })
+    pub(crate) fn new(
+        db: Arc<ArenaDatabase>,
+        engine: Arc<Engine>,
+        tasks: TaskTracker,
+    ) -> Arc<Self> {
+        Arc::new(Self { db, engine, tasks })
     }
 
-    pub fn spawn(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
-        tokio::spawn(async move { self.process_jobs(shutdown).await })
-    }
-
-    async fn process_jobs(self: &Arc<Self>, shutdown: CancellationToken) {
+    pub(crate) async fn process_jobs(self: &Arc<Self>, shutdown: CancellationToken) {
         let mut stream = self.engine.job_stream();
-
+        let tag = self.db.tag();
         while let Some((job_id, job)) = tokio::select!(
             _ = shutdown.cancelled() => {
+                log::debug!("[{tag}] Job processor shutdown");
                 return
             }
             ret = stream.next() => ret
         ) {
             if let Err(err) = self.process_and_report(job_id, job).await {
-                log::debug!(
-                    "[{}] Job #{job_id} Failed to report result: {err}",
-                    self.db.tag()
-                )
+                log::debug!("[{tag}] Job #{job_id} Failed to report result: {err}",)
             }
         }
     }
@@ -50,18 +49,18 @@ impl StorageJobProcessor {
         job: StorageJob,
     ) -> anyhow::Result<()> {
         let this = Arc::clone(self);
-        task::spawn_blocking(move || {
-            if !matches!(job, StorageJob::External(_)) {
-                log::info!("[{}] Job #{job_id} Starting {job:?}", this.db.tag());
-            }
-            if let Some(status) = this.process_job(job) {
-                this.engine
-                    .job_finished(job_id, status.map_err(|e| e.into()))?;
-            }
-
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        self.tasks
+            .spawn_blocking(move || {
+                if !matches!(job, StorageJob::External(_)) {
+                    log::info!("[{}] Job #{job_id} Starting {job:?}", this.db.tag());
+                }
+                if let Some(status) = this.process_job(job) {
+                    this.engine
+                        .job_finished(job_id, status.map_err(|e| e.into()))?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
 
         Ok(())
     }
@@ -279,7 +278,8 @@ mod tests {
                     None
                 }
             });
-            let processor = StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine));
+            let processor =
+                StorageJobProcessor::new(Arc::clone(&db), Arc::clone(&engine), TaskTracker::new());
 
             let fixture = Self {
                 arena,
@@ -370,13 +370,15 @@ mod tests {
             let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
             let tag = self.processor.db.tag();
-            tokio::task::spawn_blocking(move || {
-                let status = processor.unrealize(pathid, hash)?;
+            self.processor
+                .tasks
+                .spawn_blocking(move || {
+                    let status = processor.unrealize(pathid, hash)?;
 
-                log::debug!("[{tag}] -> {status:?}");
-                Ok::<JobStatus, anyhow::Error>(status)
-            })
-            .await?
+                    log::debug!("[{tag}] -> {status:?}");
+                    Ok::<JobStatus, anyhow::Error>(status)
+                })
+                .await?
         }
 
         async fn realize(&self, path: Path, hash: Hash) -> anyhow::Result<JobStatus> {
@@ -384,13 +386,15 @@ mod tests {
             log::debug!("[{tag}] Realize({path}, {hash})",);
             let pathid = self.pathid(&path)?;
             let processor = Arc::clone(&self.processor);
-            tokio::task::spawn_blocking(move || {
-                let status = processor.realize(pathid, hash)?;
+            self.processor
+                .tasks
+                .spawn_blocking(move || {
+                    let status = processor.realize(pathid, hash)?;
 
-                log::debug!("[{tag}] -> {status:?}");
-                Ok::<JobStatus, anyhow::Error>(status)
-            })
-            .await?
+                    log::debug!("[{tag}] -> {status:?}");
+                    Ok::<JobStatus, anyhow::Error>(status)
+                })
+                .await?
         }
     }
 

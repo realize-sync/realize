@@ -17,38 +17,29 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::{self, File};
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::task;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
-/// Watch an arena directory and update its index.
-///
-/// This is created with `RealWatcher::builder()`
-pub struct RealWatcher {
-    shutdown_tx: broadcast::Sender<()>,
+pub(crate) fn builder(db: &Arc<ArenaDatabase>) -> WatcherBuilder {
+    WatcherBuilder {
+        db: Arc::clone(db),
+        initial_scan: false,
+        debounce: Duration::ZERO,
+        max_parallelism: 0,
+    }
 }
-
 /// Builder for creating a RealWatcher with convenient configuration options.
-pub struct RealWatcherBuilder {
+pub(crate) struct WatcherBuilder {
     db: Arc<ArenaDatabase>,
     initial_scan: bool,
     debounce: Duration,
     max_parallelism: usize,
 }
 
-impl RealWatcherBuilder {
-    /// Create a new builder for watching the given root directory with the specified database.
-    pub fn new(db: Arc<ArenaDatabase>) -> Self {
-        Self {
-            db,
-            initial_scan: false,
-            debounce: Duration::ZERO,
-            max_parallelism: 0,
-        }
-    }
-
+impl WatcherBuilder {
     /// Look at existing files at startup, to catch up to any missed changes.
-    pub fn with_initial_scan(mut self) -> Self {
+    pub(crate) fn with_initial_scan(mut self) -> Self {
         self.initial_scan = true;
 
         self
@@ -56,7 +47,7 @@ impl RealWatcherBuilder {
 
     /// Set debounce delay for processing files. This allows some time
     /// for operations in progress to finish.
-    pub fn debounce(mut self, duration: Duration) -> Self {
+    pub(crate) fn debounce(mut self, duration: Duration) -> Self {
         self.debounce = duration;
 
         self
@@ -69,7 +60,7 @@ impl RealWatcherBuilder {
     /// parallelism to a fraction of the available cores.
     ///
     /// Set it to 0 to not limit parallelism. This is the default.
-    pub fn max_parallel_hashers(mut self, n: usize) -> Self {
+    pub(crate) fn max_parallel_hashers(mut self, n: usize) -> Self {
         self.max_parallelism = n;
 
         self
@@ -77,41 +68,45 @@ impl RealWatcherBuilder {
 
     /// Spawn the watcher with the current configuration.
     ///
-    /// To stop the background work cleanly, call [RealWatcher::shutdown].
-    ///
-    /// Background work is also stopped at some point after the instance is dropped.
-    pub async fn spawn(self) -> Result<RealWatcher, StorageError> {
-        RealWatcher::spawn(
+    /// To stop the background work cleanly, cancel `shutdown` and
+    /// wait for tasks in `tasks` to finish.
+    pub(crate) async fn spawn(
+        self,
+        shutdown: CancellationToken,
+        tasks: TaskTracker,
+    ) -> Result<(), StorageError> {
+        spawn(
             Arc::clone(&self.db),
             self.initial_scan,
             self.debounce,
             self.max_parallelism,
+            shutdown,
+            tasks,
         )
         .await
     }
 }
 
-impl RealWatcher {
-    /// Create a builder for configuring and spawning a RealWatcher.
-    pub fn builder(db: Arc<ArenaDatabase>) -> RealWatcherBuilder {
-        RealWatcherBuilder::new(db)
-    }
+async fn spawn(
+    db: Arc<ArenaDatabase>,
+    initial_scan: bool,
+    debounce: Duration,
+    max_parallelism: usize,
+    shutdown: CancellationToken,
+    tasks: TaskTracker,
+) -> Result<(), StorageError> {
+    let root = fs::canonicalize(db.cache().datadir()).await?;
+    let tag = db.tag();
 
-    async fn spawn(
-        db: Arc<ArenaDatabase>,
-        initial_scan: bool,
-        debounce: Duration,
-        max_parallelism: usize,
-    ) -> Result<Self, StorageError> {
-        let root = fs::canonicalize(db.cache().datadir()).await?;
-        let tag = db.tag();
+    let (watch_tx, watch_rx) = mpsc::channel(100);
 
-        let (watch_tx, watch_rx) = mpsc::channel(100);
-
-        let watcher = {
+    let watcher = tasks
+        .spawn_blocking({
             let root = root.clone();
             let watch_tx = watch_tx.clone();
-            tokio::task::spawn_blocking(move || {
+            let tag = tag.clone();
+
+            move || {
                 let mut watcher = notify::recommended_watcher({
                     let root = root.clone();
                     move |ev: Result<Event, notify::Error>| {
@@ -128,42 +123,31 @@ impl RealWatcher {
                 })?;
                 watcher.configure(notify::Config::default().with_follow_symlinks(false))?;
                 watcher.watch(&root, notify::RecursiveMode::Recursive)?;
-
+                log::debug!("[{tag}] notify::Watcher initialized");
                 Ok::<RecommendedWatcher, notify::Error>(watcher)
-            })
-            .await??
-        };
-
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-
-        let worker = Arc::new(RealWatcherWorker { db: db.clone() });
-
-        task::spawn({
-            let watch_tx = watch_tx.clone();
-            async move {
-                let _watcher = watcher;
-
-                worker
-                    .event_loop(debounce, max_parallelism, watch_tx, watch_rx, shutdown_rx)
-                    .await;
             }
-        });
+        })
+        .await??;
 
-        if initial_scan {
-            let _ = watch_tx.send(FsEvent::Scan(Path::root())).await;
+    let worker = Arc::new(RealWatcherWorker { db: db.clone() });
+
+    tasks.spawn({
+        let watch_tx = watch_tx.clone();
+        let shutdown = shutdown.clone();
+        async move {
+            let _watcher = watcher; // keeps notify watcher running
+            worker
+                .event_loop(debounce, max_parallelism, watch_tx, watch_rx, shutdown)
+                .await;
         }
+    });
 
-        Ok(Self { shutdown_tx })
+    if initial_scan {
+        log::debug!("[{tag}] Start initial scan for {root:?}");
+        let _ = watch_tx.send(FsEvent::Scan(Path::root())).await;
     }
 
-    /// Shutdown background tasks and wait for them to be finished.
-    #[allow(dead_code)]
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
-        let _ = self.shutdown_tx.send(());
-        self.shutdown_tx.closed().await;
-
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Filesystem event that the watcher finds relevant.
@@ -226,14 +210,14 @@ impl RealWatcherWorker {
         max_parallelism: usize,
         watch_tx: mpsc::Sender<FsEvent>,
         mut watch_rx: mpsc::Receiver<FsEvent>,
-        mut shutdown_rx: broadcast::Receiver<()>,
+        shutdown: CancellationToken,
     ) {
         let tag = self.db.tag();
         let mut barrier = self.db.cache().watcher_barrier();
         let mut debouncer = DebouncerMap::new(debounce, max_parallelism);
         loop {
             tokio::select!(
-                _ = shutdown_rx.recv() => {
+                _ = shutdown.cancelled() => {
                     break;
                 }
                 ev = watch_rx.recv() => {
@@ -253,6 +237,7 @@ impl RealWatcherWorker {
                 }
             );
         }
+        log::debug!("[{tag}] Watcher shut down");
     }
 
     async fn handle_event(
@@ -758,11 +743,15 @@ mod tests {
     use assert_fs::prelude::*;
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
+    use tokio_util::sync::DropGuard;
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
         root: ChildPath,
         tempdir: TempDir,
+        tasks: TaskTracker,
+        shutdown: CancellationToken,
+        _drop_guard: DropGuard,
     }
 
     impl Fixture {
@@ -774,14 +763,23 @@ mod tests {
 
             let arena = Arena::from("test");
             let db = ArenaDatabase::for_testing(arena, root.path())?;
-            Ok(Self { root, db, tempdir })
+            let shutdown = CancellationToken::new();
+            let drop_guard = shutdown.clone().drop_guard();
+            Ok(Self {
+                root,
+                db,
+                tempdir,
+                shutdown,
+                _drop_guard: drop_guard,
+                tasks: TaskTracker::new(),
+            })
         }
 
         /// Catch up to any previous changes and watch for anything new.
-        async fn scan_and_watch(&self) -> Result<RealWatcher, StorageError> {
-            RealWatcher::builder(Arc::clone(&self.db))
+        async fn scan_and_watch(&self) -> Result<(), StorageError> {
+            super::builder(&self.db)
                 .with_initial_scan()
-                .spawn()
+                .spawn(self.shutdown.clone(), self.tasks.clone())
                 .await
         }
 
@@ -789,8 +787,10 @@ mod tests {
         ///
         /// Note that filesystem modifications made just before this
         /// is called might still get reported.
-        async fn watch(&self) -> Result<RealWatcher, StorageError> {
-            RealWatcher::builder(Arc::clone(&self.db)).spawn().await
+        async fn watch(&self) -> Result<(), StorageError> {
+            super::builder(&self.db)
+                .spawn(self.shutdown.clone(), self.tasks.clone())
+                .await
         }
 
         /// Wait for the given history entry to have been written.
@@ -822,9 +822,16 @@ mod tests {
     #[tokio::test]
     async fn shutdown() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
-        watcher.shutdown().await?;
+        // Make sure the watcher started and did something before
+        // shutting it down.
+        fixture.root.child("foobar").write_str("test")?;
+        fixture.wait_for_history_event(1).await?;
+
+        fixture.tasks.close();
+        fixture.shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), fixture.tasks.wait()).await?;
 
         Ok(())
     }
@@ -832,7 +839,7 @@ mod tests {
     #[tokio::test]
     async fn create_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.write_str("test")?;
 
@@ -855,7 +862,7 @@ mod tests {
     #[tokio::test]
     async fn create_empty_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.touch()?;
 
@@ -878,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn modify_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
         foobar.write_str("test")?;
 
@@ -906,7 +913,7 @@ mod tests {
     #[tokio::test]
     async fn remove_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
 
         foobar.write_str("test")?;
@@ -928,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn create_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -954,7 +961,7 @@ mod tests {
     #[tokio::test]
     async fn remove_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -981,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn move_dir_with_files_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.tempdir.child("newdir");
         dir.create_dir_all()?;
@@ -1004,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn move_dir_with_files_out() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -1031,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn rename_dir_with_files() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -1067,7 +1074,7 @@ mod tests {
     #[tokio::test]
     async fn move_file_into() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let newfile = fixture.tempdir.child("newfile");
         newfile.write_str("test")?;
@@ -1087,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn move_file_out() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foobar = fixture.root.child("foobar");
 
         foobar.write_str("test")?;
@@ -1110,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn rename_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foo = fixture.root.child("foo");
 
         foo.write_str("test")?;
@@ -1139,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn change_file_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -1165,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn change_dir_accessibility() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let dir = fixture.root.child("a/b");
         dir.create_dir_all()?;
@@ -1208,7 +1215,7 @@ mod tests {
         fixture.root.child("a/b/c").create_dir_all()?;
         fixture.root.child("a/b/c/bar").write_str("bar")?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
@@ -1259,7 +1266,7 @@ mod tests {
         fs::remove_dir_all(fixture.root.child("a").path()).await?;
 
         // Now run the initial scan - it should detect the files are gone and remove them
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
         assert!(!index::has_local_file_async(db, &foo).await?);
@@ -1299,7 +1306,7 @@ mod tests {
 
         bar_child.write_str("barbar")?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
 
@@ -1358,7 +1365,7 @@ mod tests {
         make_inaccessible(foo_child.path()).await?;
         make_inaccessible(bar_child.path()).await?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(4).await?;
 
@@ -1402,7 +1409,7 @@ mod tests {
 
         make_inaccessible(fixture.root.child("a").path()).await?;
 
-        let _watcher = match fixture.scan_and_watch().await {
+        match fixture.scan_and_watch().await {
             Ok(w) => w,
             Err(err) => {
                 // The inotify backend won't start if a subdirectory
@@ -1428,7 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn ignore_new_symlinks() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
 
         let file_symlink = fixture.root.child("file_symlink");
@@ -1492,7 +1499,7 @@ mod tests {
         )
         .await?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(2).await?;
         let foo = realize_types::Path::parse("foo")?;
@@ -1515,7 +1522,7 @@ mod tests {
     #[tokio::test]
     async fn turn_file_into_symlink() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("foo")?;
         let bar_child = fixture.root.child("bar");
@@ -1584,7 +1591,7 @@ mod tests {
         fs::remove_file(bar_child.path()).await?;
         fs::symlink(foo_child.path(), bar_child.path()).await?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
 
@@ -1622,7 +1629,7 @@ mod tests {
         fs::rename(dir.path(), newdir.path()).await?;
         fs::symlink(newdir.path(), dir.path()).await?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(3).await?;
         let foo_in_b = realize_types::Path::parse("b/foo")?;
@@ -1640,7 +1647,7 @@ mod tests {
     #[tokio::test]
     async fn create_hard_link() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
         let db = &fixture.db;
         let foo_child = fixture.root.child("foo");
         foo_child.write_str("test")?;
@@ -1667,7 +1674,7 @@ mod tests {
     #[tokio::test]
     async fn ignore_excluded() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.watch().await?;
+        fixture.watch().await?;
 
         fixture
             .root
@@ -1711,7 +1718,7 @@ mod tests {
             .write_str("test")?;
         fixture.root.child("dir/not_excluded").write_str("test")?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(1).await?;
 
@@ -1758,7 +1765,7 @@ mod tests {
         )
         .await?;
 
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture.wait_for_history_event(2).await?;
         assert!(
@@ -1773,7 +1780,7 @@ mod tests {
     #[tokio::test]
     async fn capture_ignore_and_removes_excluded() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
-        let _watcher = fixture.scan_and_watch().await?;
+        fixture.scan_and_watch().await?;
 
         fixture
             .root
