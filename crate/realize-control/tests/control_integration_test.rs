@@ -1,4 +1,5 @@
 use assert_fs::TempDir;
+use assert_fs::fixture::ChildPath;
 use assert_fs::prelude::*;
 use realize_core::config::Config;
 use realize_core::setup::SetupHelper;
@@ -27,6 +28,7 @@ struct Fixture {
     tempdir: TempDir,
     socket: PathBuf,
     arena: Arena,
+    arena_dir: ChildPath,
     setup: SetupHelper,
 }
 
@@ -40,8 +42,8 @@ impl Fixture {
         // Setup temp directory for the daemon to serve
         let tempdir = TempDir::new()?;
 
-        let myarena = tempdir.child("myarena");
-        myarena.create_dir_all()?;
+        let arena_dir = tempdir.child("myarena");
+        arena_dir.create_dir_all()?;
 
         config.storage.cache = CacheConfig {
             db: tempdir.child("cache.db").to_path_buf(),
@@ -68,10 +70,11 @@ impl Fixture {
             .bind_control_socket(local, Some(&socket), 0o077)
             .await?;
 
-        setup.storage.create_arena(arena, myarena.path()).await?;
+        setup.storage.create_arena(arena, arena_dir.path()).await?;
 
         Ok(Self {
             arena,
+            arena_dir,
             tempdir,
             socket,
             setup,
@@ -522,6 +525,30 @@ async fn arena_create() -> anyhow::Result<()> {
                     .arenas()
                     .contains(&Arena::from("other"))
             );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arena_remove() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            let mut control_cmd = fixture.control_command(&["arena", "remove", "myarena"])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+
+            assert!(fixture.setup.storage.arenas().is_empty());
+            assert!(fixture.arena_dir.exists());
+            assert!(!fixture.arena_dir.child(".realize").exists());
 
             Ok::<_, anyhow::Error>(())
         })

@@ -113,7 +113,26 @@ enum ArenaCommands {
     ///
     /// If an arena with the same name exists on other peers, syncing
     /// between peers starts automatically.
-    Create { name: String, path: PathBuf },
+    Create {
+        /// Arena name
+        name: String,
+
+        /// Directory where Arena's files and database are stored.
+        path: PathBuf,
+    },
+
+    Remove {
+        /// Arena name
+        name: String,
+
+        /// Delete all files belonging to the arena.
+        #[arg(long)]
+        delete_files: bool,
+
+        /// Keep the arena database, so it can be re-added later.
+        #[arg(long)]
+        keep_database: bool,
+    },
 }
 
 /// Get the default socket path by checking for the first existing socket
@@ -216,6 +235,20 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                 Commands::Arena { command } => match command {
                     ArenaCommands::Create { name, path } => {
                         arena_cmd::execute_arena_create(&control, cli.output, &name, &path).await
+                    }
+                    ArenaCommands::Remove {
+                        name,
+                        delete_files,
+                        keep_database,
+                    } => {
+                        arena_cmd::execute_arena_remove(
+                            &control,
+                            cli.output,
+                            &name,
+                            delete_files,
+                            keep_database,
+                        )
+                        .await
                     }
                 },
             }

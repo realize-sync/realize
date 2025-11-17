@@ -23,6 +23,8 @@ interface Control {
 
   createArena @6 (req: CreateArenaRequest) -> (res: Result(CreateArenaResponse, CreateArenaError));
   # create a new local arena
+
+  removeArena @7 (req: RemoveArenaRequest) -> (res: Result(RemoveArenaResponse, RemoveArenaError));
 }
 
 struct PeerConnectionInfo {
@@ -164,6 +166,19 @@ struct CreateArenaResponse {}
 struct CreateArenaError {
   
   issue @0: SanityCheckIssue;
+}
+
+struct RemoveArenaRequest {
+  arena @0: Text; # name of the arena to remove
+
+}
+
+struct RemoveArenaResponse {
+  dir @0: Data; # path to the arena's local directory, may be missing
+  workdir @1: Data; # path to the arena's local directory, may be missing
+}
+
+struct RemoveArenaError {
 }
 
 struct SanityCheckIssue {

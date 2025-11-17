@@ -8,7 +8,8 @@ use super::control_capnp::churten::{
 use super::control_capnp::control::{
     self, ChurtenParams, ChurtenResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
     DisconnectResults, GetMarkParams, GetMarkResults, KeepConnectedParams, KeepConnectedResults,
-    ListPeersParams, ListPeersResults, SetMarkParams, SetMarkResults,
+    ListPeersParams, ListPeersResults, RemoveArenaParams, RemoveArenaResults, SetMarkParams,
+    SetMarkResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
@@ -192,13 +193,10 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
             let arena = parse_arena(req.get_arena()?)?;
             let dir = std::path::Path::new(&OsStr::from_bytes(req.get_dir()?)).to_path_buf();
 
-            let result = tokio::task::spawn_local(async move {
-                let ret = storage.create_arena(arena, &dir).await;
-
-                ret
-            })
-            .await
-            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+            let result =
+                tokio::task::spawn_local(async move { storage.create_arena(arena, &dir).await })
+                    .await
+                    .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             match result {
                 Ok(()) => {
@@ -213,6 +211,31 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
                 }
                 Err(err) => return Err(from_storage_err(err)),
             }
+            Ok(())
+        })
+    }
+
+    fn remove_arena(
+        &mut self,
+        params: RemoveArenaParams,
+        mut results: RemoveArenaResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+
+            let paths = tokio::task::spawn_local(async move { storage.remove_arena(arena).await })
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+            let mut res = results.get().init_res().init_ok();
+            if let Some((dir, workdir)) = paths {
+                res.set_dir(dir.as_os_str().as_bytes());
+                res.set_workdir(workdir.as_os_str().as_bytes());
+            }
+
             Ok(())
         })
     }
@@ -1343,6 +1366,54 @@ mod tests {
                     BTreeSet::from([HouseholdFixture::test_arena()]),
                     storage.arenas()
                 );
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn remove_arena() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let datadir = fixture.inner.arena_root(peer).to_path_buf();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                let arena = HouseholdFixture::test_arena();
+                let mut request = control.remove_arena_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                let result = request.send().promise.await?;
+                match result.get()?.get_res()?.which()? {
+                    result_capnp::result::Which::Ok(res) => {
+                        let res = res?;
+                        assert_eq!(
+                            datadir.as_path(),
+                            std::path::Path::new(&OsStr::from_bytes(res.get_dir()?))
+                        );
+                        assert_eq!(
+                            datadir.join(".realize"),
+                            std::path::Path::new(&OsStr::from_bytes(res.get_workdir()?))
+                        );
+                    }
+                    _ => panic!("Unexpected error from remove_arena"),
+                };
+                assert!(storage.arenas().is_empty());
 
                 Ok::<(), anyhow::Error>(())
             })
