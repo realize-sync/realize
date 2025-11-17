@@ -100,7 +100,6 @@ impl ArenaStorage {
     ///
     /// This function doesn't wait for the shutdown to actually
     /// happen. Call [ArenaStorage::closed] for that.
-    #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
         self.shutdown.cancel();
         self.tasks.close();

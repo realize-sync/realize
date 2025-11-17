@@ -8,6 +8,7 @@ use futures::Stream;
 use global::db::GlobalDatabase;
 use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinHandle};
@@ -95,6 +96,39 @@ impl Storage {
             .send(lock.keys().map(|a| *a).collect());
 
         Ok(())
+    }
+
+    /// Remove the given arena.
+    ///
+    /// If the arena was actually removed by this call, returns
+    /// `(datadir, workdir)`, with `datadir` the directory storing the
+    /// local files, and `workdir`, the directory storing the database
+    /// and blobs.
+    pub async fn remove_arena(
+        &self,
+        arena: Arena,
+    ) -> Result<Option<(PathBuf, PathBuf)>, StorageError> {
+        let mut dirs = None;
+
+        self.cache.remove_arena(arena).await?;
+        let storage = {
+            let mut lock = self.arena_storage.write().unwrap();
+            let storage = lock.remove(&arena);
+            let _ = self
+                .arena_set_watch_tx
+                .send(lock.keys().map(|a| *a).collect());
+            storage
+        };
+        if let Some(storage) = storage {
+            dirs = Some((
+                storage.db.datadir().to_path_buf(),
+                storage.db.workdir().to_path_buf(),
+            ));
+            storage.shutdown();
+            storage.closed().await;
+        }
+
+        Ok(dirs)
     }
 
     /// Return a handle on the unreal cache.
@@ -346,6 +380,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_arena() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+
+        assert_eq!(BTreeSet::from([fixture.arena]), fixture.storage.arenas());
+        let (datadir, workdir) = fixture.storage.remove_arena(fixture.arena).await?.unwrap();
+        assert!(workdir.exists());
+        assert!(datadir.exists());
+        assert_eq!(datadir.join(".realize"), workdir);
+
+        assert!(fixture.storage.arenas().is_empty());
+        assert_eq!(None, fixture.storage.cache().arenas().next());
+        assert!(
+            fixture
+                .storage
+                .cache()
+                .readdir(Inode::ROOT)
+                .await?
+                .is_empty()
+        );
+
+        // A second call does nothing and returns None
+        assert!(fixture.storage.remove_arena(fixture.arena).await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn watch_arena_set() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
 
@@ -365,6 +426,12 @@ mod tests {
             BTreeSet::from([fixture.arena, new]),
             fixture.storage.arenas()
         );
+
+        fixture.storage.remove_arena(new).await?;
+        watch.changed().await.unwrap();
+        assert_eq!(BTreeSet::from([fixture.arena]), *watch.borrow());
+        assert_eq!(BTreeSet::from([fixture.arena]), fixture.storage.arenas());
+
         Ok(())
     }
 }

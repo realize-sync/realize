@@ -22,6 +22,7 @@ use redb::TableDefinition;
 use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
 use std::panic::Location;
+use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -175,6 +176,10 @@ pub(crate) struct ArenaDatabase {
     arena: Arena,
     subsystems: Subsystems,
     tag: Tag,
+
+    /// Directory that contains the blobs, in "blobs" and the
+    /// database, unless the database is an in-memory one.
+    workdir: PathBuf,
 }
 
 struct Subsystems {
@@ -187,9 +192,9 @@ struct Subsystems {
 }
 
 impl ArenaDatabase {
-    pub const WORKDIR_NAME: &str = ".realize";
-    pub const BLOBDIR_NAME: &str = "blobs";
-    pub const DB_NAME: &str = "arena.db";
+    const WORKDIR_NAME: &str = ".realize";
+    const BLOBDIR_NAME: &str = "blobs";
+    const DB_NAME: &str = "arena.db";
     /// Special file used to execute write tests. It must be possible
     /// to safely write it to the data and blob directories. That file
     /// should ideally be excluded.
@@ -213,13 +218,12 @@ impl ArenaDatabase {
     ) -> Result<Arc<Self>, StorageError> {
         let datadir = datadir.as_ref();
         let workdir = datadir.join(Self::WORKDIR_NAME);
-        let blob_dir = workdir.join(Self::BLOBDIR_NAME);
-        std::fs::create_dir_all(&blob_dir)?;
+        std::fs::create_dir_all(&workdir)?;
 
         Self::new(
             crate::utils::redb_utils::in_memory()?,
             arena,
-            blob_dir,
+            &workdir,
             datadir,
             PathSet::from([
                 Path::parse(Self::WORKDIR_NAME)?,
@@ -234,15 +238,14 @@ impl ArenaDatabase {
     ) -> Result<Arc<Self>, StorageError> {
         let datadir = datadir.as_ref();
         let workdir = datadir.join(Self::WORKDIR_NAME);
-        let blob_dir = workdir.join(Self::BLOBDIR_NAME);
         let dbpath = workdir.join(Self::DB_NAME);
 
-        sanity_check_dirs(arena, datadir, &blob_dir).fail_if_error()?;
+        sanity_check_dirs(arena, datadir, &workdir).fail_if_error()?;
 
         Self::new(
             redb::Database::create(dbpath)?,
             arena,
-            blob_dir,
+            workdir,
             datadir,
             PathSet::from([
                 Path::parse(Self::WORKDIR_NAME)?,
@@ -254,7 +257,7 @@ impl ArenaDatabase {
     pub(crate) fn new(
         db: redb::Database,
         arena: Arena,
-        blob_dir: impl AsRef<std::path::Path>,
+        workdir: impl AsRef<std::path::Path>,
         datadir: impl AsRef<std::path::Path>,
         exclude: PathSet,
     ) -> Result<Arc<Self>, StorageError> {
@@ -294,7 +297,10 @@ impl ArenaDatabase {
             settings = Settings::setup(&mut settings_table)?;
             uuid = settings.borrow().uuid;
             tag = Tag::new(uuid, arena);
-            blobs = Blobs::setup(blob_dir.as_ref(), &blob_lru_queue_table)?;
+            blobs = Blobs::setup(
+                &workdir.as_ref().join(ArenaDatabase::BLOBDIR_NAME),
+                &blob_lru_queue_table,
+            )?;
             cache = Cache::setup(&mut cache_table, tree.root(), datadir.as_ref(), exclude)?;
         }
         txn.commit()?;
@@ -303,6 +309,7 @@ impl ArenaDatabase {
             db,
             arena,
             uuid,
+            workdir: workdir.as_ref().to_path_buf(),
             subsystems: Subsystems {
                 tree,
                 dirty,
@@ -360,6 +367,16 @@ impl ArenaDatabase {
     /// Return handle on the Cache subsystem.
     pub fn cache(&self) -> &Cache {
         &self.subsystems.cache
+    }
+
+    /// Return the directory that stores the data files.
+    pub(crate) fn datadir(&self) -> &std::path::Path {
+        self.subsystems.cache.datadir()
+    }
+
+    /// Return the directory that stores the database and blobs.
+    pub(crate) fn workdir(&self) -> &std::path::Path {
+        &self.workdir
     }
 
     pub fn begin_write(&self) -> Result<ArenaWriteTransaction<'_>, StorageError> {
@@ -475,7 +492,7 @@ impl SanityCheckResult {
 fn sanity_check_dirs(
     arena: Arena,
     datadir: &std::path::Path,
-    blobdir: &std::path::Path,
+    workdir: &std::path::Path,
 ) -> SanityCheckResult {
     SanityCheckResult::build(arena, |result| {
         if !datadir.exists() {
@@ -490,20 +507,21 @@ fn sanity_check_dirs(
             result.warn(datadir, SanityCheck::WritableDir);
         }
 
-        let _ = std::fs::create_dir_all(blobdir);
-        if !fs_utils::is_readable_dir(blobdir) {
-            result.err(blobdir, SanityCheck::ReadableDir);
+        let blobdir = workdir.join(ArenaDatabase::BLOBDIR_NAME);
+        let _ = std::fs::create_dir_all(&blobdir);
+        if !fs_utils::is_readable_dir(&blobdir) {
+            result.err(&blobdir, SanityCheck::ReadableDir);
             return Ok(());
         }
 
-        if !fs_utils::is_writable_dir(blobdir, ArenaDatabase::TEST_FILENAME) {
-            result.err(blobdir, SanityCheck::WritableDir);
+        if !fs_utils::is_writable_dir(&blobdir, ArenaDatabase::TEST_FILENAME) {
+            result.err(&blobdir, SanityCheck::WritableDir);
         }
 
         if let (Ok(m1), Ok(m2)) = (datadir.metadata(), blobdir.metadata())
             && m1.dev() != m2.dev()
         {
-            result.warn(blobdir, SanityCheck::SameDevice);
+            result.warn(&blobdir, SanityCheck::SameDevice);
         }
         Ok(())
     })
