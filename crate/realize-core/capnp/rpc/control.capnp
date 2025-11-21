@@ -49,7 +49,8 @@ struct GetMarkResponse {
 }
 
 enum Mark {
-  watch @0;
+  default @0;
+  watch @3;
   keep @1;
   own @2;
 }

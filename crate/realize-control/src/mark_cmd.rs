@@ -70,6 +70,7 @@ pub(crate) async fn execute_mark_get(
 
         let mark_str = match mark {
             Ok(control_capnp::Mark::Watch) => "watch",
+            Ok(control_capnp::Mark::Default) => "default",
             Ok(control_capnp::Mark::Keep) => "keep",
             Ok(control_capnp::Mark::Own) => "own",
             Err(_) => "unknown",
@@ -88,6 +89,7 @@ pub(crate) async fn execute_mark_get(
 
             let mark_str = match mark {
                 Ok(control_capnp::Mark::Watch) => "watch",
+                Ok(control_capnp::Mark::Default) => "default",
                 Ok(control_capnp::Mark::Keep) => "keep",
                 Ok(control_capnp::Mark::Own) => "own",
                 Err(_) => "unknown",

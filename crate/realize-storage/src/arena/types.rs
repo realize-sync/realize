@@ -560,9 +560,16 @@ fn parse_path(path: capnp::text::Reader<'_>) -> Result<realize_types::Path, Byte
 /// A mark that can be applied to files and directories in an arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
 pub enum Mark {
-    /// Files marked as "watch" belong in the unreal. They should be left in the cache and are subject to normal LRU rules.
-    #[default]
+    /// Files marked as "watch" belong in the unreal. They may be
+    /// cached, subject to normal LRU rules. Once another peer has
+    /// taken ownership of a file marked "watch", it can be
+    /// unrealized.
     Watch,
+    /// Files without mark are left wherever they are, subject to
+    /// normal LRU rule when kept in the cache. They are never
+    /// realized or unrealized.
+    #[default]
+    Default,
     /// Files marked as "keep" belong in the unreal. They should be left in the cache and are unconditionally kept.
     Keep,
     /// Files marked as "own" belong in the real. They should be moved into the arena root as regular files.
@@ -573,6 +580,7 @@ impl std::fmt::Display for Mark {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Mark::Watch => "watch",
+            Mark::Default => "default",
             Mark::Keep => "keep",
             Mark::Own => "own",
         })
@@ -648,6 +656,7 @@ impl ByteConvertible<MarkTableEntry> for MarkTableEntry {
 
         let mark = match msg.get_mark()? {
             mark_capnp::Mark::Own => Mark::Own,
+            mark_capnp::Mark::Default => Mark::Default,
             mark_capnp::Mark::Watch => Mark::Watch,
             mark_capnp::Mark::Keep => Mark::Keep,
         };
@@ -663,6 +672,7 @@ impl ByteConvertible<MarkTableEntry> for MarkTableEntry {
         let mark = match self.mark {
             Mark::Own => mark_capnp::Mark::Own,
             Mark::Watch => mark_capnp::Mark::Watch,
+            Mark::Default => mark_capnp::Mark::Default,
             Mark::Keep => mark_capnp::Mark::Keep,
         };
         builder.set_mark(mark);

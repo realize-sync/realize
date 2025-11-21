@@ -1042,7 +1042,7 @@ fn choose_queue(
     pathid: PathId,
 ) -> Result<LruQueueId, StorageError> {
     let queue = match marks.get(tree, pathid)? {
-        Mark::Watch => LruQueueId::WorkingArea,
+        Mark::Watch | Mark::Default => LruQueueId::WorkingArea,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
     };
     Ok(queue)

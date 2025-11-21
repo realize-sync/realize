@@ -408,6 +408,7 @@ fn parse_mark(mark: control_capnp::Mark) -> Mark {
     match mark {
         control_capnp::Mark::Own => Mark::Own,
         control_capnp::Mark::Watch => Mark::Watch,
+        control_capnp::Mark::Default => Mark::Default,
         control_capnp::Mark::Keep => Mark::Keep,
     }
 }
@@ -416,6 +417,7 @@ fn mark_to_capnp(mark: Mark) -> control_capnp::Mark {
     match mark {
         Mark::Own => control_capnp::Mark::Own,
         Mark::Watch => control_capnp::Mark::Watch,
+        Mark::Default => control_capnp::Mark::Default,
         Mark::Keep => control_capnp::Mark::Keep,
     }
 }
@@ -644,7 +646,7 @@ mod tests {
                 req.set_path("foo");
                 let result = request.send().promise.await?;
                 assert_eq!(
-                    control_capnp::Mark::Watch,
+                    control_capnp::Mark::Default,
                     result.get()?.get_res()?.get_mark()?
                 );
 

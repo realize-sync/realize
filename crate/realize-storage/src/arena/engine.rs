@@ -446,6 +446,9 @@ impl Engine {
                 want_unprotect_blob = true;
                 want_unrealize = true;
             }
+            Mark::Default => {
+                want_unprotect_blob = true;
+            }
             Mark::Keep => {
                 want_protect_blob = true;
                 want_download = true;
@@ -1017,7 +1020,7 @@ mod tests {
             blob.update(0, b"te").await?;
         }
         // blob is partially available, but unprotected, going from
-        // Mark::Watch to Mark::Keep triggers the need to:
+        // Mark::Default to Mark::Own triggers the need to:
         //
         // 1. set it protected
         // 2. download the rest and verify it
@@ -1071,12 +1074,11 @@ mod tests {
         let fixture = EngineFixture::setup().await?;
         let foobar = Path::parse("foo/bar")?;
 
-        mark::set(&fixture.db, &foobar, Mark::Keep)?;
         fixture.add_file_to_index_with_version(&foobar, test_hash())?;
         fixture.add_file_to_cache_with_version(&foobar, test_hash())?;
 
-        // File is in the index. Going from Mark::Keep to Mark::Watch
-        // triggers unrealize.
+        // The same version is available both locally and remotely.
+        // Going from Mark::Default to Mark::Watch triggers unrealize.
         mark::set(&fixture.db, &foobar, Mark::Watch)?;
 
         let mut job_stream = fixture.engine.job_stream();

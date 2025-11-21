@@ -426,22 +426,22 @@ mod tests {
         fixture.add_to_cache(&file, Peer::from("peer"), "test")?;
 
         assert_eq!(
-            "watch (derived)",
+            "default (derived)",
             super::get(&fixture.db, Path::root(), "realize.mark")?.as_str(),
         );
         assert_eq!(
-            "watch (derived)",
+            "default (derived)",
             super::get(&fixture.db, &dir, "realize.mark")?.as_str(),
         );
         assert_eq!(
-            "watch (derived)",
+            "default (derived)",
             super::get(&fixture.db, &file, "realize.mark")?.as_str(),
         );
 
         super::set(&fixture.db, &dir, "realize.mark", "own".into())?;
 
         assert_eq!(
-            "watch (derived)",
+            "default (derived)",
             super::get(&fixture.db, Path::root(), "realize.mark")?.as_str(),
         );
         assert_eq!(

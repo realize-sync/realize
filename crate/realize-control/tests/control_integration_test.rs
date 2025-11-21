@@ -262,9 +262,9 @@ async fn mark_set_paths() -> anyhow::Result<()> {
                     .get_mark(arena, &realize_types::Path::parse("file2.txt")?)
                     .await?
             );
-            // file3.txt wasn't set. It still has the default (watch)
+            // file3.txt wasn't set. It still has the default
             assert_eq!(
-                Mark::Watch,
+                Mark::Default,
                 storage
                     .get_mark(arena, &realize_types::Path::parse("file3.txt")?)
                     .await?
@@ -314,7 +314,7 @@ async fn mark_get() -> anyhow::Result<()> {
 
             let output_str = String::from_utf8(output.stdout)?;
             assert_eq!(
-                "file1.txt: keep\nfile2.txt: own\nfile3.txt: watch\n",
+                "file1.txt: keep\nfile2.txt: own\nfile3.txt: default\n",
                 output_str
             );
 

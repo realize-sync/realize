@@ -356,8 +356,11 @@ mod tests {
         let mark = txn.write_marks()?;
         let tree = txn.write_tree()?;
 
-        assert_eq!(Mark::Watch, mark.get(&tree, tree.root())?);
-        assert_eq!(Mark::Watch, mark.get(&tree, Path::parse("some/file.txt")?)?);
+        assert_eq!(Mark::Default, mark.get(&tree, tree.root())?);
+        assert_eq!(
+            Mark::Default,
+            mark.get(&tree, Path::parse("some/file.txt")?)?
+        );
 
         Ok(())
     }
@@ -370,7 +373,7 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
         let root = tree.root();
-        assert_eq!(Mark::Watch, mark.get(&tree, root)?);
+        assert_eq!(Mark::Default, mark.get(&tree, root)?);
         mark.set(&mut tree, &mut dirty, root, Mark::Keep)?;
 
         assert_eq!(Mark::Keep, mark.get(&tree, root)?);
@@ -389,8 +392,8 @@ mod tests {
         let mut tree = txn.write_tree()?;
         let mut dirty = txn.write_dirty()?;
 
-        assert_eq!(Mark::Watch, mark.get(&tree, Path::parse("foo/bar")?)?);
-        assert_eq!(Mark::Watch, mark.get(&tree, Path::parse("foo/qux")?)?);
+        assert_eq!(Mark::Default, mark.get(&tree, Path::parse("foo/bar")?)?);
+        assert_eq!(Mark::Default, mark.get(&tree, Path::parse("foo/qux")?)?);
 
         mark.set(&mut tree, &mut dirty, Path::parse("foo/bar")?, Mark::Keep)?;
         mark.set(&mut tree, &mut dirty, Path::parse("foo/qux")?, Mark::Own)?;
@@ -465,8 +468,7 @@ mod tests {
 
         mark.clear(&mut tree, &mut dirty, root)?;
 
-        // default
-        assert_eq!(Mark::Watch, mark.get(&tree, Path::parse("foo/bar/baz")?)?);
+        assert_eq!(Mark::Default, mark.get(&tree, Path::parse("foo/bar/baz")?)?);
 
         Ok(())
     }

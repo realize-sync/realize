@@ -12,7 +12,8 @@ struct MarkTableEntry {
 
 # Mark types for file operations.
 enum Mark {
-  watch @0;
+  default @0;
   keep @1;
   own @2;
+  watch @3;
 } 

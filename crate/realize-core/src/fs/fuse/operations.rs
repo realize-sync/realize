@@ -2242,11 +2242,11 @@ mod tests {
                 let dir_realpath = dir_path.within(&datadir);
 
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&dir_realpath, "realize.mark").await.unwrap()
                 );
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
                 );
 
@@ -2298,13 +2298,13 @@ mod tests {
                 let file_realpath = file_path.within(&datadir);
                 let dir_realpath = dir_path.within(&datadir);
 
-                // Initial state should be watch (derived)
+                // Initial state should be default (derived)
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&dir_realpath, "realize.mark").await.unwrap()
                 );
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
                 );
 
@@ -2348,13 +2348,13 @@ mod tests {
                 // Clear directory mark
                 setxattr(&dir_realpath, "realize.mark", "").await?;
 
-                // Both should now be watch (derived from arena root)
+                // Both should now be default (derived from arena root)
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&dir_realpath, "realize.mark").await.unwrap()
                 );
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
                 );
 
@@ -2402,7 +2402,7 @@ mod tests {
                 clearxattr(&file_realpath, "realize.mark").await.unwrap();
 
                 assert_eq!(
-                    Some("watch (derived)".to_string()),
+                    Some("default (derived)".to_string()),
                     getxattr(&file_realpath, "realize.mark").await.unwrap()
                 );
 
