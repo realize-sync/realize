@@ -25,6 +25,10 @@ interface Control {
   # create a new local arena
 
   removeArena @7 (req: RemoveArenaRequest) -> (res: Result(RemoveArenaResponse, RemoveArenaError));
+
+  listAttr @8 (req: ListAttrRequest) -> (res: Result(ListAttrResponse, AttrError));
+  getAttr @9 (req: GetAttrRequest) -> (res: Result(GetAttrResponse, AttrError));
+  setAttr @10 (req: SetAttrRequest) -> (res: Result(SetAttrResponse, AttrError));                             
 }
 
 struct PeerConnectionInfo {
@@ -194,3 +198,38 @@ struct SanityCheckIssue {
   }
 }
 
+struct AttrError {
+  union {
+    noSuchAttribute @0: Void;
+    invalidAttributeValue @1: Void;
+    unknownArena @2: Void;
+    pathNotFound @3: Void;
+  }
+}
+
+struct ListAttrRequest {
+  arena @0: Text;
+  path @1: Text;
+}
+
+struct ListAttrResponse {
+  attrs @0: List(Text);
+}
+
+struct GetAttrRequest {
+  attr @0: Text;
+  arena @1: Text;
+  path @2: Text;
+}
+struct GetAttrResponse {
+  value @0: Text;
+}
+
+struct SetAttrRequest {
+  attr @0: Text;
+  value @1: Text;
+  arena @2: Text;
+  path @3: Text;
+}
+struct SetAttrResponse {
+}                            

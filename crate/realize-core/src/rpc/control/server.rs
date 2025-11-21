@@ -7,9 +7,10 @@ use super::control_capnp::churten::{
 };
 use super::control_capnp::control::{
     self, ChurtenParams, ChurtenResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
-    DisconnectResults, GetMarkParams, GetMarkResults, KeepConnectedParams, KeepConnectedResults,
-    ListPeersParams, ListPeersResults, RemoveArenaParams, RemoveArenaResults, SetMarkParams,
-    SetMarkResults,
+    DisconnectResults, GetAttrParams, GetAttrResults, GetMarkParams, GetMarkResults,
+    KeepConnectedParams, KeepConnectedResults, ListAttrParams, ListAttrResults, ListPeersParams,
+    ListPeersResults, RemoveArenaParams, RemoveArenaResults, SetAttrParams, SetAttrResults,
+    SetMarkParams, SetMarkResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
@@ -239,6 +240,110 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
             Ok(())
         })
     }
+
+    fn list_attr(
+        &mut self,
+        params: ListAttrParams,
+        mut results: ListAttrResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let path = parse_path(req.get_path()?)?;
+            let res = results.get().init_res();
+            match storage.cache().list_xattrs((arena, path)).await {
+                Ok(attrs) => {
+                    let res = res.init_ok();
+                    let mut list = res.init_attrs(attrs.len() as u32);
+                    for (i, attr) in attrs.into_iter().enumerate() {
+                        if let Some(stripped) = attr.strip_prefix("realize.") {
+                            list.set(i as u32, stripped);
+                        } else {
+                            list.set(i as u32, attr);
+                        }
+                    }
+                }
+                Err(e) => fill_attr_error(e, res.init_err())?,
+            }
+            Ok(())
+        })
+    }
+
+    fn get_attr(
+        &mut self,
+        params: GetAttrParams,
+        mut results: GetAttrResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let path = parse_path(req.get_path()?)?;
+            let attr = format!("realize.{}", req.get_attr()?.to_str()?);
+
+            let res = results.get().init_res();
+            match storage.cache().get_xattr((arena, path), &attr).await {
+                Ok(v) => res.init_ok().set_value(&v),
+                Err(e) => fill_attr_error(e, res.init_err())?,
+            }
+            Ok(())
+        })
+    }
+
+    fn set_attr(
+        &mut self,
+        params: SetAttrParams,
+        mut results: SetAttrResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let req = params.get()?.get_req()?;
+            let arena = parse_arena(req.get_arena()?)?;
+            let path = parse_path(req.get_path()?)?;
+            let attr = format!("realize.{}", req.get_attr()?.to_str()?);
+            let value = req.get_value()?;
+
+            let res = results.get().init_res();
+            match storage
+                .cache()
+                .set_xattr((arena, path), &attr, value.to_str()?.into())
+                .await
+            {
+                Ok(()) => {
+                    res.init_ok();
+                }
+                Err(e) => fill_attr_error(e, res.init_err())?,
+            }
+
+            Ok(())
+        })
+    }
+}
+
+fn fill_attr_error(
+    err: StorageError,
+    mut res: control_capnp::attr_error::Builder<'_>,
+) -> Result<(), capnp::Error> {
+    match err {
+        StorageError::NoSuchAttribute => {
+            res.set_no_such_attribute(());
+        }
+        StorageError::InvalidAttributeValue => {
+            res.set_invalid_attribute_value(());
+        }
+        StorageError::UnknownArena(_) => {
+            res.set_unknown_arena(());
+        }
+        StorageError::NotFound => {
+            res.set_path_not_found(());
+        }
+        _ => {
+            return Err(from_storage_err(err));
+        }
+    }
+
+    Ok(())
 }
 
 fn fill_issue(
@@ -1416,6 +1521,209 @@ mod tests {
                     _ => panic!("Unexpected error from remove_arena"),
                 };
                 assert!(storage.arenas().is_empty());
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_attr() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                let mut request = control.list_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("");
+                let result = request.send().promise.await?;
+
+                let res = result.get()?.get_res()?;
+                let attrs = match res.which()? {
+                    result_capnp::result::Which::Ok(ok) => ok?.get_attrs()?,
+                    result_capnp::result::Which::Err(e) => panic!("RPC failed: {:?}", e),
+                };
+
+                // We expect "quota.max" and "quota.leave" for root, stripped of "realize."
+                let mut attr_vec: Vec<String> = Vec::new();
+                for attr in attrs.iter() {
+                    attr_vec.push(attr?.to_str()?.to_string());
+                }
+                attr_vec.sort();
+
+                assert!(attr_vec.contains(&"quota.max".to_string()));
+                assert!(attr_vec.contains(&"quota.leave".to_string()));
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_attr() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                // Set a mark first
+                storage.set_arena_mark(arena, Mark::Keep).await?;
+
+                let mut request = control.get_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("");
+                req.set_attr("mark");
+                let result = request.send().promise.await?;
+
+                let res = result.get()?.get_res()?;
+                match res.which()? {
+                    result_capnp::result::Which::Ok(ok) => {
+                        assert_eq!("keep", ok?.get_value()?.to_str()?);
+                    }
+                    result_capnp::result::Which::Err(e) => panic!("RPC failed: {:?}", e),
+                }
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_attr() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                let mut request = control.set_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("");
+                req.set_attr("mark");
+                req.set_value("own");
+                let result = request.send().promise.await?;
+
+                let res = result.get()?.get_res()?;
+                match res.which()? {
+                    result_capnp::result::Which::Ok(_) => {}
+                    result_capnp::result::Which::Err(e) => panic!("RPC failed: {:?}", e),
+                }
+
+                assert_eq!(Mark::Own, storage.get_arena_mark(arena).await?);
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attr_errors() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+
+                // Get unknown attribute
+                let mut request = control.get_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("");
+                req.set_attr("nonexistent");
+                let result = request.send().promise.await?;
+
+                let res = result.get()?.get_res()?;
+                match res.which()? {
+                    result_capnp::result::Which::Ok(_) => panic!("Expected error"),
+                    result_capnp::result::Which::Err(e) => match e?.which()? {
+                        control_capnp::attr_error::Which::NoSuchAttribute(_) => {}
+                        _ => panic!("Wrong error type"),
+                    },
+                }
+
+                // Set invalid value
+                let mut request = control.set_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path("");
+                req.set_attr("mark");
+                req.set_value("invalid_mark");
+                let result = request.send().promise.await?;
+
+                let res = result.get()?.get_res()?;
+                match res.which()? {
+                    result_capnp::result::Which::Ok(_) => panic!("Expected error"),
+                    result_capnp::result::Which::Err(e) => match e?.which()? {
+                        control_capnp::attr_error::Which::InvalidAttributeValue(_) => {}
+                        _ => panic!("Wrong error type"),
+                    },
+                }
 
                 Ok::<(), anyhow::Error>(())
             })
