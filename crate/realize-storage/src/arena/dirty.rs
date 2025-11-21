@@ -425,21 +425,27 @@ fn get_earliest_backoff(
 mod tests {
     use super::*;
     use crate::arena::db::ArenaDatabase;
+    use assert_fs::TempDir;
     use realize_types::{Arena, Path};
     use std::collections::HashSet;
     use std::sync::Arc;
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
+        _tempdir: TempDir,
     }
 
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
             let arena = Arena::from("myarena");
-            let db = ArenaDatabase::for_testing_no_blobs(arena)?;
+            let tempdir = TempDir::new()?;
+            let db = ArenaDatabase::for_testing(arena, tempdir.path())?;
 
-            Ok(Self { db })
+            Ok(Self {
+                db,
+                _tempdir: tempdir,
+            })
         }
     }
 

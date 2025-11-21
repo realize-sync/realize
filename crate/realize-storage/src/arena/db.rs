@@ -201,17 +201,6 @@ impl ArenaDatabase {
     const TEST_FILENAME: &str = ".realize_writetest";
 
     #[cfg(test)]
-    pub fn for_testing_no_blobs(arena: realize_types::Arena) -> Result<Arc<Self>, StorageError> {
-        Self::new(
-            crate::utils::redb_utils::in_memory()?,
-            arena,
-            std::path::Path::new("/dev/null"),
-            std::path::Path::new("/dev/null"),
-            PathSet::new(),
-        )
-    }
-
-    #[cfg(test)]
     pub fn for_testing(
         arena: realize_types::Arena,
         datadir: impl AsRef<std::path::Path>,
@@ -933,15 +922,19 @@ mod tests {
 
     struct Fixture {
         db: Arc<ArenaDatabase>,
+        _tempdir: TempDir,
     }
 
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
             let _ = env_logger::try_init();
+            let tempdir = TempDir::new()?;
+            let db = ArenaDatabase::for_testing(Arena::from("myarena"), tempdir.path())?;
 
-            let db = ArenaDatabase::for_testing_no_blobs(Arena::from("myarena"))?;
-
-            Ok(Self { db })
+            Ok(Self {
+                db,
+                _tempdir: tempdir,
+            })
         }
     }
 
