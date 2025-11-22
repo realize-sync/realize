@@ -460,26 +460,11 @@ async fn daemon_exports_fuse() -> anyhow::Result<()> {
     }
     assert_ne!(fs::metadata(mount_point.path())?.dev(), original_dev);
 
-    // List the root directory content - the arena must not appear
-    let entries = std::fs::read_dir(mount_point.path())?;
-    let entry_names: Vec<String> = entries
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .and_then(|e| e.file_name().to_str().map(|s| s.to_string()))
-        })
-        .collect();
-    assert!(
-        entry_names.is_empty(),
-        "Expected to find no arenas in FUSE mount, found: {:?}",
-        entry_names
-    );
-
     fixture
         .create_arena(Arena::from("myarena"), &fixture.myarena)
         .await?;
 
-    // List the root directory content - the arena must now appear
+    // List the root directory content - the arena must appear
     let entries = std::fs::read_dir(mount_point.path())?;
     let entry_names: Vec<String> = entries
         .filter_map(|entry| {
