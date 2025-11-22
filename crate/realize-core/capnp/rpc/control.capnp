@@ -9,26 +9,25 @@ $Rust.parentModule("rpc::control");
 interface Control {
   churten @0 () -> (churten: Churten);
 
-  setMark @1 (req: SetMarkRequest) -> ();
-  getMark @2 (req: GetMarkRequest) -> (res: GetMarkResponse);
 
-  listPeers @3 () -> (res:List(PeerConnectionInfo));
+
+  listPeers @1 () -> (res:List(PeerConnectionInfo));
   # list peers and their connection status
   
-  keepConnected @4 (peer: Text) -> ();
+  keepConnected @2 (peer: Text) -> ();
   # attempt to keep connected to the given peer
   
-  disconnect @5 (peer: Text) -> ();
+  disconnect @3 (peer: Text) -> ();
   # disconnect to the given peer or stop trying to connect
 
-  createArena @6 (req: CreateArenaRequest) -> (res: Result(CreateArenaResponse, CreateArenaError));
+  createArena @4 (req: CreateArenaRequest) -> (res: Result(CreateArenaResponse, CreateArenaError));
   # create a new local arena
 
-  removeArena @7 (req: RemoveArenaRequest) -> (res: Result(RemoveArenaResponse, RemoveArenaError));
+  removeArena @5 (req: RemoveArenaRequest) -> (res: Result(RemoveArenaResponse, RemoveArenaError));
 
-  listAttr @8 (req: ListAttrRequest) -> (res: Result(ListAttrResponse, AttrError));
-  getAttr @9 (req: GetAttrRequest) -> (res: Result(GetAttrResponse, AttrError));
-  setAttr @10 (req: SetAttrRequest) -> (res: Result(SetAttrResponse, AttrError));                             
+  listAttr @6 (req: ListAttrRequest) -> (res: Result(ListAttrResponse, AttrError));
+  getAttr @7 (req: GetAttrRequest) -> (res: Result(GetAttrResponse, AttrError));
+  setAttr @8 (req: SetAttrRequest) -> (res: Result(SetAttrResponse, AttrError));                             
 }
 
 struct PeerConnectionInfo {
@@ -37,27 +36,7 @@ struct PeerConnectionInfo {
   keepConnected @2:Bool; # if true, the server will keep trying to connect
 }
 
-struct SetMarkRequest {
-  arena @0: Text;
-  path @1: Text;  # Optional: if empty, sets arena mark
-  mark @2: Mark;
-}
 
-struct GetMarkRequest {
-  arena @0: Text;
-  path @1: Text;  # Optional: if empty, gets arena mark
-}
-
-struct GetMarkResponse {
-  mark @0: Mark;
-}
-
-enum Mark {
-  default @0;
-  watch @3;
-  keep @1;
-  own @2;
-}
 
 interface Churten {
   subscribe @0 (subscriber: Subscriber) -> ();

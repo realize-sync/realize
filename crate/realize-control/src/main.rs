@@ -11,7 +11,7 @@ mod arena_cmd;
 mod attr_cmd;
 mod churten_cmd;
 mod display;
-mod mark_cmd;
+
 mod output;
 mod peer_cmd;
 
@@ -41,10 +41,7 @@ enum Commands {
         #[command(subcommand)]
         command: ChurtenCommands,
     },
-    Mark {
-        #[command(subcommand)]
-        command: MarkCommands,
-    },
+
     Peer {
         #[command(subcommand)]
         command: PeerCommands,
@@ -75,26 +72,7 @@ enum ChurtenCommands {
     Run,
 }
 
-#[derive(Subcommand, Debug)]
-enum MarkCommands {
-    /// Set marks on paths or arena
-    Set {
-        /// The mark to set (watch, keep, own)
-        #[arg(value_enum)]
-        mark: mark_cmd::MarkValue,
-        /// The arena name
-        arena: String,
-        /// Paths to mark (optional - if not provided, sets arena mark)
-        paths: Vec<String>,
-    },
-    /// Get marks for paths
-    Get {
-        /// The arena name
-        arena: String,
-        /// Paths to get marks for
-        paths: Vec<String>,
-    },
-}
+
 
 #[derive(Subcommand, Debug)]
 enum PeerCommands {
@@ -246,16 +224,7 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                     }
                 },
 
-                Commands::Mark { command } => match command {
-                    MarkCommands::Set { mark, arena, paths } => {
-                        mark_cmd::execute_mark_set(&control, &mark, &arena, &paths, cli.output)
-                            .await
-                    }
 
-                    MarkCommands::Get { arena, paths } => {
-                        mark_cmd::execute_mark_get(&control, &arena, &paths, cli.output).await
-                    }
-                },
 
                 Commands::Peer { command } => match command {
                     PeerCommands::Query => peer_cmd::execute_peer_query(&control, cli.output).await,
