@@ -86,7 +86,7 @@ impl Fixture {
         cmd.arg("--socket")
             .arg(&self.socket)
             .args(args)
-            .env("RUST_LOG", "realize_")
+            .env("RUST_LOG", "debug")
             .kill_on_drop(true);
 
         Ok(cmd)
@@ -549,6 +549,119 @@ async fn arena_remove() -> anyhow::Result<()> {
             assert!(fixture.setup.storage.arenas().is_empty());
             assert!(fixture.arena_dir.exists());
             assert!(!fixture.arena_dir.child(".realize").exists());
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_get_list_file_attr() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
+    fixture.add_file_to_cache("file2.txt").await?;
+
+    local
+        .run_until(async move {
+            // 1. Set attribute
+            let output = fixture
+                .control_command(&[
+                    "attr",
+                    "set",
+                    "mark",
+                    "keep",
+                    "myarena",
+                    "file1.txt",
+                    "file2.txt",
+                ])?
+                .output()
+                .await?;
+            assert!(output.status.success(), "Attr set failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(
+                outstr.contains("OK [myarena]/file1.txt: attribute set\n"),
+                "{output:?}"
+            );
+            assert!(
+                outstr.contains("OK [myarena]/file2.txt: attribute set\n"),
+                "{output:?}"
+            );
+
+            // 2. Get attribute
+            let output = fixture
+                .control_command(&["attr", "get", "mark", "myarena", "file1.txt", "file2.txt"])?
+                .output()
+                .await?;
+            assert!(output.status.success(), "Attr get failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(
+                outstr.contains("[myarena]/file1.txt: mark=keep\n"),
+                "{output:?}"
+            );
+            assert!(
+                outstr.contains("[myarena]/file2.txt: mark=keep\n"),
+                "{output:?}"
+            );
+
+            // 3. List attributes
+            let output = fixture
+                .control_command(&["attr", "list", "myarena", "file1.txt", "file2.txt"])?
+                .output()
+                .await?;
+
+            assert!(output.status.success(), "Attr list failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(outstr.contains("[myarena]/file1.txt: "), "{output:?}");
+            assert!(outstr.contains("[myarena]/file2.txt: "), "{output:?}");
+            assert!(outstr.contains("mark, "), "{output:?}");
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_get_list_arena_attr() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+    fixture.add_file_to_cache("file1.txt").await?;
+
+    local
+        .run_until(async move {
+            // 1. Set attribute
+            let output = fixture
+                .control_command(&["attr", "set", "mark", "keep", "myarena"])?
+                .output()
+                .await?;
+            assert!(output.status.success(), "Attr set failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(
+                outstr.contains("OK [myarena]: attribute set\n"),
+                "{output:?}"
+            );
+
+            // 2. Get attribute
+            let output = fixture
+                .control_command(&["attr", "get", "mark", "myarena"])?
+                .output()
+                .await?;
+            assert!(output.status.success(), "Attr get failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(outstr.contains("[myarena]: mark=keep\n"), "{output:?}");
+
+            // 3. List attributes
+            let output = fixture
+                .control_command(&["attr", "list", "myarena"])?
+                .output()
+                .await?;
+
+            assert!(output.status.success(), "Attr list failed: {output:?}",);
+            let outstr = str::from_utf8(&output.stdout)?;
+            assert!(outstr.contains("[myarena]: "), "{output:?}");
+            assert!(outstr.contains(", quota"), "{output:?}");
 
             Ok::<_, anyhow::Error>(())
         })

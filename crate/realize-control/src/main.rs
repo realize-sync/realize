@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use tokio::task::LocalSet;
 
 mod arena_cmd;
+mod attr_cmd;
 mod churten_cmd;
 mod display;
 mod mark_cmd;
@@ -51,6 +52,11 @@ enum Commands {
     Arena {
         #[command(subcommand)]
         command: ArenaCommands,
+    },
+    /// Attributes
+    Attr {
+        #[command(subcommand)]
+        command: AttrCommands,
     },
 }
 
@@ -132,6 +138,34 @@ enum ArenaCommands {
         /// Keep the arena database, so it can be re-added later.
         #[arg(long)]
         keep_database: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AttrCommands {
+    /// List available attributes on an arena, directory or file.
+    ///
+    /// If no paths is given, the command applies to the arena, otherwise
+    /// it applies to each given path within the arena.
+    List { arena: String, paths: Vec<String> },
+    /// Get the value of an attributes in an arena, directories or files
+    ///
+    /// If no paths is given, the command applies to the arena, otherwise
+    /// it applies to each given path within the arena.
+    Get {
+        attr: String,
+        arena: String,
+        paths: Vec<String>,
+    },
+    /// Set the value of an attribute in an arena, directories or files
+    ///
+    /// If no paths is given, the command applies to the arena, otherwise
+    /// it applies to each given path within the arena.
+    Set {
+        attr: String,
+        value: String,
+        arena: String,
+        paths: Vec<String>,
     },
 }
 
@@ -247,6 +281,26 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                             &name,
                             delete_files,
                             keep_database,
+                        )
+                        .await
+                    }
+                },
+                Commands::Attr { command } => match command {
+                    AttrCommands::List { arena, paths } => {
+                        attr_cmd::execute_attr_list(&control, cli.output, &arena, &paths).await
+                    }
+                    AttrCommands::Get { attr, arena, paths } => {
+                        attr_cmd::execute_attr_get(&control, cli.output, &attr, &arena, &paths)
+                            .await
+                    }
+                    AttrCommands::Set {
+                        attr,
+                        value,
+                        arena,
+                        paths,
+                    } => {
+                        attr_cmd::execute_attr_set(
+                            &control, cli.output, &attr, &value, &arena, &paths,
                         )
                         .await
                     }
