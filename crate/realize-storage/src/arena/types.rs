@@ -5,7 +5,8 @@ use crate::utils::holder::{ByteConversionError, ByteConvertible, NamedType};
 use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
-use redb::{Key, Value};
+use redb::{Key, TypeName, Value};
+use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -1578,6 +1579,124 @@ fn parse_bytes_or_percent(
     }
 }
 
+/// ID of a blob, stored in the database.
+///
+/// A [BlobId] is the combination of a [PathId] with an arbitrary
+/// index. The [BlobId] with index 0 is the active blob of the
+/// corresponding [PathId], with ids with indexes > 0 are backups or
+/// trashed version of files on that path.
+///
+/// When stored in a redb table, [BlobId]s are grouped by [PathId].
+/// Use [BlobId::range] to get the range of blob ids that correspond
+/// to a [PathId].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct BlobId(u64);
+
+impl BlobId {
+    /// An invalid [BlobId] that correspond to an invalid [PathId], [PathId::ZERO].
+    pub(crate) const INVALID: BlobId = BlobId(0);
+
+    /// Number of bits in a u64 allocated to the index.
+    pub(crate) const INDEX_NUMBITS: u32 = 64 - PathId::NUMBITS;
+
+    /// Maximum allowed index value as well as index mask.
+    pub(crate) const MAX_INDEX: u8 = ((!PathId::MASK >> PathId::NUMBITS) & 0xff) as u8;
+
+    /// Return the [BlobId] with index 0 for the given [PathId].
+    pub(crate) fn from_pathid(pathid: PathId) -> Self {
+        BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS)
+    }
+
+    /// Return a range that covers all [BlobId]s for the given [PathId].
+    pub(crate) fn pathid_range(pathid: PathId) -> Range<BlobId> {
+        Range {
+            start: BlobId::from_pathid(pathid),
+            end: BlobId::from_pathid(pathid.plus(1)),
+        }
+    }
+
+    /// Return a [BlobId] with the same [PathId] and an increased index.
+    ///
+    /// Return `None` if
+    pub(crate) fn next_index(&self) -> Option<BlobId> {
+        if self.index() < BlobId::MAX_INDEX {
+            Some(BlobId(
+                (self.0 & !(BlobId::MAX_INDEX as u64)) | (self.index() + 1) as u64,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Return the [PathId] that correspond to this [BlobId].
+    pub(crate) fn pathid(&self) -> PathId {
+        PathId(self.0 >> BlobId::INDEX_NUMBITS)
+    }
+
+    /// Return the index of this [BlobId]
+    pub(crate) fn index(&self) -> u8 {
+        (self.0 & (BlobId::MAX_INDEX as u64) & 0xff) as u8
+    }
+}
+
+impl std::fmt::Display for BlobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.pathid().hex())?;
+        let index = self.index();
+        if index > 0 {
+            write!(f, "_{:02x}", index)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for BlobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BlobId({:?}, {:?})", self.pathid(), self.index())
+    }
+}
+
+impl Key for BlobId {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        let value1 = u64::from_le_bytes(data1.try_into().unwrap_or([0; 8]));
+        let value2 = u64::from_le_bytes(data2.try_into().unwrap_or([0; 8]));
+        value1.cmp(&value2)
+    }
+}
+
+impl Value for BlobId {
+    type SelfType<'a> = BlobId;
+    type AsBytes<'a>
+        = [u8; 8]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        Some(8)
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> BlobId
+    where
+        Self: 'a,
+    {
+        data.try_into()
+            .map(|bytes| BlobId(<u64>::from_le_bytes(bytes)))
+            .unwrap_or(BlobId::INVALID)
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> [u8; 8]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value.0.to_le_bytes()
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new("BlobId")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::DiskUsageConfig;
@@ -2103,5 +2222,95 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn blobid_with_index() {
+        let pathid = PathId(123);
+        let blobid = BlobId::from_pathid(pathid);
+        assert_eq!(pathid, blobid.pathid());
+        assert_eq!(0, blobid.index());
+
+        let one = blobid.next_index().unwrap();
+        assert_eq!(pathid, one.pathid());
+        assert_eq!(1, one.index());
+
+        let mut last = one;
+        while let Some(next) = last.next_index() {
+            last = next;
+        }
+        assert_eq!(pathid, last.pathid());
+        assert_eq!(BlobId::MAX_INDEX, last.index());
+    }
+
+    #[test]
+    fn blobid_range() {
+        assert_eq!(
+            Range {
+                start: BlobId::from_pathid(PathId(100)),
+                end: BlobId::from_pathid(PathId(101))
+            },
+            BlobId::pathid_range(PathId(100))
+        );
+    }
+
+    #[test]
+    fn blobid_to_string() {
+        let blobid = BlobId::from_pathid(PathId(123));
+        assert_eq!("000000000000007b", blobid.to_string());
+        assert_eq!(
+            "000000000000007b_01",
+            blobid.next_index().unwrap().to_string()
+        );
+        assert_eq!(
+            "000000000000007b_02",
+            blobid
+                .next_index()
+                .unwrap()
+                .next_index()
+                .unwrap()
+                .to_string()
+        )
+    }
+
+    #[test]
+    fn blobid_redb_key() {
+        let id100 = BlobId::from_pathid(PathId(100));
+        let id200 = BlobId::from_pathid(PathId(200));
+        let other_id100 = BlobId::from_pathid(PathId(100));
+
+        let data1 = BlobId::as_bytes(&id100);
+        let data2 = BlobId::as_bytes(&id200);
+        let data3 = BlobId::as_bytes(&other_id100);
+
+        assert_eq!(BlobId::compare(&data1, &data2), std::cmp::Ordering::Less);
+        assert_eq!(BlobId::compare(&data2, &data1), std::cmp::Ordering::Greater);
+        assert_eq!(BlobId::compare(&data1, &data3), std::cmp::Ordering::Equal);
+
+        let id100_1 = id100.next_index().unwrap();
+        let id100_2 = id100_1.next_index().unwrap();
+        let id101 = BlobId::from_pathid(PathId(101));
+
+        assert_eq!(
+            BlobId::compare(&BlobId::as_bytes(&id100), &BlobId::as_bytes(&id100_1)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            BlobId::compare(&BlobId::as_bytes(&id100_1), &BlobId::as_bytes(&id100_2)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            BlobId::compare(&BlobId::as_bytes(&id100_2), &BlobId::as_bytes(&id101)),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn blobid_redb_value() {
+        let original = BlobId::from_pathid(PathId(12345)).next_index().unwrap();
+        let bytes = BlobId::as_bytes(&original);
+        let restored = BlobId::from_bytes(&bytes);
+
+        assert_eq!(original, restored);
     }
 }

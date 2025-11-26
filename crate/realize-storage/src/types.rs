@@ -12,7 +12,9 @@ use redb::{Key, TypeName, Value};
 pub struct InodePrefix(u8);
 
 impl InodePrefix {
-    pub(crate) const MASK: u64 = 0x00ffffffffffffff;
+    /// Number of bits, out of 64, available for the prefix.
+    pub const NUMBITS: u32 = 64 - PathId::NUMBITS;
+
     pub const ZERO: InodePrefix = InodePrefix(0);
 
     pub fn from_u8(val: u8) -> InodePrefix {
@@ -30,7 +32,7 @@ impl InodePrefix {
 
 impl From<u64> for InodePrefix {
     fn from(value: u64) -> Self {
-        InodePrefix((value >> 56) as u8)
+        InodePrefix((value >> PathId::NUMBITS) as u8)
     }
 }
 
@@ -64,6 +66,12 @@ impl std::fmt::Debug for InodePrefix {
 pub struct PathId(pub u64);
 
 impl PathId {
+    /// Number of usable bits, from a u64, in a PathId.
+    pub const NUMBITS: u32 = 56;
+
+    /// Usable portion of a u64 for a `PathId`, must be in sync with [PathId::NUMBITS].
+    pub const MASK: u64 = 0x00ffffffffffffff;
+
     /// An invalid path id.
     pub const ZERO: PathId = PathId(0);
 
@@ -71,7 +79,7 @@ impl PathId {
     pub const ROOT: PathId = PathId(1);
 
     /// Maximum allowed pathid value.
-    pub const MAX: PathId = PathId(InodePrefix::MASK);
+    pub const MAX: PathId = PathId(PathId::MASK);
 
     /// Return true if this is the special path id 1, which identifies
     /// a root.
@@ -193,7 +201,7 @@ impl Inode {
 
     /// Create a new Inode from a u64 value.
     pub fn new(prefix: InodePrefix, partial: PartialInode) -> Self {
-        Self(prefix.as_u64() | (partial.as_u64() & InodePrefix::MASK))
+        Self(prefix.as_u64() | (partial.as_u64() & PathId::MASK))
     }
 
     /// Check whether the corresponding [PartialInode] is a root.
@@ -203,7 +211,7 @@ impl Inode {
 
     /// Return the [PartialInode] that's part of this inode.
     pub fn partial(&self) -> PartialInode {
-        PartialInode(self.0 & InodePrefix::MASK)
+        PartialInode(self.0 & PathId::MASK)
     }
 
     /// Return the inode prefix
