@@ -2,7 +2,7 @@ use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
 use super::mark::{MarkExt, MarkReadOperations};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
-use super::types::{BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
+use super::types::{BlobId, BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
 use crate::arena::cache::CacheReadOperations;
 use crate::arena::db::Tag;
 use crate::types::PathId;
@@ -142,7 +142,7 @@ impl Blobs {
 
 pub(crate) struct ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     blob_table: T,
@@ -152,7 +152,7 @@ where
 
 impl<T, TQ> ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     pub(crate) fn new(blob_table: T, blob_lru_queue_table: TQ) -> Self {
@@ -167,7 +167,7 @@ pub(crate) struct WritableOpenBlob<'a> {
     tag: Tag,
     before_commit: &'a BeforeCommit,
 
-    blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
+    blob_table: Table<'a, BlobId, Holder<'static, BlobTableEntry>>,
     blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
     subsystem: &'a Blobs,
 
@@ -183,7 +183,7 @@ impl<'a> WritableOpenBlob<'a> {
         tag: Tag,
         blobs: &Blobs,
         before_commit: &'a BeforeCommit,
-        blob_table: Table<'a, PathId, Holder<'static, BlobTableEntry>>,
+        blob_table: Table<'a, BlobId, Holder<'static, BlobTableEntry>>,
         blob_lru_queue_table: Table<'a, u16, Holder<'static, QueueTableEntry>>,
         subsystem: &'a Blobs,
     ) -> Self {
@@ -325,7 +325,7 @@ pub(crate) trait BlobReadOperations {
 
 impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
 where
-    T: ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
     fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
@@ -450,7 +450,7 @@ impl<'a> WritableOpenBlob<'a> {
         size: u64,
     ) -> Result<(PathId, PathBuf, BlobTableEntry), StorageError> {
         let pathid = tree.setup(loc)?;
-        let existing_entry = if let Some(e) = self.blob_table.get(pathid)? {
+        let existing_entry = if let Some(e) = self.blob_table.get(BlobId::from_pathid(pathid))? {
             Some(e.value().parse()?)
         } else {
             None
@@ -482,7 +482,12 @@ impl<'a> WritableOpenBlob<'a> {
             "[{}] Created blob {pathid} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
             self.tag
         );
-        tree.insert_and_incref(pathid, &mut self.blob_table, pathid, Holder::new(&entry)?)?;
+        tree.insert_and_incref(
+            pathid,
+            &mut self.blob_table,
+            BlobId::from_pathid(pathid),
+            Holder::new(&entry)?,
+        )?;
         Ok((pathid, blob_path, entry))
     }
 
@@ -545,7 +550,7 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(()), // Nothing to modify
         };
 
-        let mut blob_entry = match self.blob_table.get(pathid)? {
+        let mut blob_entry = match self.blob_table.get(BlobId::from_pathid(pathid))? {
             None => {
                 return Ok(());
             }
@@ -569,8 +574,10 @@ impl<'a> WritableOpenBlob<'a> {
         self.add_to_queue_front(new_queue, pathid, &mut blob_entry)?;
 
         // Update the entry in the table
-        self.blob_table
-            .insert(pathid, Holder::with_content(blob_entry)?)?;
+        self.blob_table.insert(
+            BlobId::from_pathid(pathid),
+            Holder::with_content(blob_entry)?,
+        )?;
         dirty.mark_dirty(pathid, "set_protected")?;
         self.report_disk_usage_changed();
 
@@ -629,7 +636,7 @@ impl<'a> WritableOpenBlob<'a> {
         entry.verified = false;
         self.update_disk_usage(&mut entry, metadata)?;
         self.blob_table
-            .insert(pathid, Holder::with_content(entry)?)?;
+            .insert(BlobId::from_pathid(pathid), Holder::with_content(entry)?)?;
         self.report_disk_usage_changed();
 
         // Return the path where the file should be moved
@@ -643,7 +650,7 @@ impl<'a> WritableOpenBlob<'a> {
     ///
     /// Does nothing if the blob doesn't exist.
     fn mark_accessed(&mut self, pathid: PathId) -> Result<(), StorageError> {
-        let mut blob_entry = match self.blob_table.get(pathid)? {
+        let mut blob_entry = match self.blob_table.get(BlobId::from_pathid(pathid))? {
             None => {
                 return Ok(());
             }
@@ -659,8 +666,10 @@ impl<'a> WritableOpenBlob<'a> {
         self.move_to_front(pathid, &mut blob_entry)?;
 
         // Update the entry in the table
-        self.blob_table
-            .insert(pathid, Holder::with_content(blob_entry)?)?;
+        self.blob_table.insert(
+            BlobId::from_pathid(pathid),
+            Holder::with_content(blob_entry)?,
+        )?;
 
         Ok(())
     }
@@ -682,7 +691,7 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(false), // Nothing to mark
         };
 
-        let mut blob_entry = match self.blob_table.get(pathid)? {
+        let mut blob_entry = match self.blob_table.get(BlobId::from_pathid(pathid))? {
             None => {
                 return Ok(false);
             }
@@ -694,8 +703,10 @@ impl<'a> WritableOpenBlob<'a> {
             blob_entry.verified = true;
             log::debug!("[{}] {pathid} content verified to be {hash}", self.tag);
 
-            self.blob_table
-                .insert(pathid, Holder::with_content(blob_entry)?)?;
+            self.blob_table.insert(
+                BlobId::from_pathid(pathid),
+                Holder::with_content(blob_entry)?,
+            )?;
             dirty.mark_dirty(pathid, "verified")?;
             return Ok(true);
         }
@@ -736,8 +747,10 @@ impl<'a> WritableOpenBlob<'a> {
             self.report_disk_usage_changed();
         }
 
-        self.blob_table
-            .insert(pathid, Holder::with_content(blob_entry)?)?;
+        self.blob_table.insert(
+            BlobId::from_pathid(pathid),
+            Holder::with_content(blob_entry)?,
+        )?;
 
         Ok(true)
     }
@@ -782,7 +795,11 @@ impl<'a> WritableOpenBlob<'a> {
             );
             self.remove_from_queue_update_entry(&current, &mut queue)?;
             removed_count += 1;
-            tree.remove_and_decref(current_id, &mut self.blob_table, current_id)?;
+            tree.remove_and_decref(
+                current_id,
+                &mut self.blob_table,
+                BlobId::from_pathid(current_id),
+            )?;
 
             // Remove the blob file
             let blob_path = self.subsystem.blob_dir.join(current_id.hex());
@@ -835,7 +852,7 @@ impl<'a> WritableOpenBlob<'a> {
             head.prev = Some(pathid);
 
             self.blob_table
-                .insert(head_id, Holder::with_content(head)?)?;
+                .insert(BlobId::from_pathid(head_id), Holder::with_content(head)?)?;
         } else {
             // This is the first node in the queue, so both the head
             // and the tail
@@ -871,7 +888,7 @@ impl<'a> WritableOpenBlob<'a> {
             let mut prev = follow_queue_link(&self.blob_table, prev_id)?;
             prev.next = blob_entry.next;
             self.blob_table
-                .insert(prev_id, Holder::with_content(prev)?)?;
+                .insert(BlobId::from_pathid(prev_id), Holder::with_content(prev)?)?;
         } else {
             // This was the first node
             queue.head = blob_entry.next;
@@ -880,7 +897,7 @@ impl<'a> WritableOpenBlob<'a> {
             let mut next = follow_queue_link(&self.blob_table, next_id)?;
             next.prev = blob_entry.prev;
             self.blob_table
-                .insert(next_id, Holder::with_content(next)?)?;
+                .insert(BlobId::from_pathid(next_id), Holder::with_content(next)?)?;
         } else {
             // This was the last node
             queue.tail = blob_entry.prev;
@@ -925,7 +942,7 @@ impl<'a> WritableOpenBlob<'a> {
     ) -> Result<bool, StorageError> {
         if let Some(entry) = get_blob_entry(&self.blob_table, pathid)? {
             self.remove_from_queue(&entry)?;
-            tree.remove_and_decref(pathid, &mut self.blob_table, pathid)?;
+            tree.remove_and_decref(pathid, &mut self.blob_table, BlobId::from_pathid(pathid))?;
             return Ok(true);
         }
 
@@ -955,7 +972,7 @@ impl<'a> WritableOpenBlob<'a> {
 #[allow(dead_code)]
 pub(crate) struct QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
 {
     blob_table: &'a T,
     err: Option<StorageError>,
@@ -966,7 +983,7 @@ where
 #[allow(dead_code)]
 impl<'a, T> QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
 {
     fn head(
         blob_table: &'a T,
@@ -1007,7 +1024,7 @@ where
 
 impl<'a, T> Iterator for QueueIterator<'a, T>
 where
-    T: redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    T: redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
 {
     type Item = Result<PathId, StorageError>;
 
@@ -1080,10 +1097,10 @@ fn get_queue_must_exist(
 }
 
 fn get_blob_entry(
-    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<BlobTableEntry>, StorageError> {
-    if let Some(entry) = blob_table.get(pathid)? {
+    if let Some(entry) = blob_table.get(BlobId::from_pathid(pathid))? {
         Ok(Some(entry.value().parse()?))
     } else {
         Ok(None)
@@ -1091,7 +1108,7 @@ fn get_blob_entry(
 }
 
 fn follow_queue_link(
-    blob_table: &impl redb::ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     pathid: PathId,
 ) -> Result<BlobTableEntry, StorageError> {
     get_blob_entry(blob_table, pathid)?
@@ -1449,10 +1466,10 @@ impl AsyncSeek for Blob {
 }
 
 fn get_read_op(
-    blob_table: &impl ReadableTable<PathId, Holder<'static, BlobTableEntry>>,
+    blob_table: &impl ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     pathid: PathId,
 ) -> Result<Option<BlobInfo>, StorageError> {
-    if let Some(e) = blob_table.get(pathid)? {
+    if let Some(e) = blob_table.get(BlobId::from_pathid(pathid))? {
         Ok(Some(BlobInfo::new(pathid, e.value().parse()?)))
     } else {
         Ok(None)

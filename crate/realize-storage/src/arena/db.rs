@@ -6,7 +6,7 @@ use super::mark::{MarkReadOperations, ReadableOpenMark, WritableOpenMark};
 use super::peer::{PeersReadOperations, ReadableOpenPeers, WritableOpenPeers};
 use super::settings::{Settings, WritableOpenSettings};
 use super::tree::{ReadableOpenTree, Tree, TreeReadOperations, WritableOpenTree};
-use super::types::Layer;
+use super::types::{BlobId, Layer};
 use super::types::{
     BlobTableEntry, CacheTableEntry, FailedJobTableEntry, HistoryTableEntry, MarkTableEntry,
     PeerTableEntry, QueueTableEntry,
@@ -99,7 +99,7 @@ const NOTIFICATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("not
 ///
 /// Key: BlodId
 /// Value: BlobTableEntry
-const BLOB_TABLE: TableDefinition<PathId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
+const BLOB_TABLE: TableDefinition<BlobId, Holder<BlobTableEntry>> = TableDefinition::new("blob");
 
 /// Track the next blob ID to be allocated.
 ///

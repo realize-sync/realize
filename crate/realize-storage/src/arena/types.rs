@@ -1639,6 +1639,12 @@ impl BlobId {
     }
 }
 
+impl From<PathId> for BlobId {
+    fn from(value: PathId) -> Self {
+        BlobId::from_pathid(value)
+    }
+}
+
 impl std::fmt::Display for BlobId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.pathid().hex())?;
