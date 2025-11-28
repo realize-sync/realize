@@ -3,6 +3,8 @@
 using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
 
+using import "version.capnp".Version;
+
 # A new simplified DirTableEntry that only contains mtime
 struct DirtableEntry {
   mtime @0: Time;
@@ -21,11 +23,10 @@ struct CacheTableEntry {
 struct FileTableEntry {
   size @0: UInt64;
   mtime @1: Time;
-  hash @2: Data;
+  version @2: Version;
   branchedFrom @3: UInt64; # 0 for None
   local @4: Bool;
-  modified @5: Bool;
-  special @6: Bool;
+  special @5: Bool;
 }
 
 struct PeerTableEntry {

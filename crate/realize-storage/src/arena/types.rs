@@ -54,6 +54,13 @@ mod engine_capnp {
 mod settings_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/settings_capnp.rs"));
 }
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
+mod version_capnp {
+    include!(concat!(env!("OUT_DIR"), "/arena/version_capnp.rs"));
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FileRealm {
@@ -280,7 +287,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let reader: blob_capnp::blob_table_entry::Reader =
             message_reader.get_root::<blob_capnp::blob_table_entry::Reader>()?;
 
-        let version = parse_version(reader)?;
+        let version = parse_version(reader.get_version()?)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
             Some(PathId(next_value))
@@ -331,7 +338,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
 }
 
 /// Fill a [Version] message from capnp.
-fn fill_version(mut version_builder: blob_capnp::version::Builder<'_>, version: &Version) {
+fn fill_version(mut version_builder: version_capnp::version::Builder<'_>, version: &Version) {
     match version {
         Version::Modified(None) => {
             version_builder.init_modified();
@@ -347,10 +354,10 @@ fn fill_version(mut version_builder: blob_capnp::version::Builder<'_>, version: 
 
 /// Parse a [Version] from capnp.
 fn parse_version(
-    reader: blob_capnp::blob_table_entry::Reader<'_>,
+    reader: version_capnp::version::Reader<'_>,
 ) -> Result<Version, ByteConversionError> {
-    let version = match reader.get_version()?.which()? {
-        blob_capnp::version::Which::Modified(version) => {
+    let version = match reader.which()? {
+        version_capnp::version::Which::Modified(version) => {
             let version = version?;
             Version::Modified(if version.has_hash() {
                 Some(parse_hash(version.get_hash()?)?)
@@ -358,7 +365,7 @@ fn parse_version(
                 None
             })
         }
-        blob_capnp::version::Which::Indexed(hash) => Version::Indexed(parse_hash(hash?)?),
+        version_capnp::version::Which::Indexed(hash) => Version::Indexed(parse_hash(hash?)?),
     };
     Ok(version)
 }
@@ -1024,17 +1031,6 @@ fn fill_file_table_entry(
     let mut mtime = builder.reborrow().init_mtime();
     mtime.set_secs(entry.mtime.as_secs());
     mtime.set_nsecs(entry.mtime.subsec_nanos());
-    match &entry.version {
-        Version::Modified(base) => {
-            builder.set_modified(true);
-            if let Some(hash) = base {
-                builder.set_hash(&hash.0);
-            }
-        }
-        Version::Indexed(hash) => {
-            builder.set_hash(&hash.0);
-        }
-    }
 
     // Convert the new enum back to the old capnp fields for compatibility
     match entry.kind {
@@ -1050,6 +1046,7 @@ fn fill_file_table_entry(
             builder.set_branched_from(PathId::from_optional(Some(pathid)));
         }
     }
+    fill_version(builder.init_version(), &entry.version);
 }
 
 fn parse_file_table_entry(
@@ -1067,15 +1064,7 @@ fn parse_file_table_entry(
         FileEntryKind::RemoteFile
     };
 
-    let version = if msg.get_modified() {
-        Version::Modified(if msg.has_hash() {
-            Some(parse_hash(msg.get_hash()?)?)
-        } else {
-            None
-        })
-    } else {
-        Version::Indexed(parse_hash(msg.get_hash()?)?)
-    };
+    let version = parse_version(msg.get_version()?)?;
 
     Ok(FileTableEntry {
         size: msg.get_size(),

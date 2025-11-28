@@ -1,9 +1,9 @@
-# An entry in the directory table.
-
 @0xe1b5a79fba1782e8;
 
 using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
+
+using import "version.capnp".Version;
 
 # An entry in the blob table.
 struct BlobTableEntry {
@@ -29,17 +29,6 @@ struct BlobTableEntry {
 
   # Disk usage in bytes
   diskUsage @5: UInt64;
-}
-
-struct Version {
-  union {
-    modified @0 :ModifiedVersion;
-    indexed @1 :Data;
-  }
-}
-
-struct ModifiedVersion {
-  hash @0: Data;
 }
 
 # A sequence of byte ranges.
