@@ -246,8 +246,8 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 pub struct BlobTableEntry {
     pub written_areas: realize_types::ByteRanges,
 
-    /// Hash of the content.
-    pub content_hash: Hash,
+    /// Version of the content.
+    pub version: Version,
 
     /// Size of the content.
     pub content_size: u64,
@@ -280,7 +280,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let reader: blob_capnp::blob_table_entry::Reader =
             message_reader.get_root::<blob_capnp::blob_table_entry::Reader>()?;
 
-        let content_hash = parse_hash(reader.get_content_hash()?)?;
+        let version = parse_version(reader)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
             Some(PathId(next_value))
@@ -299,7 +299,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
 
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
-            content_hash,
+            version,
             content_size: reader.get_content_size(),
             verified: reader.get_verified(),
             queue,
@@ -314,7 +314,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let mut builder: blob_capnp::blob_table_entry::Builder =
             message.init_root::<blob_capnp::blob_table_entry::Builder>();
 
-        builder.set_content_hash(&self.content_hash.0);
+        fill_version(builder.reborrow().init_version(), &self.version);
         builder.set_content_size(self.content_size);
         builder.set_verified(self.verified);
         builder.set_queue(self.queue);
@@ -328,6 +328,39 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
 
         Ok(buffer)
     }
+}
+
+/// Fill a [Version] message from capnp.
+fn fill_version(mut version_builder: blob_capnp::version::Builder<'_>, version: &Version) {
+    match version {
+        Version::Modified(None) => {
+            version_builder.init_modified();
+        }
+        Version::Modified(Some(hash)) => {
+            version_builder.init_modified().set_hash(&hash.0);
+        }
+        Version::Indexed(hash) => {
+            version_builder.set_indexed(&hash.0);
+        }
+    }
+}
+
+/// Parse a [Version] from capnp.
+fn parse_version(
+    reader: blob_capnp::blob_table_entry::Reader<'_>,
+) -> Result<Version, ByteConversionError> {
+    let version = match reader.get_version()?.which()? {
+        blob_capnp::version::Which::Modified(version) => {
+            let version = version?;
+            Version::Modified(if version.has_hash() {
+                Some(parse_hash(version.get_hash()?)?)
+            } else {
+                None
+            })
+        }
+        blob_capnp::version::Which::Indexed(hash) => Version::Indexed(parse_hash(hash?)?),
+    };
+    Ok(version)
 }
 
 fn parse_byte_ranges(msg: blob_capnp::byte_ranges::Reader<'_>) -> Result<ByteRanges, capnp::Error> {
@@ -1716,7 +1749,7 @@ mod tests {
                 realize_types::ByteRange::new(0, 1024),
                 realize_types::ByteRange::new(2048, 4096),
             ]),
-            content_hash: Hash([2u8; 32]),
+            version: Version::Indexed(Hash([2u8; 32])),
             content_size: 100,
             verified: false,
             queue: LruQueueId::WorkingArea,
@@ -1730,9 +1763,25 @@ mod tests {
             BlobTableEntry::from_bytes(entry.clone().to_bytes()?.as_slice())?
         );
 
+        let modified_entry = BlobTableEntry {
+            written_areas: realize_types::ByteRanges::single(0, 1024),
+            version: Version::Modified(Some(Hash([2u8; 32]))),
+            content_size: 100,
+            verified: false,
+            queue: LruQueueId::WorkingArea,
+            next: None,
+            prev: None,
+            disk_usage: 1024,
+        };
+
+        assert_eq!(
+            modified_entry,
+            BlobTableEntry::from_bytes(modified_entry.clone().to_bytes()?.as_slice())?
+        );
+
         let empty_entry = BlobTableEntry {
             written_areas: realize_types::ByteRanges::from_ranges(vec![]),
-            content_hash: Hash([0x03; 32]),
+            version: Version::Indexed(Hash([0x03; 32])),
             content_size: 0,
             verified: false,
             queue: LruQueueId::WorkingArea,

@@ -190,7 +190,7 @@ impl StorageJobProcessor {
                 Some(b) => b,
                 None => return Ok(JobStatus::Abandoned("no_blob")),
             };
-            if blobinfo.hash != hash {
+            if !blobinfo.version.matches_hash(&hash) {
                 return Ok(JobStatus::Abandoned("blob_version"));
             }
             if !blobinfo.verified {

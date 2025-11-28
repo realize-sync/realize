@@ -2,7 +2,9 @@ use super::db::{ArenaDatabase, BeforeCommit};
 use super::dirty::WritableOpenDirty;
 use super::mark::{MarkExt, MarkReadOperations};
 use super::tree::{TreeExt, TreeLoc, TreeReadOperations, WritableOpenTree};
-use super::types::{BlobId, BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry};
+use super::types::{
+    BlobId, BlobTableEntry, CacheStatus, LruQueueId, Mark, QueueTableEntry, Version,
+};
 use crate::arena::cache::CacheReadOperations;
 use crate::arena::db::Tag;
 use crate::types::PathId;
@@ -253,7 +255,7 @@ impl DiskUsage {
 pub(crate) struct BlobInfo {
     pub(crate) pathid: PathId,
     pub(crate) size: u64,
-    pub(crate) hash: Hash,
+    pub(crate) version: Version,
 
     /// Byte ranges for which data is available locally.
     /// May be empty or may be the entire range [0, size).]
@@ -274,7 +276,7 @@ impl BlobInfo {
         Self {
             pathid,
             size: entry.content_size,
-            hash: entry.content_hash,
+            version: entry.version,
             available_ranges: entry.written_areas,
             protected: entry.queue == LruQueueId::Protected,
             verified: entry.verified,
@@ -456,7 +458,7 @@ impl<'a> WritableOpenBlob<'a> {
             None
         };
         if let Some(e) = existing_entry {
-            if e.content_hash == *hash {
+            if e.version.matches_hash(hash) {
                 return Ok((pathid, self.subsystem.blob_dir.join(pathid.hex()), e));
             }
 
@@ -468,7 +470,7 @@ impl<'a> WritableOpenBlob<'a> {
         let queue = choose_queue(tree, marks, pathid)?;
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
-            content_hash: hash.clone(),
+            version: Version::Indexed(hash.clone()),
             content_size: size,
             verified: false,
             queue,
@@ -476,12 +478,11 @@ impl<'a> WritableOpenBlob<'a> {
             prev: None,
             disk_usage: calculate_disk_usage(&blob_path.metadata()?),
         };
-        self.add_to_queue_front(queue, pathid, &mut entry)?;
-
         log::debug!(
-            "[{}] Created blob {pathid} {hash} in {queue:?} at {blob_path:?} -> {entry:?}",
+            "[{}] Creating blob {pathid} in {queue:?} at {blob_path:?} -> {entry:?}",
             self.tag
         );
+        self.add_to_queue_front(queue, pathid, &mut entry)?;
         tree.insert_and_incref(
             pathid,
             &mut self.blob_table,
@@ -618,6 +619,7 @@ impl<'a> WritableOpenBlob<'a> {
     ///
     /// This assumes that the file will be written completely and so
     /// sets up local availability to complete already (but not verified).
+
     pub(crate) fn import<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
@@ -679,7 +681,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// If the blob exists and has the same hash as was given, update
     /// the blob and return true, otherwise do nothing and return
     /// false.
-    fn mark_verified<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn mark_verified<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
         dirty: &mut WritableOpenDirty,
@@ -698,20 +700,20 @@ impl<'a> WritableOpenBlob<'a> {
             Some(v) => v.value().parse()?,
         };
 
-        // Only mark as verified if the hash matches
-        if blob_entry.content_hash == *hash {
-            blob_entry.verified = true;
-            log::debug!("[{}] {pathid} content verified to be {hash}", self.tag);
-
-            self.blob_table.insert(
-                BlobId::from_pathid(pathid),
-                Holder::with_content(blob_entry)?,
-            )?;
-            dirty.mark_dirty(pathid, "verified")?;
-            return Ok(true);
+        if !blob_entry.version.matches_hash(hash) {
+            return Ok(false);
         }
 
-        Ok(false)
+        blob_entry.verified = true;
+        log::debug!("[{}] {pathid} content verified to be {hash:?}", self.tag);
+
+        self.blob_table.insert(
+            BlobId::from_pathid(pathid),
+            Holder::with_content(blob_entry)?,
+        )?;
+        dirty.mark_dirty(pathid, "verified")?;
+
+        Ok(true)
     }
 
     /// Extend local availability of the blob with the given range.
@@ -723,7 +725,7 @@ impl<'a> WritableOpenBlob<'a> {
         &mut self,
         tree: &impl TreeReadOperations,
         loc: L,
-        hash: &Hash,
+        version: &Version,
         new_range: &ByteRanges,
     ) -> Result<bool, StorageError> {
         let pathid = match tree.resolve(loc)? {
@@ -735,7 +737,7 @@ impl<'a> WritableOpenBlob<'a> {
             Some(e) => e,
             None => return Ok(false),
         };
-        if blob_entry.content_hash != *hash {
+        if blob_entry.version != *version {
             return Ok(false);
         }
         blob_entry.written_areas = blob_entry.written_areas.union(new_range);
@@ -1267,7 +1269,11 @@ impl Blob {
     pub async fn remote_availability(&self) -> Result<Option<RemoteAvailability>, StorageError> {
         let db = Arc::clone(&self.db);
         let pathid = self.info.pathid;
-        let hash = self.info.hash.clone();
+        let hash = if let Some(h) = self.info.version.indexed_hash() {
+            h.clone()
+        } else {
+            return Ok(None);
+        };
 
         tokio::task::spawn_blocking(move || {
             let txn = db.begin_read()?;
@@ -1278,9 +1284,9 @@ impl Blob {
         .await?
     }
 
-    /// Get the hash of the corresponding file.
-    pub fn hash(&self) -> &Hash {
-        &self.info.hash
+    /// Get the version of the corresponding file.
+    pub fn version(&self) -> &Version {
+        &self.info.version
     }
 
     /// Compute hash from the current local content.
@@ -1310,7 +1316,7 @@ impl Blob {
     pub async fn verify(&mut self) -> Result<bool, StorageError> {
         self.shared.prepare_for_verification().await?;
         let hash = self.compute_hash().await?;
-        if hash != self.info.hash {
+        if !self.info.version.matches_hash(&hash) {
             return Ok(false);
         }
         self.shared.mark_verified().await?;
@@ -1589,7 +1595,7 @@ mod tests {
                     blobs.extend_cache_status(
                         &tree,
                         info.pathid,
-                        &hash,
+                        &Version::Indexed(hash.clone()),
                         &ByteRanges::single(0, partial as u64),
                     )?;
                 }
@@ -1618,7 +1624,7 @@ mod tests {
             let path = Path::parse("blob/test.txt")?;
 
             let info = blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
-            assert_eq!(hash::digest("test"), info.hash);
+            assert_eq!(Version::Indexed(hash::digest("test")), info.version);
             assert_eq!(4, info.size);
             assert_eq!(ByteRanges::new(), info.available_ranges);
 
@@ -2093,7 +2099,7 @@ mod tests {
         assert!(watch.has_changed()?);
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(hash::digest(data), *blob.hash());
+        assert_eq!(Version::Indexed(hash::digest(data)), *blob.version());
         assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
@@ -2146,7 +2152,7 @@ mod tests {
         txn.commit()?;
 
         let mut blob = Blob::open(&fixture.db, &path)?;
-        assert_eq!(hash::digest(data), *blob.hash());
+        assert_eq!(Version::Indexed(hash::digest(data)), *blob.version());
         assert_eq!(data.len() as u64, blob.size());
         assert_eq!(
             ByteRanges::single(0, data.len() as u64),
@@ -2685,7 +2691,7 @@ mod tests {
 
         // Just test that the write transaction works correctly.
         let blob_info = blobs.create(&mut tree, &mut mark, PathId(10), &test_hash(), 100)?;
-        assert_eq!(blob_info.hash, test_hash());
+        assert_eq!(blob_info.version, Version::Indexed(test_hash()));
         assert_eq!(blob_info.size, 100);
 
         Ok(())
@@ -2749,7 +2755,12 @@ mod tests {
         // Extend with partial ranges
         let partial_ranges =
             ByteRanges::from_ranges(vec![ByteRange::new(0, 100), ByteRange::new(200, 300)]);
-        blobs.extend_cache_status(&tree, &path, &hash, &partial_ranges)?;
+        blobs.extend_cache_status(
+            &tree,
+            &path,
+            &Version::Indexed(hash.clone()),
+            &partial_ranges,
+        )?;
 
         // Test local availability - should be Partial
         let availability = blobs.cache_status(&tree, &path)?;
@@ -2779,7 +2790,12 @@ mod tests {
 
         // Extend with complete range (0 to size)
         let complete_range = ByteRanges::single(0, 500);
-        blobs.extend_cache_status(&tree, &path, &hash, &complete_range)?;
+        blobs.extend_cache_status(
+            &tree,
+            &path,
+            &Version::Indexed(hash.clone()),
+            &complete_range,
+        )?;
 
         // Test local availability - should be Complete (not verified)
         let availability = blobs.cache_status(&tree, &path)?;
@@ -2804,7 +2820,12 @@ mod tests {
 
         // Extend with complete range
         let complete_range = ByteRanges::single(0, 500);
-        blobs.extend_cache_status(&tree, &path, &hash, &complete_range)?;
+        blobs.extend_cache_status(
+            &tree,
+            &path,
+            &Version::Indexed(hash.clone()),
+            &complete_range,
+        )?;
 
         // Mark as verified
         blobs.mark_verified(&tree, &mut dirty, &path, &hash)?;

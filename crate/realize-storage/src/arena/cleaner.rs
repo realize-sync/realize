@@ -140,7 +140,7 @@ mod tests {
     use crate::arena::blob::{BlobExt, BlobReadOperations};
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
     use crate::utils::hash;
-    use crate::{Blob, Mark};
+    use crate::{Blob, Mark, Version};
     use assert_fs::prelude::PathCreateDir;
     use assert_fs::{TempDir, fixture::PathChild};
     use realize_types::{Arena, Path};
@@ -221,7 +221,7 @@ mod tests {
                 blobs.extend_cache_status(
                     &tree,
                     info.pathid,
-                    &hash,
+                    &Version::Indexed(hash.clone()),
                     &realize_types::ByteRanges::single(0, test_data.len() as u64),
                 )?;
             }

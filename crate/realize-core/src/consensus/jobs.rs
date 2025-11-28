@@ -62,7 +62,7 @@ pub(crate) async fn download(
             return Err(err.into());
         }
     };
-    if *blob.hash() != *hash {
+    if *blob.version().matches(*hash) {
         return Ok(JobStatus::Abandoned("hash mismatch"));
     }
     match blob.cache_status().await {
@@ -178,14 +178,17 @@ pub(crate) async fn verify(
         return Ok(JobStatus::Cancelled);
     });
     if verified {
-        log::debug!("[{arena}] Job #{job_id} Verified against {}", blob.hash());
+        log::debug!(
+            "[{arena}] Job #{job_id} Verified against {}",
+            blob.version()
+        );
         return Ok(JobStatus::Done);
     }
 
     // repair
     log::debug!(
         "[{arena}] Job #{job_id} Hash mismatch (expected: {}); Starting repair",
-        blob.hash()
+        blob.version()
     );
     progress.update_action(JobAction::Repair);
     let opts = fast_rsync::SignatureOptions {
@@ -229,13 +232,13 @@ pub(crate) async fn verify(
     if !verified {
         log::debug!(
             "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {}",
-            blob.hash()
+            blob.version()
         );
         return Err(JobError::InconsistentHash);
     }
     log::debug!(
         "[{arena}] Job #{job_id} Fixed and verified to be {}",
-        blob.hash()
+        blob.version()
     );
 
     Ok(JobStatus::Done)
@@ -1001,7 +1004,7 @@ mod tests {
                 );
 
                 let blob = fixture.open_file(a, "large").await?;
-                assert_eq!(hash, *blob.hash());
+                assert_eq!(Version::Indexed(hash.clone()), *blob.version());
                 assert_eq!(hash, fixture.hash_blob(blob).await?);
 
                 Ok::<(), anyhow::Error>(())
@@ -1072,7 +1075,7 @@ mod tests {
 
                 // check the content again
                 let blob = fixture.open_file(a, "large").await?;
-                assert_eq!(hash, *blob.hash());
+                assert_eq!(Version::Indexed(hash.clone()), *blob.version());
                 assert_eq!(hash, fixture.hash_blob(blob).await?);
 
                 Ok::<(), anyhow::Error>(())

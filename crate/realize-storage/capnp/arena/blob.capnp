@@ -9,8 +9,8 @@ $Rust.parentModule("arena::types");
 struct BlobTableEntry {
   writtenAreas @0: ByteRanges;
 
-  # Hash of the content
-  contentHash @1: Data;
+  # Version of the content
+  version @1: Version;
 
   # Size of the content
   contentSize @6: UInt64;
@@ -29,6 +29,17 @@ struct BlobTableEntry {
 
   # Disk usage in bytes
   diskUsage @5: UInt64;
+}
+
+struct Version {
+  union {
+    modified @0 :ModifiedVersion;
+    indexed @1 :Data;
+  }
+}
+
+struct ModifiedVersion {
+  hash @0: Data;
 }
 
 # A sequence of byte ranges.

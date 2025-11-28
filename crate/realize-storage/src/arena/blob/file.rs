@@ -1,9 +1,9 @@
-#![allow(dead_code)] // WIP
 use super::BlobInfo;
 use crate::arena::db::ArenaDatabase;
+use crate::arena::types::Version;
 use crate::types::PathId;
 use crate::{CacheStatus, StorageError};
-use realize_types::{ByteRange, ByteRanges, Hash};
+use realize_types::{ByteRange, ByteRanges};
 use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -103,7 +103,7 @@ pub(crate) struct SharedBlobFile {
     path: PathBuf,
     pathid: PathId,
     size: u64,
-    hash: Hash,
+    version: Version,
     tx_readable: watch::Sender<ReadableRange>,
     guarded: Mutex<BlobFileGuarded>,
 }
@@ -174,7 +174,7 @@ impl SharedBlobFile {
             path: path.to_path_buf(),
             pathid: info.pathid,
             size: info.size,
-            hash: info.hash.clone(),
+            version: info.version.clone(),
             guarded: Mutex::new(BlobFileGuarded {
                 state,
                 available_ranges: info.available_ranges.clone(),
@@ -312,7 +312,11 @@ impl SharedBlobFile {
             BlobFileState::Complete => {
                 let pathid = self.pathid;
                 let db = self.db.clone();
-                let hash = self.hash.clone();
+                let hash = if let Some(h) = self.version.indexed_hash() {
+                    h.clone()
+                } else {
+                    return Err(StorageError::InvalidBlobState);
+                };
                 let join_handle = tokio::task::spawn_blocking(move || {
                     let txn = db.begin_write()?;
                     {
@@ -447,14 +451,13 @@ impl SharedBlobFile {
         let pathid = self.pathid;
         let ranges = guard.pending_ranges.clone();
         let db = Arc::clone(&self.db);
-        let hash = self.hash.clone();
-
+        let version = self.version.clone();
         let join_handle = tokio::task::spawn_blocking(move || {
             let txn = db.begin_write()?;
             txn.write_blobs()?.extend_cache_status(
                 &mut txn.read_tree()?,
                 pathid,
-                &hash,
+                &version,
                 &ranges,
             )?;
             txn.commit()?;
@@ -484,26 +487,6 @@ impl SharedBlobFile {
         join_handle.await??;
 
         Ok(())
-    }
-
-    /// Make changes to the database.
-    ///
-    /// It's important *not* to wait for the spawn_blocking to return,
-    /// as that would create a lock loops between self.guarded and the
-    /// write transaction mutex. It does mean that SharedBlobFile
-    /// might have more up-to-date information than what's on the
-    /// database - temporarily unless the database has problems.
-    fn write_to_db(
-        &self,
-        cb: impl FnOnce(&Arc<ArenaDatabase>) -> Result<(), StorageError> + Send + 'static,
-    ) {
-        let db = Arc::clone(&self.db);
-        let pathid = self.pathid;
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = cb(&db) {
-                log::debug!("Updating database for blob {pathid} failed: {err}")
-            }
-        });
     }
 }
 
