@@ -4,7 +4,7 @@ use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
-use super::types::CacheStatus;
+use super::types::{CacheStatus, LruQueueId};
 use crate::arena::tree::TreeReadOperations;
 use crate::types::{JobId, PathId};
 use crate::{Mark, StorageError};
@@ -485,7 +485,7 @@ impl Engine {
             if !is_local {
                 let blob = blobs.get_with_pathid(pathid)?;
                 if let Some(blob) = &blob {
-                    if blob.protected {
+                    if blob.queue == LruQueueId::Protected {
                         should_unprotect_blob = want_unprotect_blob;
                     } else {
                         should_protect_blob = want_protect_blob;
@@ -612,6 +612,7 @@ mod tests {
     use crate::arena::index;
     use crate::arena::mark;
     use crate::arena::tree::TreeLoc;
+    use crate::arena::types::LruQueueId;
     use crate::utils::hash;
     use assert_fs::TempDir;
     use futures::StreamExt as _;
@@ -1039,7 +1040,7 @@ mod tests {
             let tree = txn.read_tree()?;
             let mut dirty = txn.write_dirty()?;
             txn.write_blobs()?
-                .set_protected(&tree, &mut dirty, pathid, true)?;
+                .move_to_queue(&tree, &mut dirty, pathid, LruQueueId::Protected)?;
         }
         txn.commit()?;
         fixture.engine.job_finished(job_id, Ok(JobStatus::Done))?;

@@ -1,5 +1,6 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
+use super::types::LruQueueId;
 use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
 use crate::types::PathId;
@@ -84,7 +85,16 @@ impl StorageJobProcessor {
             let tree = txn.read_tree()?;
             let mut blobs = txn.write_blobs()?;
             let mut dirty = txn.write_dirty()?;
-            blobs.set_protected(&tree, &mut dirty, pathid, protected)?;
+            blobs.move_to_queue(
+                &tree,
+                &mut dirty,
+                pathid,
+                if protected {
+                    LruQueueId::Protected
+                } else {
+                    LruQueueId::WorkingArea
+                },
+            )?;
         }
         txn.commit()?;
         Ok(JobStatus::Done)

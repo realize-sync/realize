@@ -139,6 +139,7 @@ mod tests {
     use super::*;
     use crate::arena::blob::{BlobExt, BlobReadOperations};
     use crate::arena::db::{ArenaReadTransaction, ArenaWriteTransaction};
+    use crate::arena::types::LruQueueId;
     use crate::utils::hash;
     use crate::{Blob, Mark, Version};
     use assert_fs::prelude::PathCreateDir;
@@ -357,7 +358,7 @@ mod tests {
             marks.set(&mut tree, &mut dirty, &protected_path, Mark::Keep)?;
 
             let mut blobs = txn.write_blobs()?;
-            blobs.set_protected(&tree, &mut dirty, &protected_path, true)?;
+            blobs.move_to_queue(&tree, &mut dirty, &protected_path, LruQueueId::Protected)?;
         }
         txn.commit()?;
 
@@ -524,7 +525,7 @@ mod tests {
             marks.set(&mut tree, &mut dirty, &protected_path, Mark::Keep)?;
 
             let mut blobs = txn.write_blobs()?;
-            blobs.set_protected(&tree, &mut dirty, &protected_path, true)?;
+            blobs.move_to_queue(&tree, &mut dirty, &protected_path, LruQueueId::Protected)?;
         }
         txn.commit()?;
 

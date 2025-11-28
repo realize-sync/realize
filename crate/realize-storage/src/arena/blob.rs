@@ -261,11 +261,11 @@ pub(crate) struct BlobInfo {
     /// May be empty or may be the entire range [0, size).]
     pub(crate) available_ranges: ByteRanges,
 
-    /// If true, local data will not be deleted by
-    /// [WritableOpenBlob::cleanup].
+    /// Queue this blob belongs to.
     ///
-    /// Protected blobs belong to the protected LRU queue.
-    pub(crate) protected: bool,
+    /// Blobs in the working or archived or queue may be cleaned up
+    /// automatically.
+    pub(crate) queue: LruQueueId,
 
     /// If true, content of the file was verified against the hash.
     pub(crate) verified: bool,
@@ -278,7 +278,7 @@ impl BlobInfo {
             size: entry.content_size,
             version: entry.version,
             available_ranges: entry.written_areas,
-            protected: entry.queue == LruQueueId::Protected,
+            queue: entry.queue,
             verified: entry.verified,
         }
     }
@@ -437,7 +437,10 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         size: u64,
     ) -> Result<BlobInfo, StorageError> {
-        let (pathid, _, entry) = self.create_entry(tree, marks, loc, hash, size)?;
+        let loc = loc.into();
+        let queue = choose_queue(tree, marks, loc.borrow())?;
+        let (pathid, _, entry) =
+            self.create_entry(tree, loc, &Version::Indexed(hash.clone()), queue, size)?;
         self.report_disk_usage_changed();
 
         Ok(BlobInfo::new(pathid, entry))
@@ -446,9 +449,9 @@ impl<'a> WritableOpenBlob<'a> {
     fn create_entry<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree<'_>,
-        marks: &impl MarkReadOperations,
         loc: L,
-        hash: &Hash,
+        version: &Version,
+        queue: LruQueueId,
         size: u64,
     ) -> Result<(PathId, PathBuf, BlobTableEntry), StorageError> {
         let pathid = tree.setup(loc)?;
@@ -458,7 +461,7 @@ impl<'a> WritableOpenBlob<'a> {
             None
         };
         if let Some(e) = existing_entry {
-            if e.version.matches_hash(hash) {
+            if matches!(version, Version::Indexed(_)) && *version == e.version {
                 return Ok((pathid, self.subsystem.blob_dir.join(pathid.hex()), e));
             }
 
@@ -467,10 +470,9 @@ impl<'a> WritableOpenBlob<'a> {
             let _ = fs::remove_file(self.subsystem.blob_dir.join(pathid.hex()));
         }
         let blob_path = self.prepare_blob_file(pathid, size)?;
-        let queue = choose_queue(tree, marks, pathid)?;
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
-            version: Version::Indexed(hash.clone()),
+            version: version.clone(),
             content_size: size,
             verified: false,
             queue,
@@ -536,15 +538,16 @@ impl<'a> WritableOpenBlob<'a> {
         Ok(())
     }
 
-    /// Move the blob into or out of the protected queue.
+    /// Move the blob into the given queue.
     ///
-    /// Does nothing if the blob doesn't exist.
-    pub(crate) fn set_protected<'b, L: Into<TreeLoc<'b>>>(
+    /// Does nothing if the blob doesn't exist or is already in the
+    /// given queue.
+    pub(crate) fn move_to_queue<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &impl TreeReadOperations,
         dirty: &mut WritableOpenDirty,
         loc: L,
-        protected: bool,
+        target: LruQueueId,
     ) -> Result<(), StorageError> {
         let pathid = match tree.resolve(loc)? {
             Some(pathid) => pathid,
@@ -557,14 +560,9 @@ impl<'a> WritableOpenBlob<'a> {
             }
             Some(v) => v.value().parse()?,
         };
-        let new_queue = if protected {
-            LruQueueId::Protected
-        } else {
-            LruQueueId::WorkingArea
-        };
 
         // If the queue is already correct, nothing to do
-        if blob_entry.queue == new_queue {
+        if blob_entry.queue == target {
             return Ok(());
         }
 
@@ -572,7 +570,7 @@ impl<'a> WritableOpenBlob<'a> {
         self.remove_from_queue(&blob_entry)?;
 
         // Add to new queue
-        self.add_to_queue_front(new_queue, pathid, &mut blob_entry)?;
+        self.add_to_queue_front(target, pathid, &mut blob_entry)?;
 
         // Update the entry in the table
         self.blob_table.insert(
@@ -619,7 +617,6 @@ impl<'a> WritableOpenBlob<'a> {
     ///
     /// This assumes that the file will be written completely and so
     /// sets up local availability to complete already (but not verified).
-
     pub(crate) fn import<'b, L: Into<TreeLoc<'b>>>(
         &mut self,
         tree: &mut WritableOpenTree,
@@ -628,8 +625,11 @@ impl<'a> WritableOpenBlob<'a> {
         hash: &Hash,
         metadata: &std::fs::Metadata,
     ) -> Result<PathBuf, StorageError> {
+        let loc = loc.into();
         let size = metadata.len();
-        let (pathid, blob_path, mut entry) = self.create_entry(tree, marks, loc, hash, size)?;
+        let queue = choose_queue(tree, marks, loc.borrow())?;
+        let (pathid, blob_path, mut entry) =
+            self.create_entry(tree, loc, &Version::Indexed(hash.clone()), queue, size)?;
 
         // Set written areas to complete (but not verified) and update
         // trusting that metadata is going to be the blob file
@@ -1055,11 +1055,12 @@ where
     }
 }
 
-fn choose_queue(
+fn choose_queue<'a, L: Into<TreeLoc<'a>>>(
     tree: &mut WritableOpenTree<'_>,
     marks: &impl MarkReadOperations,
-    pathid: PathId,
+    loc: L,
 ) -> Result<LruQueueId, StorageError> {
+    let pathid = tree.resolve_partial(loc)?;
     let queue = match marks.get(tree, pathid)? {
         Mark::Watch | Mark::Default => LruQueueId::WorkingArea,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
@@ -1745,22 +1746,18 @@ mod tests {
 
         let hash = test_hash();
         assert_eq!(
-            false,
+            LruQueueId::WorkingArea,
             blobs
                 .create(&mut tree, &marks, &watch_path, &hash, 4)?
-                .protected
+                .queue
         );
         assert_eq!(
-            true,
-            blobs
-                .create(&mut tree, &marks, &keep_path, &hash, 4)?
-                .protected
+            LruQueueId::Protected,
+            blobs.create(&mut tree, &marks, &keep_path, &hash, 4)?.queue
         );
         assert_eq!(
-            true,
-            blobs
-                .create(&mut tree, &marks, &own_path, &hash, 4)?
-                .protected
+            LruQueueId::Protected,
+            blobs.create(&mut tree, &marks, &own_path, &hash, 4)?.queue
         );
 
         Ok(())
@@ -2200,7 +2197,7 @@ mod tests {
         )?;
 
         let info = blobs.get(&tree, &path)?.unwrap();
-        assert_eq!(true, info.protected);
+        assert_eq!(LruQueueId::Protected, info.queue);
         std::fs::rename(tmpfile.path(), path_in_cache)?;
 
         Ok(())
@@ -2880,13 +2877,13 @@ mod tests {
 
             let path = Path::parse("test.txt")?;
             let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-            assert_eq!(false, blob_info.protected);
+            assert_eq!(LruQueueId::WorkingArea, blob_info.queue);
 
             dirty.delete_range(0, 999)?; // clear all
-            blobs.set_protected(&tree, &mut dirty, &path, true)?;
+            blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Protected)?;
 
             let updated_info = blobs.get(&tree, &path)?.unwrap();
-            assert_eq!(true, updated_info.protected);
+            assert_eq!(LruQueueId::Protected, updated_info.queue);
 
             assert_eq!(
                 vec![blob_info.pathid],
@@ -2925,13 +2922,13 @@ mod tests {
         let path = Path::parse("test.txt")?;
         marks.set(&mut tree, &mut dirty, &path, Mark::Keep)?;
         let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-        assert_eq!(true, blob_info.protected);
+        assert_eq!(LruQueueId::Protected, blob_info.queue);
 
         dirty.delete_range(0, 999)?; // clear all
-        blobs.set_protected(&tree, &mut dirty, &path, false)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::WorkingArea)?;
 
         let updated_info = blobs.get(&tree, &path)?.unwrap();
-        assert_eq!(false, updated_info.protected);
+        assert_eq!(LruQueueId::WorkingArea, updated_info.queue);
 
         assert_eq!(
             vec![blob_info.pathid],
@@ -2967,14 +2964,14 @@ mod tests {
         let path = Path::parse("test.txt")?;
         marks.set(&mut tree, &mut dirty, &path, Mark::Keep)?;
         let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-        assert_eq!(true, blob_info.protected);
+        assert_eq!(LruQueueId::Protected, blob_info.queue);
 
         dirty.delete_range(0, 999)?; // clear all
-        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Protected)?;
 
         // nothing changed, and the dirty bit wasn't set
         let updated_info = blobs.get(&tree, &path)?.unwrap();
-        assert_eq!(true, updated_info.protected);
+        assert_eq!(LruQueueId::Protected, updated_info.queue);
         assert_eq!(blob_info.pathid, updated_info.pathid);
         assert!(dirty.next_dirty(0)?.is_none());
 
@@ -2992,7 +2989,7 @@ mod tests {
         let path = Path::parse("nonexistent.txt")?;
 
         // should not fail, just do noting
-        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Protected)?;
 
         assert!(blobs.get(&tree, &path)?.is_none());
 
@@ -3019,7 +3016,7 @@ mod tests {
             blobs.disk_usage()?
         );
 
-        blobs.set_protected(&tree, &mut dirty, &path, true)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Protected)?;
 
         assert_eq!(
             DiskUsage {
@@ -3029,7 +3026,7 @@ mod tests {
             blobs.disk_usage()?
         );
 
-        blobs.set_protected(&tree, &mut dirty, &path, false)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::WorkingArea)?;
 
         assert_eq!(
             DiskUsage {
