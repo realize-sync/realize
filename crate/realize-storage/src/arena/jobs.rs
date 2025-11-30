@@ -92,7 +92,7 @@ impl StorageJobProcessor {
                 if protected {
                     LruQueueId::Protected
                 } else {
-                    LruQueueId::WorkingArea
+                    LruQueueId::Cached
                 },
             )?;
         }

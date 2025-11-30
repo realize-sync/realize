@@ -1,4 +1,4 @@
-use super::blob::BlobReadOperations;
+use super::blob::BlobExt;
 use super::cache::CacheReadOperations;
 use super::db::{ArenaDatabase, ArenaReadTransaction};
 use super::dirty::DirtyReadOperations;

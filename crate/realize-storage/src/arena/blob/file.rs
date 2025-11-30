@@ -132,6 +132,7 @@ enum BlobFileState {
     Complete,
     Verified,
     Realized,
+    Archived,
 }
 
 /// Byte ranges that can safely be read in the blob file.
@@ -153,7 +154,11 @@ impl SharedBlobFile {
     ) -> Arc<Self> {
         let state: BlobFileState;
         let readable_range: ReadableRange;
-        if info
+        let pathid = info.blobid.pathid();
+        if info.blobid.index() > 0 {
+            state = BlobFileState::Archived;
+            readable_range = ReadableRange::Direct;
+        } else if info
             .available_ranges
             .contains_range(&ByteRange::new(0, info.size))
         {
@@ -172,7 +177,7 @@ impl SharedBlobFile {
             id,
             db: Arc::clone(db),
             path: path.to_path_buf(),
-            pathid: info.pathid,
+            pathid,
             size: info.size,
             version: info.version.clone(),
             guarded: Mutex::new(BlobFileGuarded {
@@ -222,6 +227,7 @@ impl SharedBlobFile {
             }
             BlobFileState::Complete => Some(CacheStatus::Complete),
             BlobFileState::Verified => Some(CacheStatus::Verified),
+            BlobFileState::Archived => Some(CacheStatus::Complete),
             BlobFileState::Realized => None,
         }
     }

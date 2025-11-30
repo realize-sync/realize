@@ -94,6 +94,9 @@ pub enum StorageError {
     #[error("no pathid available")]
     PathIdSpaceExhausted,
 
+    #[error("no blobid available")]
+    BlobIdSpaceExhausted,
+
     #[error("[0] {2}: {1:?}")]
     SanityCheckFailed(Arena, PathBuf, SanityCheck),
 
@@ -171,6 +174,7 @@ impl StorageError {
             StorageError::InvalidAttributeValue => InvalidData,
             StorageError::NoSuchAttribute => Other,
             StorageError::PathIdSpaceExhausted => Other,
+            StorageError::BlobIdSpaceExhausted => Other,
             StorageError::ChannelSendError => Other,
             StorageError::SanityCheckFailed(_, _, _) => Other,
         }

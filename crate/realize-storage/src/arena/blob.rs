@@ -64,10 +64,10 @@ pub(crate) async fn mark_accessed_loop(
                     let txn = db.begin_write()?;
                     {
                         let mut blobs = txn.write_blobs()?;
-                        while let Some((pathid, _)) = queue.pop() {
+                        while let Some((blobid, _)) = queue.pop() {
                             // If marking one pathid fails, don't make
                             // other pathids fail.
-                            let _ = blobs.mark_accessed(pathid);
+                            let _ = blobs.mark_accessed(blobid);
                         }
                     }
                     txn.commit()?;
@@ -88,7 +88,7 @@ pub(crate) struct Blobs {
     _disk_usage_tx: watch::Receiver<DiskUsage>,
 
     /// Report blob accesses
-    accessed_tx: broadcast::Sender<PathId>,
+    accessed_tx: broadcast::Sender<BlobId>,
 
     registry: Arc<file::BlobFileRegistry>,
 }
@@ -126,7 +126,7 @@ impl Blobs {
     }
 
     /// Return a receiver that can receive report about blob accesses.
-    fn subscribe_accessed(&self) -> broadcast::Receiver<PathId> {
+    fn subscribe_accessed(&self) -> broadcast::Receiver<BlobId> {
         self.accessed_tx.subscribe()
     }
 
@@ -225,8 +225,11 @@ pub(crate) struct DiskUsage {
     /// Total disk used to store local blobs, in bytes.
     pub(crate) total: u64,
 
-    /// Subset of the total that can be evicted, in bytes.
+    /// Subset of `total` that can be evicted, in bytes.
     pub(crate) evictable: u64,
+
+    /// Space used by archived blobs, a subset of `evictable`.
+    pub(crate) archived: u64,
 }
 
 impl DiskUsage {
@@ -234,6 +237,7 @@ impl DiskUsage {
     pub(crate) const ZERO: DiskUsage = DiskUsage {
         total: 0,
         evictable: 0,
+        archived: 0,
     };
 
     // Arbitrary disk space considered to be occupied by an pathid.
@@ -253,7 +257,7 @@ impl DiskUsage {
 /// Public information about the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobInfo {
-    pub(crate) pathid: PathId,
+    pub(crate) blobid: BlobId,
     pub(crate) size: u64,
     pub(crate) version: Version,
 
@@ -272,9 +276,9 @@ pub(crate) struct BlobInfo {
 }
 
 impl BlobInfo {
-    fn new(pathid: PathId, entry: BlobTableEntry) -> Self {
+    fn new(blobid: BlobId, entry: BlobTableEntry) -> Self {
         Self {
-            pathid,
+            blobid,
             size: entry.content_size,
             version: entry.version,
             available_ranges: entry.written_areas,
@@ -301,20 +305,23 @@ impl BlobInfo {
 
 /// Read operations for blobs. See also [BlobExt].
 pub(crate) trait BlobReadOperations {
-    /// Return some info about the blob.
-    ///
-    /// This call returns [StorageError::NotFound] if the blob doesn't
-    /// exist on the database. Use [WritableOpenBlob::create] to
-    /// create the blob entry.
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError>;
+    /// Return some info about the blob, given its blob ID.
+    fn get_with_blobid(&self, blobid: BlobId) -> Result<Option<BlobInfo>, StorageError>;
+
+    /// Iterate over all available archives for the given path.
+    fn archives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> impl Iterator<Item = Result<BlobInfo, StorageError>>;
 
     /// Returns a double-ended iterator over the given queue, starting at the head.
     #[allow(dead_code)] // TODO: make it test-only
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>>;
 
     /// Returns a double-ended iterator over the given queue, starting at the tail.
     #[allow(dead_code)] // TODO: make it test-only
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>>;
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>>;
 
     /// Disk space used for storing local copies.
     ///
@@ -330,15 +337,23 @@ where
     T: ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
     TQ: ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 {
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
-        get_read_op(&self.blob_table, pathid)
+    fn get_with_blobid(&self, blobid: BlobId) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, blobid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn archives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> impl Iterator<Item = Result<BlobInfo, StorageError>> {
+        ArchivedBlobIterator::new(&self.blob_table, tree, loc)
+    }
+
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -348,15 +363,23 @@ where
 }
 
 impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
-    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
-        get_read_op(&self.blob_table, pathid)
+    fn get_with_blobid(&self, blobid: BlobId) -> Result<Option<BlobInfo>, StorageError> {
+        get_read_op(&self.blob_table, blobid)
     }
 
-    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn archives<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> impl Iterator<Item = Result<BlobInfo, StorageError>> {
+        ArchivedBlobIterator::new(&self.blob_table, tree, loc)
+    }
+
+    fn head(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>> {
         QueueIterator::head(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
-    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<PathId, StorageError>> {
+    fn tail(&self, queue: LruQueueId) -> impl Iterator<Item = Result<BlobId, StorageError>> {
         QueueIterator::tail(&self.blob_table, &self.blob_lru_queue_table, queue)
     }
 
@@ -368,6 +391,13 @@ impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
 /// Extend [BlobReadOperations] with convenience functions.
 #[allow(dead_code)] // for later
 pub(crate) trait BlobExt {
+    /// Return some info about the blob.
+    ///
+    /// This call returns [StorageError::NotFound] if the blob doesn't
+    /// exist on the database. Use [WritableOpenBlob::create] to
+    /// create the blob entry.
+    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError>;
+
     /// Open the blob and return a handle on it.
     ///
     /// This call returns None if the blob doesn't exist on the
@@ -391,6 +421,10 @@ pub(crate) trait BlobExt {
 }
 
 impl<T: BlobReadOperations> BlobExt for T {
+    fn get_with_pathid(&self, pathid: PathId) -> Result<Option<BlobInfo>, StorageError> {
+        self.get_with_blobid(BlobId::from_pathid(pathid))
+    }
+
     fn get<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
@@ -439,11 +473,11 @@ impl<'a> WritableOpenBlob<'a> {
     ) -> Result<BlobInfo, StorageError> {
         let loc = loc.into();
         let queue = choose_queue(tree, marks, loc.borrow())?;
-        let (pathid, _, entry) =
+        let (blobid, entry) =
             self.create_entry(tree, loc, &Version::Indexed(hash.clone()), queue, size)?;
         self.report_disk_usage_changed();
 
-        Ok(BlobInfo::new(pathid, entry))
+        Ok(BlobInfo::new(blobid, entry))
     }
 
     fn create_entry<'b, L: Into<TreeLoc<'b>>>(
@@ -453,23 +487,36 @@ impl<'a> WritableOpenBlob<'a> {
         version: &Version,
         queue: LruQueueId,
         size: u64,
-    ) -> Result<(PathId, PathBuf, BlobTableEntry), StorageError> {
+    ) -> Result<(BlobId, BlobTableEntry), StorageError> {
         let pathid = tree.setup(loc)?;
-        let existing_entry = if let Some(e) = self.blob_table.get(BlobId::from_pathid(pathid))? {
-            Some(e.value().parse()?)
-        } else {
-            None
-        };
-        if let Some(e) = existing_entry {
-            if matches!(version, Version::Indexed(_)) && *version == e.version {
-                return Ok((pathid, self.subsystem.blob_dir.join(pathid.hex()), e));
-            }
+        let blobid = match queue {
+            LruQueueId::Cached | LruQueueId::Protected => {
+                let blobid = BlobId::from_pathid(pathid);
+                let existing_entry = if let Some(e) = self.blob_table.get(blobid)? {
+                    Some(e.value().parse()?)
+                } else {
+                    None
+                };
+                if let Some(e) = existing_entry {
+                    let blob_path = self.blob_path(blobid);
+                    if matches!(version, Version::Indexed(_))
+                        && *version == e.version
+                        && blob_path.exists()
+                    {
+                        return Ok((blobid, e));
+                    }
 
-            // Existing entry cannot be reuse; remove.
-            self.remove_from_queue(&e)?;
-            let _ = fs::remove_file(self.subsystem.blob_dir.join(pathid.hex()));
-        }
-        let blob_path = self.prepare_blob_file(pathid, size)?;
+                    // Existing entry cannot be reuse; remove.
+                    self.remove_from_queue(&e)?;
+                    let _ = fs::remove_file(blob_path);
+                }
+
+                blobid
+            }
+            LruQueueId::Archived => self.next_blob_id_with_index(pathid)?,
+        };
+        let blob_path = self.blob_path(blobid);
+        self.prepare_blob_file(&blob_path, size)?;
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
             version: version.clone(),
@@ -484,19 +531,23 @@ impl<'a> WritableOpenBlob<'a> {
             "[{}] Creating blob {pathid} in {queue:?} at {blob_path:?} -> {entry:?}",
             self.tag
         );
-        self.add_to_queue_front(queue, pathid, &mut entry)?;
-        tree.insert_and_incref(
-            pathid,
-            &mut self.blob_table,
-            BlobId::from_pathid(pathid),
-            Holder::new(&entry)?,
-        )?;
-        Ok((pathid, blob_path, entry))
+        self.add_to_queue_front(queue, blobid, &mut entry)?;
+        tree.insert_and_incref(pathid, &mut self.blob_table, blobid, Holder::new(&entry)?)?;
+        Ok((blobid, entry))
     }
 
-    fn prepare_blob_file(&mut self, pathid: PathId, size: u64) -> Result<PathBuf, StorageError> {
-        let blob_dir = self.subsystem.blob_dir.as_path();
-        let blob_path = blob_dir.join(pathid.hex());
+    /// Build a path for storing a blob with the given [BlobId].
+    fn blob_path(&mut self, blobid: BlobId) -> PathBuf {
+        self.subsystem.blob_dir.join(blobid.to_string())
+    }
+
+    /// Create the blob file with the given path.
+    fn prepare_blob_file(
+        &mut self,
+        blob_path: &std::path::Path,
+        size: u64,
+    ) -> Result<(), StorageError> {
+        let blob_dir = &self.subsystem.blob_dir;
         if !blob_dir.exists() {
             std::fs::create_dir_all(blob_dir)?;
         }
@@ -512,24 +563,19 @@ impl<'a> WritableOpenBlob<'a> {
         }
         file.flush()?;
 
-        Ok(blob_path)
+        Ok(())
     }
 
     /// Delete the blob and its associated data on filesystem, if it exists.
-    pub(crate) fn delete<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn delete(
         &mut self,
         tree: &mut WritableOpenTree,
-        loc: L,
+        blobid: BlobId,
     ) -> Result<(), StorageError> {
-        let pathid = match tree.resolve(loc)? {
-            Some(pathid) => pathid,
-            None => return Ok(()), // Nothing to delete
-        };
-
-        if !self.remove_blob_entry(tree, pathid)? {
+        if !self.remove_blob_entry(tree, blobid)? {
             return Ok(());
         }
-        let blob_path = self.subsystem.blob_dir.join(pathid.hex());
+        let blob_path = self.blob_path(blobid);
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
@@ -553,8 +599,8 @@ impl<'a> WritableOpenBlob<'a> {
             Some(pathid) => pathid,
             None => return Ok(()), // Nothing to modify
         };
-
-        let mut blob_entry = match self.blob_table.get(BlobId::from_pathid(pathid))? {
+        let blobid = BlobId::from_pathid(pathid);
+        let mut blob_entry = match self.blob_table.get(blobid)? {
             None => {
                 return Ok(());
             }
@@ -570,14 +616,14 @@ impl<'a> WritableOpenBlob<'a> {
         self.remove_from_queue(&blob_entry)?;
 
         // Add to new queue
-        self.add_to_queue_front(target, pathid, &mut blob_entry)?;
+        self.add_to_queue_front(target, blobid, &mut blob_entry)?;
 
         // Update the entry in the table
-        self.blob_table.insert(
-            BlobId::from_pathid(pathid),
-            Holder::with_content(blob_entry)?,
-        )?;
-        dirty.mark_dirty(pathid, "set_protected")?;
+        self.blob_table
+            .insert(blobid, Holder::with_content(blob_entry)?)?;
+        if blobid.index() == 0 {
+            dirty.mark_dirty(pathid, "move_to_queue")?;
+        }
         self.report_disk_usage_changed();
 
         Ok(())
@@ -599,20 +645,21 @@ impl<'a> WritableOpenBlob<'a> {
             Some(pathid) => pathid,
             None => return Ok(None), // Nothing to export
         };
-        let realpath = self.subsystem.blob_dir.join(pathid.hex());
+        let blobid = BlobId::from_pathid(pathid);
+        let realpath = self.blob_path(blobid);
         let m = match realpath.metadata() {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
 
-        self.remove_blob_entry(tree, pathid)?;
+        self.remove_blob_entry(tree, blobid)?;
         self.report_disk_usage_changed();
         self.registry.realize_blocking(&m);
 
         Ok(Some(realpath))
     }
 
-    /// Setup the database to move some existing file into and return the
+    /// Setup the database to add some existing file and return the
     /// path to write to.
     ///
     /// This assumes that the file will be written completely and so
@@ -626,10 +673,36 @@ impl<'a> WritableOpenBlob<'a> {
         metadata: &std::fs::Metadata,
     ) -> Result<PathBuf, StorageError> {
         let loc = loc.into();
-        let size = metadata.len();
         let queue = choose_queue(tree, marks, loc.borrow())?;
-        let (pathid, blob_path, mut entry) =
-            self.create_entry(tree, loc, &Version::Indexed(hash.clone()), queue, size)?;
+        let (_, realpath) =
+            self.import_into_queue(tree, loc, &Version::Indexed(hash.clone()), queue, metadata)?;
+        Ok(realpath)
+    }
+
+    /// Setup the database to keep some existing file into the blob
+    /// store as an archive and return the path to write to.
+    pub(crate) fn import_into_archive<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        version: &Version,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(BlobId, PathBuf), StorageError> {
+        self.import_into_queue(tree, loc, version, LruQueueId::Archived, metadata)
+    }
+
+    pub(crate) fn import_into_queue<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        loc: L,
+        version: &Version,
+        queue: LruQueueId,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(BlobId, PathBuf), StorageError> {
+        let loc = loc.into();
+        let size = metadata.len();
+        let (blobid, mut entry) = self.create_entry(tree, loc, version, queue, size)?;
+        let blob_path = self.blob_path(blobid);
 
         // Set written areas to complete (but not verified) and update
         // trusting that metadata is going to be the blob file
@@ -638,11 +711,24 @@ impl<'a> WritableOpenBlob<'a> {
         entry.verified = false;
         self.update_disk_usage(&mut entry, metadata)?;
         self.blob_table
-            .insert(BlobId::from_pathid(pathid), Holder::with_content(entry)?)?;
+            .insert(blobid, Holder::with_content(entry)?)?;
         self.report_disk_usage_changed();
 
         // Return the path where the file should be moved
-        Ok(blob_path)
+        Ok((blobid, blob_path))
+    }
+
+    /// Return the next available [BlobId] with index >= 1.
+    fn next_blob_id_with_index(&self, pathid: PathId) -> Result<BlobId, StorageError> {
+        let mut current = BlobId::from_pathid(pathid);
+        while let Some(next) = current.next_index() {
+            current = next;
+            if self.blob_table.get(current)?.is_none() {
+                return Ok(next);
+            }
+        }
+
+        Err(StorageError::BlobIdSpaceExhausted)
     }
 
     /// Mark the blob as accessed.
@@ -651,8 +737,8 @@ impl<'a> WritableOpenBlob<'a> {
     /// at the front of its queue.
     ///
     /// Does nothing if the blob doesn't exist.
-    fn mark_accessed(&mut self, pathid: PathId) -> Result<(), StorageError> {
-        let mut blob_entry = match self.blob_table.get(BlobId::from_pathid(pathid))? {
+    fn mark_accessed(&mut self, blobid: BlobId) -> Result<(), StorageError> {
+        let mut blob_entry = match self.blob_table.get(blobid)? {
             None => {
                 return Ok(());
             }
@@ -665,13 +751,11 @@ impl<'a> WritableOpenBlob<'a> {
         }
 
         // Move to the front of the queue
-        self.move_to_front(pathid, &mut blob_entry)?;
+        self.move_to_front(blobid, &mut blob_entry)?;
 
         // Update the entry in the table
-        self.blob_table.insert(
-            BlobId::from_pathid(pathid),
-            Holder::with_content(blob_entry)?,
-        )?;
+        self.blob_table
+            .insert(blobid, Holder::with_content(blob_entry)?)?;
 
         Ok(())
     }
@@ -732,8 +816,9 @@ impl<'a> WritableOpenBlob<'a> {
             Some(pathid) => pathid,
             None => return Ok(false), // Nothing to extend
         };
+        let blobid = BlobId::from_pathid(pathid);
 
-        let mut blob_entry = match get_blob_entry(&self.blob_table, pathid)? {
+        let mut blob_entry = match get_blob_entry(&self.blob_table, blobid)? {
             Some(e) => e,
             None => return Ok(false),
         };
@@ -743,43 +828,61 @@ impl<'a> WritableOpenBlob<'a> {
         blob_entry.written_areas = blob_entry.written_areas.union(new_range);
 
         // Update disk usage if the blob file exists
-        let blob_path = self.subsystem.blob_dir.join(pathid.hex());
+        let blob_path = self.blob_path(blobid);
         if let Ok(metadata) = blob_path.metadata() {
             self.update_disk_usage(&mut blob_entry, &metadata)?;
             self.report_disk_usage_changed();
         }
 
-        self.blob_table.insert(
-            BlobId::from_pathid(pathid),
-            Holder::with_content(blob_entry)?,
-        )?;
+        self.blob_table
+            .insert(blobid, Holder::with_content(blob_entry)?)?;
 
         Ok(true)
     }
 
     /// Delete blobs as necessary to reach the target total size, in bytes.
-    ///
-    /// Returns the final disk usage.
     pub(crate) fn cleanup(
         &mut self,
         tree: &mut WritableOpenTree,
-        target: u64,
+        target_bytes: u64,
     ) -> Result<(), StorageError> {
-        // Get the WorkingArea queue
-        let mut queue =
-            match get_queue_if_available(&self.blob_lru_queue_table, LruQueueId::WorkingArea)? {
-                Some(q) => q,
-                None => {
-                    // No queue exists, nothing to clean up
-                    return Ok(());
-                }
-            };
+        let (archived_removed, remaining) =
+            self.cleanup_queue(tree, target_bytes, LruQueueId::Archived)?;
+        log::debug!("==== target {target_bytes} remaining {remaining}");
+        let (cached_removed, _) = self.cleanup_queue(
+            tree,
+            target_bytes.saturating_sub(remaining),
+            LruQueueId::Cached,
+        )?;
+        if archived_removed > 0 || cached_removed > 0 {
+            self.report_disk_usage_changed();
+        }
+
+        Ok(())
+    }
+
+    /// Delete entries from the given queue, to reach the given target size.
+    ///
+    /// Return the number of entries removed and remaining disk usage
+    /// of the queue after the cleanup was executed.
+    fn cleanup_queue(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        target: u64,
+        queue_id: LruQueueId,
+    ) -> Result<(i32, u64), StorageError> {
+        let mut queue = match get_queue_if_available(&self.blob_lru_queue_table, queue_id)? {
+            Some(q) => q,
+            None => {
+                // Nothing to clean up
+                return Ok((0, 0));
+            }
+        };
+        let tag = self.tag;
 
         log::debug!(
-            "[{}] Cleaning up of WorkingArea with disk usage: {}, target: {}",
+            "[{tag}] Cleaning up {queue_id:?} disk usage: {}, target: {target}",
             queue.disk_usage,
-            target,
-            self.tag
         );
 
         let mut prev = queue.tail;
@@ -791,50 +894,43 @@ impl<'a> WritableOpenBlob<'a> {
             prev = current.prev;
 
             log::debug!(
-                "[{}] Evicted blob from WorkingArea: {current_id} ({} bytes)",
+                "[{tag}] Evicted blob from {queue_id:?}: {current_id} ({} bytes)",
                 current.disk_usage,
-                self.tag
             );
             self.remove_from_queue_update_entry(&current, &mut queue)?;
             removed_count += 1;
-            tree.remove_and_decref(
-                current_id,
-                &mut self.blob_table,
-                BlobId::from_pathid(current_id),
-            )?;
+            tree.remove_and_decref(current_id.pathid(), &mut self.blob_table, current_id)?;
 
             // Remove the blob file
-            let blob_path = self.subsystem.blob_dir.join(current_id.hex());
+            let blob_path = self.blob_path(current_id);
             if blob_path.exists() {
                 std::fs::remove_file(&blob_path)?;
             }
         }
 
         log::debug!(
-            "[{}] Evicted {removed_count} entries from WorkingArea disk usage now {} (target: {target})",
+            "[{tag}] Evicted {removed_count} {queue_id:?} entries. Disk usage now {} (target: {target})",
             queue.disk_usage,
-            self.tag
         );
 
         if removed_count > 0 {
             self.blob_lru_queue_table
-                .insert(LruQueueId::WorkingArea as u16, Holder::new(&queue)?)?;
-            self.report_disk_usage_changed();
+                .insert(queue_id as u16, Holder::new(&queue)?)?;
         }
 
-        Ok(())
+        Ok((removed_count, queue.disk_usage))
     }
 
-    /// Add a blob to the front of the WorkingArea queue.
+    /// Add a blob to the front of the Cached queue.
     fn add_to_queue_front(
         &mut self,
         queue_id: LruQueueId,
-        pathid: PathId,
+        blobid: BlobId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         let mut queue =
             get_queue_if_available(&self.blob_lru_queue_table, queue_id)?.unwrap_or_default();
-        self.add_to_queue_front_update_entry(queue_id, pathid, blob_entry, &mut queue)?;
+        self.add_to_queue_front_update_entry(queue_id, blobid, blob_entry, &mut queue)?;
         self.blob_lru_queue_table
             .insert(queue_id as u16, Holder::with_content(queue)?)?;
 
@@ -844,24 +940,24 @@ impl<'a> WritableOpenBlob<'a> {
     fn add_to_queue_front_update_entry(
         &mut self,
         queue_id: LruQueueId,
-        pathid: PathId,
+        blobid: BlobId,
         blob_entry: &mut BlobTableEntry,
         queue: &mut QueueTableEntry,
     ) -> Result<(), StorageError> {
         blob_entry.queue = queue_id;
         if let Some(head_id) = queue.head {
             let mut head = follow_queue_link(&self.blob_table, head_id)?;
-            head.prev = Some(pathid);
+            head.prev = Some(blobid);
 
             self.blob_table
-                .insert(BlobId::from_pathid(head_id), Holder::with_content(head)?)?;
+                .insert(head_id, Holder::with_content(head)?)?;
         } else {
             // This is the first node in the queue, so both the head
             // and the tail
-            queue.tail = Some(pathid);
+            queue.tail = Some(blobid);
         }
         blob_entry.next = queue.head;
-        queue.head = Some(pathid);
+        queue.head = Some(blobid);
         blob_entry.prev = None;
         queue.disk_usage += blob_entry.disk_usage;
 
@@ -890,7 +986,7 @@ impl<'a> WritableOpenBlob<'a> {
             let mut prev = follow_queue_link(&self.blob_table, prev_id)?;
             prev.next = blob_entry.next;
             self.blob_table
-                .insert(BlobId::from_pathid(prev_id), Holder::with_content(prev)?)?;
+                .insert(prev_id, Holder::with_content(prev)?)?;
         } else {
             // This was the first node
             queue.head = blob_entry.next;
@@ -899,7 +995,7 @@ impl<'a> WritableOpenBlob<'a> {
             let mut next = follow_queue_link(&self.blob_table, next_id)?;
             next.prev = blob_entry.prev;
             self.blob_table
-                .insert(BlobId::from_pathid(next_id), Holder::with_content(next)?)?;
+                .insert(next_id, Holder::with_content(next)?)?;
         } else {
             // This was the last node
             queue.tail = blob_entry.prev;
@@ -940,11 +1036,11 @@ impl<'a> WritableOpenBlob<'a> {
     fn remove_blob_entry(
         &mut self,
         tree: &mut WritableOpenTree<'_>,
-        pathid: PathId,
+        blobid: BlobId,
     ) -> Result<bool, StorageError> {
-        if let Some(entry) = get_blob_entry(&self.blob_table, pathid)? {
+        if let Some(entry) = get_blob_entry(&self.blob_table, blobid)? {
             self.remove_from_queue(&entry)?;
-            tree.remove_and_decref(pathid, &mut self.blob_table, BlobId::from_pathid(pathid))?;
+            tree.remove_and_decref(blobid.pathid(), &mut self.blob_table, blobid)?;
             return Ok(true);
         }
 
@@ -954,7 +1050,7 @@ impl<'a> WritableOpenBlob<'a> {
     /// Move the blob to the front of its queue
     fn move_to_front(
         &mut self,
-        pathid: PathId,
+        blobid: BlobId,
         blob_entry: &mut BlobTableEntry,
     ) -> Result<(), StorageError> {
         if blob_entry.prev.is_none() {
@@ -964,10 +1060,61 @@ impl<'a> WritableOpenBlob<'a> {
         let queue_id = blob_entry.queue;
         let mut queue = get_queue_must_exist(&self.blob_lru_queue_table, queue_id)?;
         self.remove_from_queue_update_entry(blob_entry, &mut queue)?;
-        self.add_to_queue_front_update_entry(queue_id, pathid, blob_entry, &mut queue)?;
+        self.add_to_queue_front_update_entry(queue_id, blobid, blob_entry, &mut queue)?;
         self.blob_lru_queue_table
             .insert(queue_id as u16, Holder::with_content(queue)?)?;
         Ok(())
+    }
+}
+
+pub(crate) struct ArchivedBlobIterator<'a> {
+    iter: Option<Result<redb::Range<'a, BlobId, Holder<'static, BlobTableEntry>>, StorageError>>,
+}
+impl<'a> ArchivedBlobIterator<'a> {
+    fn new<'b, L: Into<TreeLoc<'b>>>(
+        table: &'a impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Self {
+        match tree.resolve(loc) {
+            Ok(Some(pathid)) => {
+                let iter_or_err = table
+                    .range(BlobId::first_index_of(pathid)..BlobId::from_pathid(pathid.plus(1)))
+                    .map_err(|e| StorageError::from(e));
+
+                Self {
+                    iter: Some(iter_or_err),
+                }
+            }
+            Ok(None) => Self { iter: None },
+            Err(err) => Self {
+                iter: Some(Err(err)),
+            },
+        }
+    }
+
+    fn next_internal(&mut self) -> Result<Option<BlobInfo>, StorageError> {
+        match &mut self.iter {
+            None => Ok(None),
+            Some(Err(_)) => Err(std::mem::take(&mut self.iter).unwrap().err().unwrap()),
+            Some(Ok(iter)) => match iter.next() {
+                Some(Err(err)) => Err(err.into()),
+                Some(Ok((key, val))) => {
+                    let blobid = key.value();
+                    let entry = val.value().parse()?;
+
+                    Ok(Some(BlobInfo::new(blobid, entry)))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+}
+impl<'a> Iterator for ArchivedBlobIterator<'a> {
+    type Item = Result<BlobInfo, StorageError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_internal().transpose()
     }
 }
 
@@ -978,8 +1125,8 @@ where
 {
     blob_table: &'a T,
     err: Option<StorageError>,
-    next: Option<PathId>,
-    next_fn: fn(BlobTableEntry) -> Option<PathId>,
+    next: Option<BlobId>,
+    next_fn: fn(BlobTableEntry) -> Option<BlobId>,
 }
 
 #[allow(dead_code)]
@@ -1028,7 +1175,7 @@ impl<'a, T> Iterator for QueueIterator<'a, T>
 where
     T: redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
 {
-    type Item = Result<PathId, StorageError>;
+    type Item = Result<BlobId, StorageError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.err.take() {
@@ -1036,10 +1183,10 @@ where
         }
         match self.next.take() {
             None => None,
-            Some(pathid) => {
+            Some(blobid) => {
                 {
                     // return current and move to next
-                    match follow_queue_link(self.blob_table, pathid) {
+                    match follow_queue_link(self.blob_table, blobid) {
                         Err(err) => {
                             self.err = Some(err);
                             self.next = None;
@@ -1049,7 +1196,7 @@ where
                         }
                     };
                 };
-                Some(Ok(pathid))
+                Some(Ok(blobid))
             }
         }
     }
@@ -1062,7 +1209,7 @@ fn choose_queue<'a, L: Into<TreeLoc<'a>>>(
 ) -> Result<LruQueueId, StorageError> {
     let pathid = tree.resolve_partial(loc)?;
     let queue = match marks.get(tree, pathid)? {
-        Mark::Watch | Mark::Default => LruQueueId::WorkingArea,
+        Mark::Watch | Mark::Default => LruQueueId::Cached,
         Mark::Keep | Mark::Own => LruQueueId::Protected,
     };
     Ok(queue)
@@ -1101,9 +1248,9 @@ fn get_queue_must_exist(
 
 fn get_blob_entry(
     blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blobid: BlobId,
 ) -> Result<Option<BlobTableEntry>, StorageError> {
-    if let Some(entry) = blob_table.get(BlobId::from_pathid(pathid))? {
+    if let Some(entry) = blob_table.get(blobid)? {
         Ok(Some(entry.value().parse()?))
     } else {
         Ok(None)
@@ -1112,10 +1259,10 @@ fn get_blob_entry(
 
 fn follow_queue_link(
     blob_table: &impl redb::ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blobid: BlobId,
 ) -> Result<BlobTableEntry, StorageError> {
-    get_blob_entry(blob_table, pathid)?
-        .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {pathid}")))
+    get_blob_entry(blob_table, blobid)?
+        .ok_or_else(|| StorageError::InconsistentDatabase(format!("invalid queue link {blobid}")))
 }
 
 /// Error returned by Blob when reading outside the available range.
@@ -1177,7 +1324,7 @@ impl Blob {
         info: BlobInfo,
     ) -> Result<Self, StorageError> {
         let blob_dir = db.blobs().blob_dir.as_path();
-        let path = blob_dir.join(info.pathid.hex());
+        let path = blob_dir.join(info.blobid.to_string());
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1193,7 +1340,7 @@ impl Blob {
         let blobs = db.blobs();
         let shared = blobs.registry.get(db, &path, &info)?;
         let range_rx = shared.subscribe();
-        let _ = blobs.accessed_tx.send(info.pathid);
+        let _ = blobs.accessed_tx.send(info.blobid);
 
         Ok(Self {
             info,
@@ -1269,7 +1416,7 @@ impl Blob {
     /// any remote peers. The returned [FileAvailability] is guaranteed to have at least one peer.
     pub async fn remote_availability(&self) -> Result<Option<RemoteAvailability>, StorageError> {
         let db = Arc::clone(&self.db);
-        let pathid = self.info.pathid;
+        let pathid = self.info.blobid.pathid();
         let hash = if let Some(h) = self.info.version.indexed_hash() {
             h.clone()
         } else {
@@ -1359,7 +1506,7 @@ impl Blob {
     pub async fn realize(self) -> Result<tokio::fs::File, StorageError> {
         let Self { db, info, file, .. } = self;
         let _guard = db.cache().inhibit_watcher();
-        let pathid = info.pathid;
+        let pathid = info.blobid.pathid();
 
         if self.shared.cache_status().await.is_none() {
             // Blob has already been realized, there's nothing to do
@@ -1474,10 +1621,10 @@ impl AsyncSeek for Blob {
 
 fn get_read_op(
     blob_table: &impl ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
-    pathid: PathId,
+    blobid: BlobId,
 ) -> Result<Option<BlobInfo>, StorageError> {
-    if let Some(e) = blob_table.get(BlobId::from_pathid(pathid))? {
-        Ok(Some(BlobInfo::new(pathid, e.value().parse()?)))
+    if let Some(e) = blob_table.get(blobid)? {
+        Ok(Some(BlobInfo::new(blobid, e.value().parse()?)))
     } else {
         Ok(None)
     }
@@ -1489,16 +1636,25 @@ fn disk_usage_op(
 ) -> Result<DiskUsage, StorageError> {
     let mut total: u64 = 0;
     let mut evictable: u64 = 0;
+    let mut archived: u64 = 0;
     for e in blob_lru_queue_table.iter()? {
         let (k, v) = e?;
         let disk_usage = v.value().parse()?.disk_usage;
         total += disk_usage;
-        if k.value() == LruQueueId::WorkingArea as u16 {
+        let queue_id = k.value();
+        if queue_id == (LruQueueId::Cached as u16) {
             evictable += disk_usage;
+        } else if queue_id == (LruQueueId::Archived as u16) {
+            evictable += disk_usage;
+            archived += disk_usage;
         }
     }
 
-    Ok(DiskUsage { total, evictable })
+    Ok(DiskUsage {
+        total,
+        evictable,
+        archived,
+    })
 }
 
 #[cfg(test)]
@@ -1555,8 +1711,8 @@ mod tests {
         }
 
         /// Return the path to a blob file for test use.
-        fn blob_path(&self, pathid: PathId) -> std::path::PathBuf {
-            self.blob_dir.join(pathid.hex()).to_path_buf()
+        fn blob_path(&self, blobid: BlobId) -> std::path::PathBuf {
+            self.blob_dir.join(blobid.to_string()).to_path_buf()
         }
 
         fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction<'_>> {
@@ -1570,7 +1726,10 @@ mod tests {
         fn get_blob_entry(&self, pathid: PathId) -> anyhow::Result<BlobTableEntry> {
             let txn = self.begin_write()?;
             let blobs = txn.write_blobs()?;
-            Ok(get_blob_entry(&blobs.blob_table, pathid)?.ok_or(StorageError::NotFound)?)
+            Ok(
+                get_blob_entry(&blobs.blob_table, BlobId::from_pathid(pathid))?
+                    .ok_or(StorageError::NotFound)?,
+            )
         }
 
         fn create_blob_with_partial_data<'b, L: Into<TreeLoc<'b>>>(
@@ -1591,11 +1750,11 @@ mod tests {
                 info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
 
                 if partial > 0 {
-                    let blob_path = self.blob_path(info.pathid);
+                    let blob_path = self.blob_path(info.blobid);
                     std::fs::write(&blob_path, &test_data[0..partial])?;
                     blobs.extend_cache_status(
                         &tree,
-                        info.pathid,
+                        info.blobid.pathid(),
                         &Version::Indexed(hash.clone()),
                         &ByteRanges::single(0, partial as u64),
                     )?;
@@ -1611,6 +1770,26 @@ mod tests {
             let tree = txn.read_tree()?;
             let blobs = txn.read_blobs()?;
             Ok(blobs.get(&tree, loc)?)
+        }
+
+        fn create_archive<'b, L: Into<TreeLoc<'b>>>(
+            &self,
+            tree: &mut WritableOpenTree<'_>,
+            blobs: &mut WritableOpenBlob,
+            loc: L,
+            test: &str,
+        ) -> anyhow::Result<BlobInfo> {
+            let file = self.tempdir.child(&test);
+            file.write_str(&test)?;
+            let (blobid, destpath) = blobs.import_into_archive(
+                tree,
+                loc,
+                &Version::Indexed(hash::digest(&test)),
+                &std::fs::symlink_metadata(file.path())?,
+            )?;
+            std::fs::rename(file.path(), destpath)?;
+
+            Ok(blobs.get_with_blobid(blobid)?.expect("{blobid}"))
         }
     }
 
@@ -1629,11 +1808,11 @@ mod tests {
             assert_eq!(4, info.size);
             assert_eq!(ByteRanges::new(), info.available_ranges);
 
-            let pathid = info.pathid;
+            let pathid = info.blobid.pathid();
             assert_eq!(tree.resolve(path)?, Some(pathid));
-            assert_eq!(Some(info), blobs.get_with_pathid(pathid)?);
+            assert_eq!(Some(info.clone()), blobs.get_with_pathid(pathid)?);
 
-            let file_path = fixture.blob_path(pathid);
+            let file_path = fixture.blob_path(info.blobid);
             assert!(file_path.exists());
             let m = file_path.metadata()?;
             assert_eq!(4, m.len());
@@ -1677,10 +1856,10 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        let actual_info = blobs.get_with_pathid(new_info.pathid)?.unwrap();
+        let actual_info = blobs.get_with_pathid(new_info.blobid.pathid())?.unwrap();
         assert_eq!(actual_info, new_info);
 
-        let m = fixture.blob_path(actual_info.pathid).metadata()?;
+        let m = fixture.blob_path(actual_info.blobid).metadata()?;
         assert_eq!(4, m.len());
         assert_eq!(0, m.blocks()); // sparse file
 
@@ -1720,7 +1899,7 @@ mod tests {
         assert_eq!(actual_info, new_info);
         assert_eq!(
             "old",
-            std::fs::read_to_string(fixture.blob_path(actual_info.pathid))?
+            std::fs::read_to_string(fixture.blob_path(actual_info.blobid))?
         );
 
         Ok(())
@@ -1746,7 +1925,7 @@ mod tests {
 
         let hash = test_hash();
         assert_eq!(
-            LruQueueId::WorkingArea,
+            LruQueueId::Cached,
             blobs
                 .create(&mut tree, &marks, &watch_path, &hash, 4)?
                 .queue
@@ -1773,9 +1952,7 @@ mod tests {
             let marks = txn.write_marks()?;
             let mut tree = txn.write_tree()?;
 
-            blobs
-                .create(&mut tree, &marks, &path, &hash::digest("test"), 4)?
-                .pathid;
+            blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
         }
         txn.commit()?;
 
@@ -1785,11 +1962,11 @@ mod tests {
             let mut tree = txn.write_tree()?;
 
             let pathid = tree.expect(&path)?;
-            blobs.delete(&mut tree, &path)?;
+            blobs.delete(&mut tree, BlobId::from_pathid(pathid))?;
 
             assert_eq!(None, blobs.get_with_pathid(pathid)?);
 
-            let file_path = fixture.blob_path(pathid);
+            let file_path = fixture.blob_path(BlobId::from_pathid(pathid));
             assert!(!file_path.exists());
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2024,7 +2201,7 @@ mod tests {
         let fixture = Fixture::setup()?;
         let path = Path::parse("baa/baa")?;
         fixture.create_blob_with_partial_data(&path, "Baa, baa, black sheep", 21)?;
-        let BlobInfo { pathid, .. } = fixture.blob_info(&path)?.unwrap();
+        let BlobInfo { blobid, .. } = fixture.blob_info(&path)?.unwrap();
 
         assert_eq!(true, Blob::open(&fixture.db, &path)?.verify().await?);
 
@@ -2045,10 +2222,10 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        assert!(blobs.get_with_pathid(pathid)?.is_none());
+        assert!(blobs.get_with_pathid(blobid.pathid())?.is_none());
 
         // The LRU queue must have been updated properly.
-        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
+        assert!(blobs.head(LruQueueId::Cached).next().is_none());
 
         Ok(())
     }
@@ -2110,12 +2287,12 @@ mod tests {
         );
 
         let BlobInfo {
-            pathid, verified, ..
+            blobid, verified, ..
         } = fixture.blob_info(&path)?.unwrap();
         assert_eq!(false, verified);
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(pathid)?;
+        let blob_entry = fixture.get_blob_entry(blobid.pathid())?;
         assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
@@ -2163,12 +2340,12 @@ mod tests {
         );
 
         let BlobInfo {
-            pathid, verified, ..
+            blobid, verified, ..
         } = fixture.blob_info(&path)?.unwrap();
         assert_eq!(false, verified);
 
         // Disk usage must be set.
-        let blob_entry = fixture.get_blob_entry(pathid)?;
+        let blob_entry = fixture.get_blob_entry(blobid.pathid())?;
         assert!(blob_entry.disk_usage > DiskUsage::INODE);
 
         Ok(())
@@ -2211,8 +2388,8 @@ mod tests {
         let mut blobs = txn.write_blobs()?;
         let mut tree = txn.write_tree()?;
 
-        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
-        assert!(blobs.tail(LruQueueId::WorkingArea).next().is_none());
+        assert!(blobs.head(LruQueueId::Cached).next().is_none());
+        assert!(blobs.tail(LruQueueId::Cached).next().is_none());
 
         let one = blobs
             .create(
@@ -2222,18 +2399,18 @@ mod tests {
                 &hash::digest("one"),
                 3,
             )?
-            .pathid;
+            .blobid;
 
         assert_eq!(
             vec![one],
             blobs
-                .head(LruQueueId::WorkingArea)
+                .head(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
         assert_eq!(
             vec![one],
             blobs
-                .tail(LruQueueId::WorkingArea)
+                .tail(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
 
@@ -2245,18 +2422,18 @@ mod tests {
                 &hash::digest("two"),
                 3,
             )?
-            .pathid;
+            .blobid;
 
         assert_eq!(
             vec![two, one],
             blobs
-                .head(LruQueueId::WorkingArea)
+                .head(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
         assert_eq!(
             vec![one, two],
             blobs
-                .tail(LruQueueId::WorkingArea)
+                .tail(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
 
@@ -2279,7 +2456,7 @@ mod tests {
                 &hash::digest("one"),
                 3,
             )?
-            .pathid;
+            .blobid;
 
         let two = blobs
             .create(
@@ -2289,7 +2466,7 @@ mod tests {
                 &hash::digest("two"),
                 3,
             )?
-            .pathid;
+            .blobid;
         let three = blobs
             .create(
                 &mut tree,
@@ -2298,12 +2475,12 @@ mod tests {
                 &hash::digest("three"),
                 3,
             )?
-            .pathid;
+            .blobid;
 
         assert_eq!(
             vec![three, two, one],
             blobs
-                .head(LruQueueId::WorkingArea)
+                .head(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
 
@@ -2312,15 +2489,15 @@ mod tests {
         assert_eq!(
             vec![three, one],
             blobs
-                .head(LruQueueId::WorkingArea)
+                .head(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
 
         blobs.delete(&mut tree, one)?;
         blobs.delete(&mut tree, three)?;
 
-        assert!(blobs.head(LruQueueId::WorkingArea).next().is_none());
-        assert!(blobs.tail(LruQueueId::WorkingArea).next().is_none());
+        assert!(blobs.head(LruQueueId::Cached).next().is_none());
+        assert!(blobs.tail(LruQueueId::Cached).next().is_none());
 
         Ok(())
     }
@@ -2329,13 +2506,16 @@ mod tests {
     async fn mark_accessed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
+        let one: BlobId;
+        let two: BlobId;
+        let three: BlobId;
         let txn = fixture.begin_write()?;
         {
             let marks = txn.read_marks()?;
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
 
-            let one = blobs
+            one = blobs
                 .create(
                     &mut tree,
                     &marks,
@@ -2343,9 +2523,9 @@ mod tests {
                     &hash::digest("one"),
                     3,
                 )?
-                .pathid;
+                .blobid;
 
-            let two = blobs
+            two = blobs
                 .create(
                     &mut tree,
                     &marks,
@@ -2353,8 +2533,8 @@ mod tests {
                     &hash::digest("two"),
                     3,
                 )?
-                .pathid;
-            let three = blobs
+                .blobid;
+            three = blobs
                 .create(
                     &mut tree,
                     &marks,
@@ -2362,12 +2542,12 @@ mod tests {
                     &hash::digest("three"),
                     3,
                 )?
-                .pathid;
+                .blobid;
 
             assert_eq!(
                 vec![three, two, one],
                 blobs
-                    .head(LruQueueId::WorkingArea)
+                    .head(LruQueueId::Cached)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
         }
@@ -2376,35 +2556,29 @@ mod tests {
         let txn = fixture.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
-            let tree = txn.read_tree()?;
-
-            let two_pathid = tree.resolve(Path::parse("two")?)?.unwrap();
-            let three_pathid = tree.resolve(Path::parse("three")?)?.unwrap();
-            let one_pathid = tree.resolve(Path::parse("one")?)?.unwrap();
-
-            blobs.mark_accessed(two_pathid)?;
+            blobs.mark_accessed(two)?;
 
             assert_eq!(
-                vec![two_pathid, three_pathid, one_pathid],
+                vec![two, three, one],
                 blobs
-                    .head(LruQueueId::WorkingArea)
+                    .head(LruQueueId::Cached)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
-            blobs.mark_accessed(one_pathid)?;
+            blobs.mark_accessed(one)?;
 
             assert_eq!(
-                vec![one_pathid, two_pathid, three_pathid],
+                vec![one, two, three],
                 blobs
-                    .head(LruQueueId::WorkingArea)
+                    .head(LruQueueId::Cached)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
             // make sure the list is correct both ways
             assert_eq!(
-                vec![three_pathid, two_pathid, one_pathid],
+                vec![three, two, one],
                 blobs
-                    .tail(LruQueueId::WorkingArea)
+                    .tail(LruQueueId::Cached)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
         }
@@ -2445,7 +2619,8 @@ mod tests {
             assert_eq!(
                 DiskUsage {
                     total: 4 * DiskUsage::INODE,
-                    evictable: 2 * DiskUsage::INODE
+                    evictable: 2 * DiskUsage::INODE,
+                    archived: 0,
                 },
                 blobs.disk_usage()?
             );
@@ -2502,6 +2677,7 @@ mod tests {
         blob.update(0, &vec![1u8; 4096]).await?;
         blob.update_db().await?;
 
+        let blobid = blob.info.blobid;
         tokio::task::spawn_blocking(move || {
             let txn = fixture.begin_write()?;
             {
@@ -2510,7 +2686,7 @@ mod tests {
 
                 assert!(blobs.disk_usage()?.total > 0);
 
-                blobs.delete(&mut tree, &path)?;
+                blobs.delete(&mut tree, blobid)?;
 
                 assert_eq!(0, blobs.disk_usage()?.total);
             }
@@ -2524,38 +2700,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup() -> anyhow::Result<()> {
+    async fn cleanup_cached() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
-        let mut pathids = vec![PathId::ZERO; 4];
+        let mut infos = vec![];
         let txn = fixture.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
             let mut blobs = txn.write_blobs()?;
             let marks = txn.read_marks()?;
             for i in 0..4 {
-                pathids[i] = blobs
-                    .create(
-                        &mut tree,
-                        &marks,
-                        Path::parse(format!("{i}").as_str())?,
-                        &test_hash(),
-                        4096,
-                    )?
-                    .pathid;
+                infos.push(blobs.create(
+                    &mut tree,
+                    &marks,
+                    Path::parse(format!("{i}").as_str())?,
+                    &test_hash(),
+                    4096,
+                )?);
             }
 
             // set LRU order, from least recently used (2) to most
             // recently used (0)
-            blobs.mark_accessed(pathids[2])?;
-            blobs.mark_accessed(pathids[1])?;
-            blobs.mark_accessed(pathids[3])?;
-            blobs.mark_accessed(pathids[0])?;
+            blobs.mark_accessed(infos[2].blobid)?;
+            blobs.mark_accessed(infos[1].blobid)?;
+            blobs.mark_accessed(infos[3].blobid)?;
+            blobs.mark_accessed(infos[0].blobid)?;
         }
         txn.commit()?;
 
         for i in 0..4 {
-            let mut blob = Blob::open(&fixture.db, pathids[i])?;
+            let mut blob = Blob::open_with_info(&fixture.db, infos[i].clone())?;
             blob.update(0, &vec![1u8; 4096]).await?;
             blob.update_db().await?;
         }
@@ -2568,6 +2742,7 @@ mod tests {
                 DiskUsage {
                     total: DiskUsage::INODE * 4 + 4 * 4096,
                     evictable: DiskUsage::INODE * 4 + 4 * 4096,
+                    archived: 0,
                 },
                 blobs.disk_usage()?
             );
@@ -2585,19 +2760,82 @@ mod tests {
             );
 
             // the 2 least recently accessed are the ones that were deleted
-            assert!(blobs.get(&tree, pathids[2])?.is_none());
-            assert!(blobs.get(&tree, pathids[1])?.is_none());
+            assert!(blobs.get(&tree, infos[2].blobid.pathid())?.is_none());
+            assert!(blobs.get(&tree, infos[1].blobid.pathid())?.is_none());
 
             blobs.cleanup(&mut tree, 0)?; // remove all
             assert_eq!(0, blobs.disk_usage()?.evictable);
 
             for i in 0..4 {
-                assert!(blobs.get(&tree, pathids[i])?.is_none(), "blob {i}");
+                assert!(
+                    blobs.get(&tree, infos[i].blobid.pathid())?.is_none(),
+                    "blob {i}"
+                );
             }
         }
         let watch = fixture.db.blobs().watch_disk_usage();
         txn.commit()?;
         assert!(watch.has_changed()?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_archived() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let mut cached = vec![];
+        let mut archived = vec![];
+        let txn = fixture.begin_write()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.read_marks()?;
+        for i in 0..4 {
+            let path = Path::parse(format!("{i:02x}").as_str())?;
+            cached.push(
+                blobs
+                    .create(&mut tree, &marks, &path, &test_hash(), 4096)?
+                    .blobid,
+            );
+            for j in 0..2 {
+                archived.push(
+                    fixture
+                        .create_archive(&mut tree, &mut blobs, &path, &format!("{i:02x}-{j:02x}"))?
+                        .blobid,
+                );
+            }
+        }
+
+        let du = blobs.disk_usage()?;
+
+        // Clean most archives, leaving just one, the last one created
+        blobs.cleanup(
+            &mut tree,
+            (du.evictable - du.archived) + (du.archived / 8 + 1),
+        )?;
+
+        for (i, blobid) in archived.iter().enumerate() {
+            if i != 7 {
+                assert!(
+                    blobs.get_with_blobid(*blobid)?.is_none(),
+                    "archived[{i}] {blobid}"
+                );
+            }
+        }
+        assert!(blobs.get_with_blobid(archived[7])?.is_some());
+
+        for blobid in &cached {
+            assert!(blobs.get_with_blobid(*blobid)?.is_some(), "{blobid}");
+        }
+
+        // Now clean up everything
+        blobs.cleanup(&mut tree, 0)?;
+        for blobid in archived {
+            assert!(blobs.get_with_blobid(blobid)?.is_none(), "{blobid}");
+        }
+        for blobid in cached {
+            assert!(blobs.get_with_blobid(blobid)?.is_none(), "{blobid}");
+        }
 
         Ok(())
     }
@@ -2877,7 +3115,7 @@ mod tests {
 
             let path = Path::parse("test.txt")?;
             let blob_info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-            assert_eq!(LruQueueId::WorkingArea, blob_info.queue);
+            assert_eq!(LruQueueId::Cached, blob_info.queue);
 
             dirty.delete_range(0, 999)?; // clear all
             blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Protected)?;
@@ -2886,21 +3124,23 @@ mod tests {
             assert_eq!(LruQueueId::Protected, updated_info.queue);
 
             assert_eq!(
-                vec![blob_info.pathid],
+                vec![blob_info.blobid],
                 blobs
                     .head(LruQueueId::Protected)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
             assert_eq!(
-                vec![blob_info.pathid],
+                vec![blob_info.blobid],
                 blobs
                     .tail(LruQueueId::Protected)
                     .collect::<Result<Vec<_>, StorageError>>()?
             );
 
             assert_eq!(
-                Some(blob_info.pathid),
-                dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
+                Some(blob_info.blobid),
+                dirty
+                    .next_dirty(0)?
+                    .map(|(pathid, _)| BlobId::from_pathid(pathid))
             );
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2925,29 +3165,31 @@ mod tests {
         assert_eq!(LruQueueId::Protected, blob_info.queue);
 
         dirty.delete_range(0, 999)?; // clear all
-        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::WorkingArea)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Cached)?;
 
         let updated_info = blobs.get(&tree, &path)?.unwrap();
-        assert_eq!(LruQueueId::WorkingArea, updated_info.queue);
+        assert_eq!(LruQueueId::Cached, updated_info.queue);
 
         assert_eq!(
-            vec![blob_info.pathid],
+            vec![blob_info.blobid],
             blobs
-                .head(LruQueueId::WorkingArea)
+                .head(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
         assert_eq!(
-            vec![blob_info.pathid],
+            vec![blob_info.blobid],
             blobs
-                .tail(LruQueueId::WorkingArea)
+                .tail(LruQueueId::Cached)
                 .collect::<Result<Vec<_>, StorageError>>()?
         );
 
         assert!(blobs.head(LruQueueId::Protected).next().is_none());
 
         assert_eq!(
-            Some(blob_info.pathid),
-            dirty.next_dirty(0)?.map(|(pathid, _)| pathid)
+            Some(blob_info.blobid),
+            dirty
+                .next_dirty(0)?
+                .map(|(pathid, _)| BlobId::from_pathid(pathid))
         );
         Ok(())
     }
@@ -2972,7 +3214,7 @@ mod tests {
         // nothing changed, and the dirty bit wasn't set
         let updated_info = blobs.get(&tree, &path)?.unwrap();
         assert_eq!(LruQueueId::Protected, updated_info.queue);
-        assert_eq!(blob_info.pathid, updated_info.pathid);
+        assert_eq!(blob_info.blobid, updated_info.blobid);
         assert!(dirty.next_dirty(0)?.is_none());
 
         Ok(())
@@ -3011,7 +3253,8 @@ mod tests {
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE,
-                evictable: DiskUsage::INODE
+                evictable: DiskUsage::INODE,
+                archived: 0,
             },
             blobs.disk_usage()?
         );
@@ -3021,17 +3264,19 @@ mod tests {
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE,
-                evictable: 0
+                evictable: 0,
+                archived: 0,
             },
             blobs.disk_usage()?
         );
 
-        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::WorkingArea)?;
+        blobs.move_to_queue(&tree, &mut dirty, &path, LruQueueId::Cached)?;
 
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE,
-                evictable: DiskUsage::INODE
+                evictable: DiskUsage::INODE,
+                archived: 0,
             },
             blobs.disk_usage()?
         );
@@ -3069,7 +3314,8 @@ mod tests {
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE,
-                evictable: DiskUsage::INODE
+                evictable: DiskUsage::INODE,
+                archived: 0,
             },
             *fixture.db.blobs().watch_disk_usage().borrow()
         );
@@ -3082,7 +3328,8 @@ mod tests {
         assert_eq!(
             DiskUsage {
                 total: DiskUsage::INODE + blksize,
-                evictable: DiskUsage::INODE + blksize
+                evictable: DiskUsage::INODE + blksize,
+                archived: 0,
             },
             *fixture.db.blobs().watch_disk_usage().borrow()
         );
@@ -3096,7 +3343,7 @@ mod tests {
         let shutdown = CancellationToken::new();
 
         let txn = fixture.begin_write()?;
-        let mut pathids = vec![];
+        let mut infos = vec![];
         {
             let marks = txn.read_marks()?;
             let mut blobs = txn.write_blobs()?;
@@ -3105,7 +3352,7 @@ mod tests {
             for i in 0..3 {
                 let path = Path::parse(format!("blob{i}.txt"))?;
                 let info = blobs.create(&mut tree, &marks, &path, &test_hash(), 100)?;
-                pathids.push(info.pathid);
+                infos.push(info);
             }
         }
         txn.commit()?;
@@ -3126,10 +3373,14 @@ mod tests {
         assert_eq!(1, fixture.db.blobs().accessed_tx.receiver_count());
 
         for _ in 0..20 {
-            drop(Blob::open(&fixture.db, pathids[0])?);
-            let _ = fixture.db.blobs().accessed_tx.send(PathId(999)); // invalid; should be ignored
-            drop(Blob::open(&fixture.db, pathids[2])?);
-            drop(Blob::open(&fixture.db, pathids[1])?);
+            drop(Blob::open_with_info(&fixture.db, infos[0].clone())?);
+            let _ = fixture
+                .db
+                .blobs()
+                .accessed_tx
+                .send(BlobId::from_pathid(PathId(999))); // invalid; should be ignored
+            drop(Blob::open_with_info(&fixture.db, infos[2].clone())?);
+            drop(Blob::open_with_info(&fixture.db, infos[1].clone())?);
         }
 
         // Cooldown period plus some buffer
@@ -3137,10 +3388,13 @@ mod tests {
 
         let txn = fixture.begin_read()?;
         let blobs = txn.read_blobs()?;
-        let queue_order: Vec<PathId> = blobs
-            .head(LruQueueId::WorkingArea)
+        let queue_order: Vec<BlobId> = blobs
+            .head(LruQueueId::Cached)
             .collect::<Result<Vec<_>, StorageError>>()?;
-        assert_eq!(vec![pathids[1], pathids[2], pathids[0]], queue_order);
+        assert_eq!(
+            vec![infos[1].blobid, infos[2].blobid, infos[0].blobid],
+            queue_order
+        );
 
         shutdown.cancel();
         handle.await?;
@@ -3426,9 +3680,9 @@ mod tests {
             Some(CacheStatus::Partial(6, ByteRanges::single(0, 3))),
             blob.cache_status().await
         );
+        let blobid = blob.info.blobid;
 
         tokio::task::spawn_blocking({
-            let path = path.clone();
             let db = Arc::clone(&fixture.db);
 
             move || {
@@ -3437,7 +3691,7 @@ mod tests {
                     let mut tree = txn.write_tree()?;
                     let mut blobs = txn.write_blobs()?;
 
-                    blobs.delete(&mut tree, &path)?;
+                    blobs.delete(&mut tree, blobid)?;
                 }
                 txn.commit()?;
 
@@ -3500,8 +3754,8 @@ mod tests {
         }
 
         let mut blob = Blob::open(&fixture.db, &path)?;
+        let blobid = blob.info.blobid;
         tokio::task::spawn_blocking({
-            let path = path.clone();
             let db = Arc::clone(&fixture.db);
 
             move || {
@@ -3510,7 +3764,7 @@ mod tests {
                     let mut tree = txn.write_tree()?;
                     let mut blobs = txn.write_blobs()?;
 
-                    blobs.delete(&mut tree, &path)?;
+                    blobs.delete(&mut tree, blobid)?;
                 }
                 txn.commit()?;
 
@@ -3551,6 +3805,63 @@ mod tests {
         assert_eq!(buf, b"foo\0\0\0");
 
         assert_eq!(false, path.within(&fixture.datadir).exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn archives() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.write_marks()?;
+        let mut tree = txn.write_tree()?;
+        let path = Path::parse("blob/test.txt")?;
+
+        let info = blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
+        let pathid = info.blobid.pathid();
+
+        let mut archives = vec![];
+        for i in [1, 2] {
+            let info = fixture.create_archive(&mut tree, &mut blobs, &path, &format!("file{i}"))?;
+            archives.push(info);
+        }
+
+        assert_eq!(0, info.blobid.index());
+        for (i, info) in archives.iter().enumerate() {
+            assert_eq!(pathid, info.blobid.pathid());
+            assert_eq!((i + 1) as u8, info.blobid.index());
+        }
+
+        for info in archives.iter() {
+            assert_eq!(Some(info.clone()), blobs.get_with_blobid(info.blobid)?);
+        }
+
+        let mut goal_iter = archives.iter();
+        let mut got_iter = blobs.archives(&tree, &path);
+
+        for i in [1, 2] {
+            let goal_info = goal_iter.next().expect("#{i}");
+            let got_info = got_iter.next().expect("#{i} option").expect("#{i} err");
+            assert_eq!(*goal_info, got_info, "#{i}")
+        }
+        assert!(got_iter.next().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_archives() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.write_marks()?;
+        let mut tree = txn.write_tree()?;
+        let path = Path::parse("blob/test.txt")?;
+
+        assert!(blobs.archives(&tree, &path).next().is_none());
+        blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
+        assert!(blobs.archives(&tree, &path).next().is_none());
 
         Ok(())
     }

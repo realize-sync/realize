@@ -44,9 +44,9 @@ struct ByteRange {
 
 # LRU Queue ID enum
 enum LruQueueId {
-  workingArea @0;
+  cached @0;
   protected @1;
-  pendingRemoval @2;
+  archived @2;
 }
 
 # An entry in the queue table.

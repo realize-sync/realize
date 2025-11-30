@@ -6,7 +6,6 @@ use capnp::message::ReaderOptions;
 use capnp::serialize_packed;
 use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Key, TypeName, Value};
-use std::ops::Range;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -192,10 +191,10 @@ impl Key for Layer {
 /// An entry in the queue table.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct QueueTableEntry {
-    /// First node in the queue (PartialPathId)
-    pub head: Option<PathId>,
-    /// Last node in the queue (PartialPathId)
-    pub tail: Option<PathId>,
+    /// First node in the queue
+    pub head: Option<BlobId>,
+    /// Last node in the queue
+    pub tail: Option<BlobId>,
     /// Total disk usage in bytes
     pub disk_usage: u64,
 }
@@ -214,14 +213,14 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
 
         let head_value = reader.get_head();
         let head = if head_value != 0 {
-            Some(PathId(head_value))
+            Some(BlobId::from_u64(head_value))
         } else {
             None
         };
 
         let tail_value = reader.get_tail();
         let tail = if tail_value != 0 {
-            Some(PathId(tail_value))
+            Some(BlobId::from_u64(tail_value))
         } else {
             None
         };
@@ -238,8 +237,8 @@ impl ByteConvertible<QueueTableEntry> for QueueTableEntry {
         let mut builder: blob_capnp::queue_table_entry::Builder =
             message.init_root::<blob_capnp::queue_table_entry::Builder>();
 
-        builder.set_head(self.head.map(|b| b.0).unwrap_or(0));
-        builder.set_tail(self.tail.map(|b| b.0).unwrap_or(0));
+        builder.set_head(self.head.map(|b| b.as_u64()).unwrap_or(0));
+        builder.set_tail(self.tail.map(|b| b.as_u64()).unwrap_or(0));
         builder.set_disk_usage(self.disk_usage);
 
         let mut buffer: Vec<u8> = Vec::new();
@@ -265,11 +264,11 @@ pub struct BlobTableEntry {
     /// Queue ID enum
     pub queue: LruQueueId,
 
-    /// Next blob in the queue (PartialPathId)
-    pub next: Option<PathId>,
+    /// Next blob in the queue
+    pub next: Option<BlobId>,
 
-    /// Previous blob in the queue (PartialPathId)
-    pub prev: Option<PathId>,
+    /// Previous blob in the queue
+    pub prev: Option<BlobId>,
 
     /// Disk usage in bytes
     pub disk_usage: u64,
@@ -290,14 +289,14 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         let version = parse_version(reader.get_version()?)?;
         let next_value = reader.get_next();
         let next = if next_value != 0 {
-            Some(PathId(next_value))
+            Some(BlobId::from_u64(next_value))
         } else {
             None
         };
 
         let prev_value = reader.get_prev();
         let prev = if prev_value != 0 {
-            Some(PathId(prev_value))
+            Some(BlobId::from_u64(prev_value))
         } else {
             None
         };
@@ -1629,12 +1628,13 @@ impl BlobId {
         BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS)
     }
 
-    /// Return a range that covers all [BlobId]s for the given [PathId].
-    pub(crate) fn pathid_range(pathid: PathId) -> Range<BlobId> {
-        Range {
-            start: BlobId::from_pathid(pathid),
-            end: BlobId::from_pathid(pathid.plus(1)),
-        }
+    /// Return the [BlobId] with index 0 for the given [PathId].
+    pub(crate) fn first_index_of(pathid: PathId) -> Self {
+        BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS | 1)
+    }
+
+    pub(crate) fn from_u64(val: u64) -> Self {
+        BlobId(val)
     }
 
     /// Return a [BlobId] with the same [PathId] and an increased index.
@@ -1658,6 +1658,12 @@ impl BlobId {
     /// Return the index of this [BlobId]
     pub(crate) fn index(&self) -> u8 {
         (self.0 & (BlobId::MAX_INDEX as u64) & 0xff) as u8
+    }
+
+    /// Return the underlying u64 value, to be re-created with
+    /// [BlobId::with_u64].
+    pub(crate) fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 
@@ -1741,9 +1747,13 @@ mod tests {
             version: Version::Indexed(Hash([2u8; 32])),
             content_size: 100,
             verified: false,
-            queue: LruQueueId::WorkingArea,
-            next: Some(PathId(0x0101010101010101)),
-            prev: Some(PathId(0x0202020202020202)),
+            queue: LruQueueId::Cached,
+            next: Some(BlobId::from_pathid(PathId(0x0101010101010101))),
+            prev: Some(
+                BlobId::from_pathid(PathId(0x0202020202020202))
+                    .next_index()
+                    .unwrap(),
+            ),
             disk_usage: 1024,
         };
 
@@ -1757,7 +1767,7 @@ mod tests {
             version: Version::Modified(Some(Hash([2u8; 32]))),
             content_size: 100,
             verified: false,
-            queue: LruQueueId::WorkingArea,
+            queue: LruQueueId::Cached,
             next: None,
             prev: None,
             disk_usage: 1024,
@@ -1773,7 +1783,7 @@ mod tests {
             version: Version::Indexed(Hash([0x03; 32])),
             content_size: 0,
             verified: false,
-            queue: LruQueueId::WorkingArea,
+            queue: LruQueueId::Cached,
             next: None,
             prev: None,
             disk_usage: 0,
@@ -1790,8 +1800,8 @@ mod tests {
     #[test]
     fn convert_queue_table_entry() -> anyhow::Result<()> {
         let entry = QueueTableEntry {
-            head: Some(PathId(0x0101010101010101)),
-            tail: Some(PathId(0x0202020202020202)),
+            head: Some(BlobId::from_u64(0x0101010101010101)),
+            tail: Some(BlobId::from_u64(0x0202020202020202)),
             disk_usage: 1024,
         };
 
@@ -2285,17 +2295,6 @@ mod tests {
         }
         assert_eq!(pathid, last.pathid());
         assert_eq!(BlobId::MAX_INDEX, last.index());
-    }
-
-    #[test]
-    fn blobid_range() {
-        assert_eq!(
-            Range {
-                start: BlobId::from_pathid(PathId(100)),
-                end: BlobId::from_pathid(PathId(101))
-            },
-            BlobId::pathid_range(PathId(100))
-        );
     }
 
     #[test]

@@ -217,11 +217,11 @@ mod tests {
                 info = blobs.create(&mut tree, &marks, loc, &hash, test_data.len() as u64)?;
 
                 // Write data to the blob file
-                let blob_path = self.blob_dir.child(info.pathid.hex());
+                let blob_path = self.blob_dir.child(info.blobid.to_string());
                 std::fs::write(blob_path.path(), &test_data)?;
                 blobs.extend_cache_status(
                     &tree,
-                    info.pathid,
+                    info.blobid.pathid(),
                     &Version::Indexed(hash.clone()),
                     &realize_types::ByteRanges::single(0, test_data.len() as u64),
                 )?;

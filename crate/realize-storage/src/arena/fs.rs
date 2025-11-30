@@ -1,4 +1,4 @@
-use super::blob::BlobReadOperations;
+use super::blob::BlobExt;
 use super::cache::{CacheExt, CacheReadOperations};
 use super::db::ArenaDatabase;
 use super::peer::PeersReadOperations;

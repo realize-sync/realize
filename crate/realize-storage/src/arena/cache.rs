@@ -2,7 +2,7 @@ use super::blob::{BlobExt, BlobInfo, WritableOpenBlob};
 use super::dirty::WritableOpenDirty;
 use super::tree::{TreeExt, TreeReadOperations, WritableOpenTree};
 use super::types::{
-    CacheTableEntry, DirTableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
+    BlobId, CacheTableEntry, DirTableEntry, FileEntryKind, FileMetadata, FileRealm, FileTableEntry,
     IndexedFile, Layer, RemoteAvailability,
 };
 use crate::StorageError;
@@ -516,15 +516,7 @@ impl<'a> WritableOpenCache<'a> {
             e.version
         );
 
-        // not using cleanup_local_file to delete unconditionally,
-        // even a locally-modified file as the "unlink" command comes
-        // directly from the user.
-        let realpath = path.within(self.datadir());
-        if realpath.exists() {
-            std::fs::remove_file(&realpath)?;
-        }
-        log::debug!("[{}]@local delete {realpath:?}", self.tag);
-
+        self.archive_local_file(tree, blobs, &path, &e)?;
         self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
         history.report_removed(&path, &e.version)?;
 
@@ -627,12 +619,16 @@ impl<'a> WritableOpenCache<'a> {
                     }
                     Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
                 };
-                if old_dest.is_some() && noreplace {
-                    return Err(StorageError::AlreadyExists);
-                }
-
                 let source_path = tree.backtrack(source)?;
                 let dest_path = tree.backtrack(dest)?;
+                if let Some(e) = &old_dest {
+                    if noreplace {
+                        return Err(StorageError::AlreadyExists);
+                    }
+                    if e.is_local() {
+                        self.archive_local_file(tree, blobs, &dest_path, e)?;
+                    }
+                }
                 if source_entry.is_local() {
                     let source_realpath = source_path.within(self.datadir());
                     let dest_realpath = dest_path.within(self.datadir());
@@ -653,9 +649,6 @@ impl<'a> WritableOpenCache<'a> {
                 } else {
                     // (over)write new entry
                     source_entry.kind = FileEntryKind::Branched(source_pathid);
-                    if let Some(e) = &old_dest {
-                        self.cleanup_local_file(tree, &dest_path, e);
-                    }
                     self.write_default_file_entry(tree, blobs, dirty, dest_pathid, &source_entry)?;
 
                     // delete older entry
@@ -865,8 +858,10 @@ impl<'a> WritableOpenCache<'a> {
                 self.tag
             );
             default_modified = true;
-            if let Some(prev) = &prev {
-                self.cleanup_local_file(tree, path, prev);
+            if let Some(prev) = &prev
+                && prev.matches_file(path.within(self.datadir()))
+            {
+                self.archive_local_file(tree, blobs, path, prev)?;
             }
             self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
         }
@@ -996,7 +991,7 @@ impl<'a> WritableOpenCache<'a> {
         dirty: &mut WritableOpenDirty,
         pathid: PathId,
     ) -> Result<(), StorageError> {
-        blobs.delete(tree, pathid)?;
+        blobs.delete(tree, BlobId::from_pathid(pathid))?;
 
         // This entry is the outside world view of the file, so
         // changes should be reported.
@@ -1019,25 +1014,43 @@ impl<'a> WritableOpenCache<'a> {
         Ok(())
     }
 
-    /// Remove any local file if it exists and matches the entry. This is best effort.
-    fn cleanup_local_file<'b, L: Into<TreeLoc<'b>>>(
+    /// Archive the local file of the entry if it exists.
+    fn archive_local_file<'b, L: Into<TreeLoc<'b>>>(
         &self,
-        tree: &impl TreeReadOperations,
+        tree: &mut WritableOpenTree,
+        blobs: &mut WritableOpenBlob,
         loc: L,
         entry: &FileTableEntry,
-    ) {
+    ) -> Result<(), StorageError> {
         if !entry.is_local() {
-            return;
+            return Ok(());
         }
-        if let Ok(realpath) = self.local_path(tree, loc) {
-            if !entry.matches_file(&realpath) {
-                return;
+        let loc = loc.into();
+        if let Ok(realpath) = self.local_path(tree, loc.borrow()) {
+            if let Ok(metadata) = realpath.symlink_metadata() {
+                let (blobid, archive_path) =
+                    blobs.import_into_archive(tree, loc, &entry.version, &metadata)?;
+                if let Err(err) = std::fs::rename(&realpath, archive_path) {
+                    log::debug!(
+                        "[{}]@local archiving of {realpath:?} failed: {err:?}",
+                        self.tag
+                    );
+                    blobs.delete(tree, blobid)?;
+                } else {
+                    log::debug!(
+                        "[{}]@local {realpath:?} archived as blob {blobid}",
+                        self.tag
+                    );
+                }
+            } else {
+                log::debug!(
+                    "[{}]@local {realpath:?} missing; couldn't be archived",
+                    self.tag
+                );
             }
-            match std::fs::remove_file(&realpath) {
-                Err(err) => log::debug!("[{}]@local delete {realpath:?} failed: {err:?}", self.tag),
-                Ok(_) => log::debug!("[{}]@local delete {realpath:?}", self.tag),
-            };
         }
+
+        Ok(())
     }
 
     /// Remove a default file entry, leaving peer entries untouched.
@@ -1099,10 +1112,10 @@ impl<'a> WritableOpenCache<'a> {
                         "[{}]@local Remove \"{path}\" pathid {pathid} {old_hash}",
                         self.tag
                     );
-                    if e.matches_file(path.within(self.datadir())) {
-                        let realpath = path.within(self.datadir());
-                        log::debug!("[{}]@local delete {realpath:?}", self.tag);
-                        std::fs::remove_file(realpath)?;
+                    let realpath = path.within(self.datadir());
+                    if e.matches_file(&realpath) {
+                        log::debug!("[{}]@local archive {realpath:?}", self.tag);
+                        self.archive_local_file(tree, blobs, path, &e)?;
                     }
                     let parent = tree.parent(pathid)?;
                     self.rm_default_file_entry(tree, blobs, dirty, pathid)?;
@@ -1502,7 +1515,7 @@ impl<'a> WritableOpenCache<'a> {
         // the original version.
         if original.is_local() {
             let path = tree.backtrack(loc)?;
-            self.cleanup_local_file(tree, &path, &original);
+            self.archive_local_file(tree, blobs, &path, &original)?;
 
             // Report it added (replaced) so other peers are aware
             // of the user's decision, and then immediately drop
@@ -2201,7 +2214,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StorageError;
     use crate::arena::blob::BlobExt;
     use crate::arena::db::ArenaDatabase;
     use crate::arena::dirty::DirtyReadOperations;
@@ -2211,6 +2223,7 @@ mod tests {
     use crate::arena::types::{DirMetadata, HistoryTableEntry};
     use crate::arena::{index, update};
     use crate::utils::hash;
+    use crate::{Blob, StorageError};
     use crate::{CacheStatus, FileMetadata};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
@@ -2222,6 +2235,7 @@ mod tests {
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::u64;
+    use tokio::io::AsyncReadExt;
 
     const TEST_TIME: u64 = 1234567890;
 
@@ -2458,6 +2472,24 @@ mod tests {
             )?;
             Ok(())
         }
+
+        fn archive_count<'b, L: Into<TreeLoc<'b>>>(&self, loc: L) -> Result<usize, StorageError> {
+            let txn = self.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+
+            Ok(blobs.archives(&tree, loc).count())
+        }
+
+        /// Return the content of the given blob, as a string
+        async fn blob_content(&self, info: &BlobInfo) -> Result<String, StorageError> {
+            let mut buf = String::new();
+            Blob::open_with_info(&self.db, info.clone())?
+                .read_to_string(&mut buf)
+                .await?;
+
+            Ok(buf)
+        }
     }
 
     /// Return a value to pass to `collect_history_entries` to ignore
@@ -2668,6 +2700,72 @@ mod tests {
         let metadata = fixture.file_metadata(&file_path)?;
         assert_eq!(metadata.size, 200);
         assert_eq!(metadata.mtime, later_time());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_local_file() -> anyhow::Result<()> {
+        let arena = test_arena();
+        let fixture = Fixture::setup_with_arena(arena)?;
+        let peer = test_peer();
+
+        let path = Path::parse("file.txt")?;
+        let child = fixture.datadir.child("file.txt");
+        child.write_str("test")?;
+
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut cache = txn.write_cache()?;
+            let mut blobs = txn.write_blobs()?;
+            let mut dirty = txn.write_dirty()?;
+            let mut history = txn.write_history()?;
+            let mtime = UnixTime::mtime(&child.metadata()?);
+            cache.index(
+                &mut tree,
+                &mut blobs,
+                &mut history,
+                &mut dirty,
+                &path,
+                4,
+                mtime,
+                hash::digest("test"),
+            )?;
+        }
+        txn.commit()?;
+
+        update::apply(
+            &fixture.db,
+            peer,
+            Notification::Replace {
+                arena,
+                index: 0,
+                path: path.clone(),
+                mtime: test_time(),
+                size: 3,
+                hash: hash::digest("new"),
+                old_hash: hash::digest("test"),
+            },
+        )?;
+
+        // file should now be the cached one
+        let metadata = fixture.file_metadata(&path)?;
+        assert_eq!(metadata.size, 3);
+        assert_eq!(Version::Indexed(hash::digest("new")), metadata.version);
+        assert_eq!(metadata.mtime, test_time());
+
+        // local file should have been archived
+        assert!(!child.exists());
+        let txn = fixture.db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let blobs = txn.read_blobs()?;
+        let archives = blobs
+            .archives(&tree, &path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        assert_eq!(Version::Indexed(hash::digest("test")), archives[0].version);
+        assert_eq!("test", fixture.blob_content(&archives[0]).await?);
 
         Ok(())
     }
@@ -3023,12 +3121,12 @@ mod tests {
             },
         )?;
 
-        // Both the local file and the file entry must have been removed
+        // The file entry should have been removed and the file archived.
         assert!(matches!(
             fixture.file_metadata(&file_path),
             Err(StorageError::NotFound)
         ));
-        assert!(!childpath.exists());
+        assert_eq!(1, fixture.archive_count(&file_path)?);
 
         Ok(())
     }
@@ -4443,6 +4541,7 @@ mod tests {
         assert!(cache.metadata(&tree, &file_path)?.is_none());
         assert!(!cache.has_local_file(&tree, &file_path)?);
         assert!(!childpath.exists());
+        assert_eq!(1, blobs.archives(&tree, &file_path).count());
 
         let (_, history_entry) = history.history(0..).last().unwrap().unwrap();
         assert_eq!(HistoryTableEntry::Remove(file_path, hash), history_entry);
@@ -5606,8 +5705,15 @@ mod tests {
             false, // allow replace
         )?;
 
-        // Since source was not local, dest file should be removed from disk
+        // Since source was not local, dest file should have been
+        // archived.
         assert!(!dest_realpath.exists());
+        let archives = blobs
+            .archives(&tree, &dest_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        assert_eq!(Version::Indexed(dest_hash.clone()), archives[0].version);
+        assert_eq!("dest content", fixture.blob_content(&archives[0]).await?);
 
         // Source entry should be gone, dest should exist with source data but not be local
         assert!(cache.file_entry(&tree, &source_path)?.is_none());
@@ -6307,7 +6413,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_indexed_marks_dirty_and_adds_history() -> anyhow::Result<()> {
+    fn replace_indexed() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("foo/bar.txt")?;
         let childpath = fixture.datadir.child("foo/bar.txt");
@@ -6356,14 +6462,15 @@ mod tests {
             hash2.clone(),
         )?;
 
-        // Verify the file was replaced in the index
+        // The file was replaced in the index
         let entry = cache.indexed(&tree, &path)?.unwrap();
         assert_eq!(entry.hash, hash2);
 
-        // Verify the path was marked dirty
+        // The path was marked dirty
         let dirty_paths = dirty_paths(&dirty, &tree)?;
         assert!(dirty_paths.contains(&path));
 
+        // History was updated
         assert_eq!(
             vec![HistoryTableEntry::Replace(path.clone(), hash1)],
             collect_history_entries(&history, history_start)?
@@ -7114,8 +7221,13 @@ mod tests {
         assert_eq!(entry.version.expect_indexed()?, &remote_hash);
         assert_eq!(entry.size, 200);
 
-        // Local file should be deleted
+        // Local file should have been archived
         assert!(!childpath.exists());
+        let archives = blobs
+            .archives(&tree, &file_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        assert_eq!("local content", fixture.blob_content(&archives[0]).await?);
 
         // History should contain both replace and drop entries for the local file
         let history_entries = collect_history_entries(&history, history_start)?;
