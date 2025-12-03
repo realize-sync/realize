@@ -62,7 +62,7 @@ pub(crate) async fn download(
             return Err(err.into());
         }
     };
-    if *blob.version().matches(*hash) {
+    if blob.version().matches_hash(hash) {
         return Ok(JobStatus::Abandoned("hash mismatch"));
     }
     match blob.cache_status().await {
@@ -179,7 +179,7 @@ pub(crate) async fn verify(
     });
     if verified {
         log::debug!(
-            "[{arena}] Job #{job_id} Verified against {}",
+            "[{arena}] Job #{job_id} Verified against {:?}",
             blob.version()
         );
         return Ok(JobStatus::Done);
@@ -187,7 +187,7 @@ pub(crate) async fn verify(
 
     // repair
     log::debug!(
-        "[{arena}] Job #{job_id} Hash mismatch (expected: {}); Starting repair",
+        "[{arena}] Job #{job_id} Hash mismatch (expected: {:?}); Starting repair",
         blob.version()
     );
     progress.update_action(JobAction::Repair);
@@ -231,13 +231,13 @@ pub(crate) async fn verify(
     });
     if !verified {
         log::debug!(
-            "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {}",
+            "[{arena}] Job #{job_id} Inconsistent hash after repair; Giving up. Expected {:?}",
             blob.version()
         );
         return Err(JobError::InconsistentHash);
     }
     log::debug!(
-        "[{arena}] Job #{job_id} Fixed and verified to be {}",
+        "[{arena}] Job #{job_id} Fixed and verified to be {:?}",
         blob.version()
     );
 
@@ -252,7 +252,7 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::{RngCore, SeedableRng};
     use realize_storage::utils::hash;
-    use realize_storage::{Blob, FileRealm};
+    use realize_storage::{Blob, FileRealm, Version};
     use realize_types::Peer;
     use tokio::fs::File;
     use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
