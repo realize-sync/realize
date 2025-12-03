@@ -2,7 +2,7 @@ use crate::arena::db::ArenaDatabase;
 use crate::config::WatcherConfig;
 use anyhow::Context;
 use arena::engine::Engine;
-use arena::{ArenaStorage, indexed_store};
+use arena::{ArenaStorage, rsync};
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
@@ -26,9 +26,9 @@ pub mod utils;
 
 pub use arena::blob::{Blob, BlobIncomplete};
 pub use arena::engine::{Job, JobStatus};
-pub use arena::indexed_store::Reader;
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
+pub use arena::reader::Reader;
 pub use arena::types::{
     CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability, Version,
 };
@@ -226,7 +226,7 @@ impl Storage {
     ) -> anyhow::Result<Delta, StorageError> {
         let db = self.arena_db(arena)?;
 
-        indexed_store::rsync(&db, path, range, sig).await
+        rsync::diff(&db, path, range, sig).await
     }
 
     /// Return an infinite stream of jobs.
