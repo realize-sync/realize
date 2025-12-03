@@ -2,7 +2,7 @@ use crate::arena::db::ArenaDatabase;
 use crate::config::WatcherConfig;
 use anyhow::Context;
 use arena::engine::Engine;
-use arena::{ArenaStorage, rsync};
+use arena::{ArenaStorage, reader, rsync};
 use config::StorageConfig;
 use futures::Stream;
 use global::db::GlobalDatabase;
@@ -10,6 +10,7 @@ use realize_types::{self, Arena, ByteRange, Delta, Path, Peer, Signature};
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use tokio::io::{AsyncRead, AsyncSeek};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinHandle};
 use tokio_stream::{StreamExt, StreamMap};
@@ -28,7 +29,6 @@ pub use arena::blob::{Blob, BlobIncomplete};
 pub use arena::engine::{Job, JobStatus};
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
-pub use arena::reader::Reader;
 pub use arena::types::{
     CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability, Version,
 };
@@ -213,8 +213,10 @@ impl Storage {
         &self,
         arena: Arena,
         path: &realize_types::Path,
-    ) -> Result<Reader, StorageError> {
-        Reader::open(&self.arena_db(arena)?, path).await
+    ) -> Result<impl AsyncRead + AsyncSeek, StorageError> {
+        let db = self.arena_db(arena)?;
+
+        reader::open(&db, path).await
     }
 
     pub async fn rsync(

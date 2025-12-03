@@ -1,10 +1,9 @@
 use super::db::ArenaDatabase;
-use super::index;
+use super::reader;
 use crate::StorageError;
 use realize_types::{self, ByteRange, Delta, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Use the rsync algorithm to sync some file with a file in the index.
@@ -26,15 +25,10 @@ pub(crate) async fn diff(
     sig: Signature,
 ) -> Result<Delta, StorageError> {
     let sig = fast_rsync::Signature::deserialize(sig.0)?;
-    index::indexed_file_async(db, path)
-        .await?
-        .ok_or(StorageError::NotFound)?;
-
-    let realpath = path.within(db.cache().datadir());
     let len = range.bytecount() as usize;
     let mut data = vec![0; len];
     {
-        let mut file = File::open(realpath).await?;
+        let mut file = reader::open(db, &path).await?;
         file.seek(SeekFrom::Start(range.start)).await?;
         file.read_exact(&mut data).await?;
     }
@@ -47,8 +41,8 @@ pub(crate) async fn diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::{db::ArenaDatabase, index};
     use crate::utils::hash;
-    use crate::{Reader, arena::db::ArenaDatabase};
     use assert_fs::TempDir;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
@@ -104,18 +98,6 @@ mod tests {
 
             Ok((path, hash))
         }
-    }
-
-    #[tokio::test]
-    async fn read_file() -> anyhow::Result<()> {
-        let fixture = Fixture::setup().await?;
-        let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
-        let mut reader = Reader::open(&fixture.db, &path).await?;
-        let mut str = String::new();
-        reader.read_to_string(&mut str).await?;
-        assert_eq!("foobar", str.as_str());
-
-        Ok(())
     }
 
     #[tokio::test]
