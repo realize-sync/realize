@@ -57,6 +57,13 @@ mod settings_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+mod time_capnp {
+    include!(concat!(env!("OUT_DIR"), "/arena/time_capnp.rs"));
+}
+#[allow(dead_code)]
+#[allow(unknown_lints)]
+#[allow(clippy::uninlined_format_args)]
+#[allow(clippy::extra_unused_type_parameters)]
 mod version_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/version_capnp.rs"));
 }
@@ -272,6 +279,9 @@ pub struct BlobTableEntry {
 
     /// Disk usage in bytes
     pub disk_usage: u64,
+
+    /// Local time at which the entry was created
+    pub timestamp: UnixTime,
 }
 
 impl NamedType for BlobTableEntry {
@@ -302,6 +312,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         };
 
         let queue = reader.get_queue()?;
+        let timestamp = parse_time(reader.get_timestamp()?);
 
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
@@ -312,6 +323,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
             next,
             prev,
             disk_usage: reader.get_disk_usage(),
+            timestamp,
         })
     }
 
@@ -327,13 +339,20 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         builder.set_next(self.next.map(|b| b.0).unwrap_or(0));
         builder.set_prev(self.prev.map(|b| b.0).unwrap_or(0));
         builder.set_disk_usage(self.disk_usage);
-        fill_byte_ranges(&self.written_areas, builder.init_written_areas());
+        fill_byte_ranges(&self.written_areas, builder.reborrow().init_written_areas());
+        fill_time(builder.init_timestamp(), self.timestamp);
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
 
         Ok(buffer)
     }
+}
+
+/// Fill a [UnixTime] capnp message.
+fn fill_time(mut builder: time_capnp::time::Builder<'_>, mtime: UnixTime) {
+    builder.set_secs(mtime.as_secs());
+    builder.set_nsecs(mtime.subsec_nanos());
 }
 
 /// Fill a [Version] message from capnp.
@@ -349,6 +368,11 @@ fn fill_version(mut version_builder: version_capnp::version::Builder<'_>, versio
             version_builder.set_indexed(&hash.0);
         }
     }
+}
+
+/// Parse a [UnixTime] from capnp.
+fn parse_time(mtime: time_capnp::time::Reader<'_>) -> UnixTime {
+    UnixTime::new(mtime.get_secs(), mtime.get_nsecs())
 }
 
 /// Parse a [Version] from capnp.
@@ -1027,9 +1051,7 @@ fn fill_file_table_entry(
     entry: &FileTableEntry,
 ) {
     builder.set_size(entry.size);
-    let mut mtime = builder.reborrow().init_mtime();
-    mtime.set_secs(entry.mtime.as_secs());
-    mtime.set_nsecs(entry.mtime.subsec_nanos());
+    fill_time(builder.reborrow().init_mtime(), entry.mtime);
 
     // Convert the new enum back to the old capnp fields for compatibility
     match entry.kind {
@@ -1067,7 +1089,7 @@ fn parse_file_table_entry(
 
     Ok(FileTableEntry {
         size: msg.get_size(),
-        mtime: UnixTime::new(mtime.get_secs(), mtime.get_nsecs()),
+        mtime: parse_time(mtime),
         version,
         kind,
     })
@@ -1086,13 +1108,13 @@ impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
             }
             cache_capnp::cache_table_entry::Dir(dir_entry) => {
                 let dir_entry = dir_entry?;
-                let mtime = dir_entry.get_mtime()?;
+                let mtime = parse_time(dir_entry.get_mtime()?);
                 let dir_table_entry = DirTableEntry {
                     local: dir_entry.get_local(),
-                    mtime: if mtime.get_secs() == 0 && mtime.get_nsecs() == 0 {
+                    mtime: if mtime == UnixTime::ZERO {
                         None
                     } else {
-                        Some(UnixTime::new(mtime.get_secs(), mtime.get_nsecs()))
+                        Some(mtime)
                     },
                 };
 
@@ -1114,9 +1136,7 @@ impl ByteConvertible<CacheTableEntry> for CacheTableEntry {
                 let mut dir_builder = builder.init_dir();
                 dir_builder.set_local(dir_entry.local);
                 if let Some(mtime) = dir_entry.mtime {
-                    let mut mtime_builder = dir_builder.init_mtime();
-                    mtime_builder.set_secs(mtime.as_secs());
-                    mtime_builder.set_nsecs(mtime.subsec_nanos());
+                    fill_time(dir_builder.init_mtime(), mtime);
                 }
             }
         }
@@ -1739,6 +1759,7 @@ mod tests {
 
     #[test]
     fn convert_blob_table_entry() -> anyhow::Result<()> {
+        let now = UnixTime::now();
         let entry = BlobTableEntry {
             written_areas: realize_types::ByteRanges::from_ranges(vec![
                 realize_types::ByteRange::new(0, 1024),
@@ -1755,6 +1776,7 @@ mod tests {
                     .unwrap(),
             ),
             disk_usage: 1024,
+            timestamp: now,
         };
 
         assert_eq!(
@@ -1771,6 +1793,7 @@ mod tests {
             next: None,
             prev: None,
             disk_usage: 1024,
+            timestamp: now,
         };
 
         assert_eq!(
@@ -1787,6 +1810,7 @@ mod tests {
             next: None,
             prev: None,
             disk_usage: 0,
+            timestamp: now,
         };
 
         assert_eq!(

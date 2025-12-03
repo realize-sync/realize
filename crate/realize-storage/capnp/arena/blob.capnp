@@ -4,6 +4,7 @@ using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
 
 using import "version.capnp".Version;
+using import "time.capnp".Time;
 
 # An entry in the blob table.
 struct BlobTableEntry {
@@ -29,6 +30,10 @@ struct BlobTableEntry {
 
   # Disk usage in bytes
   diskUsage @5: UInt64;
+
+  # Time at which the blob was created; especially
+  # useful for archives
+  timestamp @8: Time;
 }
 
 # A sequence of byte ranges.

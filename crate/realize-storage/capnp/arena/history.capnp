@@ -4,6 +4,7 @@
 
 using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
+using import "time.capnp".Time;
 
 # An entry in the history table
 struct HistoryTableEntry {
@@ -50,8 +51,3 @@ struct HistoryTableEntry {
   }
 }
 
-# Time as duration since UNIX_EPOCH.
-struct Time {
-  secs @0: UInt64;
-  nsecs @1: UInt32;
-}

@@ -12,7 +12,7 @@ use crate::utils::hash;
 use crate::utils::holder::Holder;
 use crate::{RemoteAvailability, StorageError};
 use priority_queue::PriorityQueue;
-use realize_types::{ByteRanges, Hash};
+use realize_types::{ByteRanges, Hash, UnixTime};
 use redb::{ReadableTable, Table};
 use std::cmp::{Reverse, min};
 use std::fs;
@@ -526,6 +526,7 @@ impl<'a> WritableOpenBlob<'a> {
             next: None,
             prev: None,
             disk_usage: calculate_disk_usage(&blob_path.metadata()?),
+            timestamp: UnixTime::now(),
         };
         log::debug!(
             "[{}] Creating blob {pathid} in {queue:?} at {blob_path:?} -> {entry:?}",

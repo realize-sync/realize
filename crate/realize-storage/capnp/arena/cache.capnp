@@ -4,6 +4,7 @@ using Rust = import "/capnpc/rust.capnp";
 $Rust.parentModule("arena::types");
 
 using import "version.capnp".Version;
+using import "time.capnp".Time;
 
 # A new simplified DirTableEntry that only contains mtime
 struct DirtableEntry {
@@ -33,11 +34,3 @@ struct PeerTableEntry {
   uuidHi @0: UInt64;
   uuidLo @1: UInt64;
 }
-
-# Time as duration since UNIX_EPOCH.
-struct Time {
-  secs @0: UInt64;
-  nsecs @1: UInt32;
-}
-
-
