@@ -116,11 +116,17 @@ impl Blobs {
         &self.blob_dir
     }
 
+    /// Return the path of the blob with the given [BlobId].
+    ///
+    /// The blob might not exist.
+    pub(crate) fn blob_path(&self, blobid: BlobId) -> PathBuf {
+        self.blob_dir.join(blobid.to_string())
+    }
+
     /// Get a watch channel that reports changes to disk usage.
     ///
     /// The current value is also available as
     /// [BlobReadOperations::disk_usage].
-    #[allow(dead_code)] // will be used soon
     pub(crate) fn watch_disk_usage(&self) -> watch::Receiver<DiskUsage> {
         self.disk_usage_tx.subscribe()
     }
@@ -273,6 +279,10 @@ pub(crate) struct BlobInfo {
 
     /// If true, content of the file was verified against the hash.
     pub(crate) verified: bool,
+
+    /// Time at which the blob was created. This is different from a
+    /// file mtime.
+    pub(crate) timestamp: UnixTime,
 }
 
 impl BlobInfo {
@@ -284,6 +294,7 @@ impl BlobInfo {
             available_ranges: entry.written_areas,
             queue: entry.queue,
             verified: entry.verified,
+            timestamp: entry.timestamp,
         }
     }
 
@@ -418,6 +429,12 @@ pub(crate) trait BlobExt {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<CacheStatus, StorageError>;
+
+    fn most_recent_archive<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<BlobInfo>, StorageError>;
 }
 
 impl<T: BlobReadOperations> BlobExt for T {
@@ -447,6 +464,20 @@ impl<T: BlobReadOperations> BlobExt for T {
         } else {
             Ok(CacheStatus::Missing)
         }
+    }
+
+    fn most_recent_archive<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+    ) -> Result<Option<BlobInfo>, StorageError> {
+        self.archives(tree, loc)
+            .max_by_key(|info| {
+                info.as_ref()
+                    .map(|info| info.timestamp)
+                    .unwrap_or(UnixTime::ZERO)
+            })
+            .transpose()
     }
 }
 
@@ -498,7 +529,7 @@ impl<'a> WritableOpenBlob<'a> {
                     None
                 };
                 if let Some(e) = existing_entry {
-                    let blob_path = self.blob_path(blobid);
+                    let blob_path = self.subsystem.blob_path(blobid);
                     if matches!(version, Version::Indexed(_))
                         && *version == e.version
                         && blob_path.exists()
@@ -515,7 +546,7 @@ impl<'a> WritableOpenBlob<'a> {
             }
             LruQueueId::Archived => self.next_blob_id_with_index(pathid)?,
         };
-        let blob_path = self.blob_path(blobid);
+        let blob_path = self.subsystem.blob_path(blobid);
         self.prepare_blob_file(&blob_path, size)?;
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
@@ -535,11 +566,6 @@ impl<'a> WritableOpenBlob<'a> {
         self.add_to_queue_front(queue, blobid, &mut entry)?;
         tree.insert_and_incref(pathid, &mut self.blob_table, blobid, Holder::new(&entry)?)?;
         Ok((blobid, entry))
-    }
-
-    /// Build a path for storing a blob with the given [BlobId].
-    fn blob_path(&mut self, blobid: BlobId) -> PathBuf {
-        self.subsystem.blob_dir.join(blobid.to_string())
     }
 
     /// Create the blob file with the given path.
@@ -576,7 +602,7 @@ impl<'a> WritableOpenBlob<'a> {
         if !self.remove_blob_entry(tree, blobid)? {
             return Ok(());
         }
-        let blob_path = self.blob_path(blobid);
+        let blob_path = self.subsystem.blob_path(blobid);
         if blob_path.exists() {
             std::fs::remove_file(&blob_path)?;
         }
@@ -647,7 +673,7 @@ impl<'a> WritableOpenBlob<'a> {
             None => return Ok(None), // Nothing to export
         };
         let blobid = BlobId::from_pathid(pathid);
-        let realpath = self.blob_path(blobid);
+        let realpath = self.subsystem.blob_path(blobid);
         let m = match realpath.metadata() {
             Ok(m) => m,
             Err(_) => return Ok(None),
@@ -703,7 +729,7 @@ impl<'a> WritableOpenBlob<'a> {
         let loc = loc.into();
         let size = metadata.len();
         let (blobid, mut entry) = self.create_entry(tree, loc, version, queue, size)?;
-        let blob_path = self.blob_path(blobid);
+        let blob_path = self.subsystem.blob_path(blobid);
 
         // Set written areas to complete (but not verified) and update
         // trusting that metadata is going to be the blob file
@@ -829,7 +855,7 @@ impl<'a> WritableOpenBlob<'a> {
         blob_entry.written_areas = blob_entry.written_areas.union(new_range);
 
         // Update disk usage if the blob file exists
-        let blob_path = self.blob_path(blobid);
+        let blob_path = self.subsystem.blob_path(blobid);
         if let Ok(metadata) = blob_path.metadata() {
             self.update_disk_usage(&mut blob_entry, &metadata)?;
             self.report_disk_usage_changed();
@@ -903,7 +929,7 @@ impl<'a> WritableOpenBlob<'a> {
             tree.remove_and_decref(current_id.pathid(), &mut self.blob_table, current_id)?;
 
             // Remove the blob file
-            let blob_path = self.blob_path(current_id);
+            let blob_path = self.subsystem.blob_path(current_id);
             if blob_path.exists() {
                 std::fs::remove_file(&blob_path)?;
             }
@@ -1711,9 +1737,8 @@ mod tests {
             })
         }
 
-        /// Return the path to a blob file for test use.
-        fn blob_path(&self, blobid: BlobId) -> std::path::PathBuf {
-            self.blob_dir.join(blobid.to_string()).to_path_buf()
+        fn blob_path(&self, blobid: BlobId) -> PathBuf {
+            self.db.blobs().blob_path(blobid)
         }
 
         fn begin_read(&self) -> anyhow::Result<ArenaReadTransaction<'_>> {

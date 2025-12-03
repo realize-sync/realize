@@ -1,3 +1,4 @@
+use super::blob::BlobExt;
 use super::cache::CacheExt;
 use super::db::ArenaDatabase;
 use crate::StorageError;
@@ -20,7 +21,15 @@ pub(crate) async fn open(
         let realpath = if cache.indexed(&tree, &path)?.is_some() {
             path.within(db.cache().datadir())
         } else {
-            return Err(StorageError::NotFound);
+            // Look for an archived blob. Doing this avoids race
+            // conditions in the cases where the requested file has
+            // just been deleted and the peer isn't aware of it.
+            let blobs = txn.read_blobs()?;
+            if let Some(info) = blobs.most_recent_archive(&tree, &path)? {
+                db.blobs().blob_path(info.blobid)
+            } else {
+                return Err(StorageError::NotFound);
+            }
         };
 
         Ok::<_, StorageError>(std::fs::File::open(realpath)?)
@@ -98,6 +107,31 @@ mod tests {
     async fn read_file() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
+        let mut reader = super::open(&fixture.db, &path).await?;
+        let mut str = String::new();
+        reader.read_to_string(&mut str).await?;
+        assert_eq!("foobar", str.as_str());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_archived_file() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let (path, _) = fixture.add_file("foo/bar.txt", "foobar").await?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut cache = txn.write_cache()?;
+            cache.unlink(
+                &mut txn.write_tree()?,
+                &mut txn.write_blobs()?,
+                &mut txn.write_history()?,
+                &mut txn.write_dirty()?,
+                &path,
+            )?;
+        }
+        txn.commit()?;
+
         let mut reader = super::open(&fixture.db, &path).await?;
         let mut str = String::new();
         reader.read_to_string(&mut str).await?;
