@@ -62,7 +62,7 @@ pub(crate) async fn download(
             return Err(err.into());
         }
     };
-    if blob.version().matches_hash(hash) {
+    if !blob.version().matches_hash(hash) {
         return Ok(JobStatus::Abandoned("hash mismatch"));
     }
     match blob.cache_status().await {
