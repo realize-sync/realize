@@ -12,6 +12,8 @@ use crate::arena::types::FileAlternative;
 use crate::config::BytesOrPercent;
 use crate::{CacheStatus, FileRealm, Mark, StorageError, Version};
 
+use super::blob::{BlobInfo, BlobReadOperations};
+
 const XATTR_MARK: &str = "realize.mark";
 const XATTR_STATUS: &str = "realize.status";
 const XATTR_VERSION: &str = "realize.version";
@@ -70,16 +72,8 @@ pub(crate) fn get(
         let cache = txn.read_cache()?;
         let loc = loc.into().into_tree_loc(&cache)?;
         return Ok(match cache.file_realm(&tree, &blobs, loc)? {
-            FileRealm::Local(_) => "local 100%".to_string(),
-            FileRealm::Remote(CacheStatus::Missing) => "remote 0%".to_string(),
-            FileRealm::Remote(CacheStatus::Complete) => "remote 100%".to_string(),
-            FileRealm::Remote(CacheStatus::Verified) => "remote 100% verified".to_string(),
-            FileRealm::Remote(CacheStatus::Partial(size, available_ranges)) => {
-                format!(
-                    "remote {:0.0}%",
-                    (available_ranges.bytecount() as f64) / (size as f64) * 100.0
-                )
-            }
+            FileRealm::Local(_) => "local".to_string(),
+            FileRealm::Remote(status) => format_cache_status(&status),
         });
     }
 
@@ -98,10 +92,12 @@ pub(crate) fn get(
         let txn = db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
+        let blobs = txn.read_blobs()?;
         let loc = loc.into().into_tree_loc(&cache)?;
 
-        let alternatives = cache.list_alternatives(&tree, loc)?;
-        return Ok(format_versions(&alternatives));
+        let alternatives = cache.list_alternatives(&tree, loc.borrow())?;
+        let archives = blobs.archives(&tree, loc).collect::<Result<Vec<_>, _>>()?;
+        return Ok(format_alternatives(&alternatives, &archives));
     }
 
     if xattr == XATTR_QUOTA_MAX || xattr == XATTR_QUOTA_LEAVE {
@@ -222,7 +218,7 @@ pub(crate) fn set(
 ///
 /// Each line represents one alternative, ending with a newline.
 /// Empty input produces empty string.
-fn format_versions(alts: &[FileAlternative]) -> String {
+fn format_alternatives(alts: &[FileAlternative], archives: &[BlobInfo]) -> String {
     if alts.is_empty() {
         return String::new();
     }
@@ -232,6 +228,9 @@ fn format_versions(alts: &[FileAlternative]) -> String {
         result.push_str(&format_alternative(alt));
         result.push('\n');
     }
+    for archive in archives {
+        result.push_str(&format_archive(archive));
+    }
 
     result
 }
@@ -239,16 +238,46 @@ fn format_versions(alts: &[FileAlternative]) -> String {
 /// Format a single FileAlternative for display.
 fn format_alternative(alt: &FileAlternative) -> String {
     match alt {
-        FileAlternative::Local(version) => match version {
-            Version::Modified(Some(hash)) => format!("local {}", hash),
-            Version::Modified(None) => "local modified".to_string(),
-            Version::Indexed(hash) => format!("local {}", hash),
-        },
+        FileAlternative::Local(version) => format!("local {}", format_version(version)),
         FileAlternative::Branched(path, hash) => {
             format!("branched {} {}", path, hash)
         }
         FileAlternative::Remote(peer, hash, size, mtime) => {
-            format!("{} {} {} {}", peer, hash, size, mtime.display())
+            format!("remote:{} {} {} {}", peer, hash, size, mtime.display())
+        }
+    }
+}
+
+/// Format a single archive as an alternative for display .
+fn format_archive(info: &BlobInfo) -> String {
+    format!(
+        "archive:{} {} {} {} {}",
+        info.blobid.index(),
+        format_version(&info.version),
+        info.size,
+        info.timestamp.display(),
+        format_cache_status(&info.cache_status())
+    )
+}
+
+fn format_version(version: &Version) -> String {
+    match version {
+        Version::Modified(Some(hash)) => format!("modified:{}", hash),
+        Version::Modified(None) => "modified".to_string(),
+        Version::Indexed(hash) => format!("{}", hash),
+    }
+}
+
+fn format_cache_status(status: &CacheStatus) -> String {
+    match status {
+        CacheStatus::Missing => "0%".to_string(),
+        CacheStatus::Complete => "100%".to_string(),
+        CacheStatus::Verified => "100% verified".to_string(),
+        CacheStatus::Partial(size, available_ranges) => {
+            format!(
+                "{:0.0}%",
+                (available_ranges.bytecount() as f64) / (*size as f64) * 100.0
+            )
         }
     }
 }
@@ -336,6 +365,20 @@ mod tests {
             txn.commit()?;
 
             Ok(())
+        }
+
+        /// Return the display string of the timestamp of the archive
+        /// with the given index.
+        fn archive_ts(&self, path: &Path, index: u8) -> anyhow::Result<String> {
+            let txn = self.db.begin_read()?;
+
+            Ok(txn
+                .read_blobs()?
+                .archives(&txn.read_tree()?, path)
+                .find(|r| r.as_ref().is_ok_and(|info| info.blobid.index() == index))
+                .expect("archive:{index}")?
+                .timestamp
+                .display())
         }
     }
 
@@ -502,9 +545,9 @@ mod tests {
 
         assert_eq!(
             "local phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc
-peer1 0BwGywlga8Syzt9CZqOiDh5ja0Z8t3qdvtWVCU4C6kY 3 2009-02-13T23:31:30.000
-peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
-peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
+remote:peer1 0BwGywlga8Syzt9CZqOiDh5ja0Z8t3qdvtWVCU4C6kY 3 2009-02-13T23:31:30.000
+remote:peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
+remote:peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
 ",
             super::get(&fixture.db, &file, "realize.versions")?
         );
@@ -516,16 +559,20 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
             hash::digest("two").to_string().into(),
         )?;
 
+        // peer1's version is now the active version. The local version is archived.
         assert_eq!(
             hash::digest("two").to_string(),
             super::get(&fixture.db, &file, "realize.version")?
         );
 
         assert_eq!(
-            "peer1 0BwGywlga8Syzt9CZqOiDh5ja0Z8t3qdvtWVCU4C6kY 3 2009-02-13T23:31:30.000
-peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
-peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
-",
+            format!(
+                "remote:peer1 0BwGywlga8Syzt9CZqOiDh5ja0Z8t3qdvtWVCU4C6kY 3 2009-02-13T23:31:30.000
+remote:peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
+remote:peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
+archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
+                fixture.archive_ts(&file, 1)?
+            ),
             super::get(&fixture.db, &file, "realize.versions")?
         );
 
@@ -564,16 +611,41 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
         Ok(())
     }
 
+    #[test]
+    fn get_archive() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file = Path::parse("file")?;
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_index(&file, "local")?;
+        let txn = fixture.db.begin_write()?;
+        txn.write_cache()?.unlink(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_history()?,
+            &mut txn.write_dirty()?,
+            &file,
+        )?;
+        txn.commit()?;
+
+        assert_eq!(
+            format!(
+                "remote:peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
+archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
+                fixture.archive_ts(&file, 1)?
+            ),
+            super::get(&fixture.db, &file, "realize.versions")?
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn get_remote_file_status() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let path = Path::parse("remote")?;
         fixture.add_to_cache(&path, Peer::from("peer"), "test")?;
 
-        assert_eq!(
-            "remote 0%",
-            super::get(&fixture.db, &path, "realize.status")?
-        );
+        assert_eq!("0%", super::get(&fixture.db, &path, "realize.status")?);
 
         let txn = fixture.db.begin_write()?;
         {
@@ -590,10 +662,7 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
         blob.update(0, b"te").await.unwrap();
         blob.update_db().await.unwrap();
 
-        assert_eq!(
-            "remote 50%",
-            super::get(&fixture.db, &path, "realize.status")?
-        );
+        assert_eq!("50%", super::get(&fixture.db, &path, "realize.status")?);
 
         Ok(())
     }
@@ -604,10 +673,7 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
         let path = Path::parse("local")?;
         fixture.add_to_index(&path, "test")?;
 
-        assert_eq!(
-            "local 100%",
-            super::get(&fixture.db, &path, "realize.status")?
-        );
+        assert_eq!("local", super::get(&fixture.db, &path, "realize.status")?);
 
         Ok(())
     }
@@ -683,7 +749,7 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
         let alt = FileAlternative::Local(Version::Modified(Some(hash)));
         assert_eq!(
             format_alternative(&alt),
-            "local AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+            "local modified:AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
         );
     }
 
@@ -710,28 +776,28 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
         let hash = Hash([4; 32]);
         let size = 100;
         let mtime = UnixTime::new(1234567890, 333999111); // 2009-02-13T23:31:30.333
-        let expected = format!("peer1 {} 100 2009-02-13T23:31:30.333", hash);
+        let expected = format!("remote:peer1 {} 100 2009-02-13T23:31:30.333", hash);
         let alt = FileAlternative::Remote(peer, hash, size, mtime);
         assert_eq!(format_alternative(&alt), expected);
     }
 
     #[test]
-    fn format_versions_empty() {
-        assert_eq!(format_versions(&[]), "");
+    fn format_alternatives_empty() {
+        assert_eq!(format_alternatives(&[], &[]), "");
     }
 
     #[test]
-    fn format_versions_single() {
+    fn format_alternatives_single() {
         let hash = Hash([1; 32]);
         let alt = FileAlternative::Local(Version::Indexed(hash));
         assert_eq!(
-            format_versions(&[alt]),
+            format_alternatives(&[alt], &[]),
             "local AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\n"
         );
     }
 
     #[test]
-    fn format_versions_multiple() {
+    fn format_alternatives_multiple() {
         let local_alt = FileAlternative::Local(Version::Indexed(Hash([1; 32])));
         let remote_alt = FileAlternative::Remote(
             Peer::from("peer1"),
@@ -740,8 +806,8 @@ peer3 SEvM9qZv1GZ4MupKxpAmzX5v8x5LdB0KG9x0CvykQWw 5 2009-02-13T23:31:30.000
             UnixTime::new(1640995200, 0), // 2022-01-01T00:00:00.000
         );
 
-        let result = format_versions(&[local_alt, remote_alt]);
-        let expected = "local AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\npeer1 AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI 200 2022-01-01T00:00:00.000\n";
+        let result = format_alternatives(&[local_alt, remote_alt], &[]);
+        let expected = "local AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE\nremote:peer1 AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI 200 2022-01-01T00:00:00.000\n";
         assert_eq!(result, expected);
     }
 }
