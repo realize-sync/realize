@@ -1659,6 +1659,11 @@ impl BlobId {
         BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS)
     }
 
+    /// Create a new [BlobId] with an arbitrary path and index.
+    pub(crate) fn new(pathid: PathId, index: u8) -> Self {
+        BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS | ((index as u64) & 0xff))
+    }
+
     /// Return the [BlobId] with index 0 for the given [PathId].
     pub(crate) fn first_index_of(pathid: PathId) -> Self {
         BlobId(pathid.as_u64() << BlobId::INDEX_NUMBITS | 1)
@@ -1674,7 +1679,7 @@ impl BlobId {
     pub(crate) fn next_index(&self) -> Option<BlobId> {
         if self.index() < BlobId::MAX_INDEX {
             Some(BlobId(
-                (self.0 & !(BlobId::MAX_INDEX as u64)) | (self.index() + 1) as u64,
+                (self.0 & !(BlobId::MAX_INDEX as u64)) | ((self.index() + 1) as u64 & 0xff),
             ))
         } else {
             None

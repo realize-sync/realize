@@ -13,6 +13,7 @@ use crate::config::BytesOrPercent;
 use crate::{CacheStatus, FileRealm, Mark, StorageError, Version};
 
 use super::blob::{BlobInfo, BlobReadOperations};
+use super::types::BlobId;
 
 const XATTR_MARK: &str = "realize.mark";
 const XATTR_STATUS: &str = "realize.status";
@@ -153,8 +154,6 @@ pub(crate) fn set(
     }
 
     if name == XATTR_VERSION {
-        let hash = Hash::from_base64(value.as_ref()).ok_or(StorageError::InvalidAttributeValue)?;
-
         let txn = db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -164,14 +163,61 @@ pub(crate) fn set(
             let mut cache = txn.write_cache()?;
             let loc = loc.into().into_tree_loc(&cache)?;
 
-            cache.select_alternative(
-                &mut tree,
-                &mut blobs,
-                &mut history,
-                &mut dirty,
-                loc,
-                &hash,
-            )?;
+            let value = value.as_ref().trim();
+            if let Some(rest) = value.strip_prefix("remote:")
+                && let Some((peer, hash)) = cache
+                    .list_alternatives(&tree, loc.borrow())?
+                    .into_iter()
+                    .filter_map(|alt| {
+                        if let FileAlternative::Remote(peer, hash, _, _) = alt
+                            && {
+                                log::debug!("=== ook peer:'{peer}' rest:'{rest}");
+
+                                peer.as_str() == rest || rest.starts_with(&format!("{peer} {hash}"))
+                            }
+                        {
+                            Some((peer, hash))
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+            {
+                log::debug!("[{}]@{peer} select version {}", db.tag(), hash);
+
+                cache.select_peer_version(
+                    &mut tree,
+                    &mut blobs,
+                    &mut history,
+                    &mut dirty,
+                    loc,
+                    peer,
+                )?;
+            } else if let Some(remote_index) = value
+                .strip_prefix("archive:")
+                .and_then(|s| s.split(' ').next())
+                && let Ok(index) = remote_index.parse::<u8>()
+            {
+                let pathid = tree.expect(loc)?;
+                let blobid = BlobId::new(pathid, index);
+                log::debug!(
+                    "[{}]@local recover {pathid} from archive {blobid}",
+                    db.tag()
+                );
+                cache.recover_archived(&mut tree, &mut blobs, &mut dirty, blobid)?;
+            } else if let Some(hash) = Hash::from_base64(value.as_ref()) {
+                log::debug!("[{}] select peer or archived version {hash}", db.tag());
+                cache.select_alternative(
+                    &mut tree,
+                    &mut blobs,
+                    &mut history,
+                    &mut dirty,
+                    loc,
+                    &hash,
+                )?;
+            } else {
+                return Err(StorageError::InvalidAttributeValue);
+            }
         }
         txn.commit()?;
         return Ok(());
@@ -580,6 +626,60 @@ archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
     }
 
     #[test]
+    fn select_alternative_from_peer() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file = Path::parse("file")?;
+        fixture.add_to_cache(&file, Peer::from("peer1"), "one")?;
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_cache(&file, Peer::from("peer3"), "three")?;
+        fixture.add_to_index(&file, "local")?;
+
+        assert_eq!(
+            hash::digest("local").to_string(),
+            super::get(&fixture.db, &file, "realize.version")?
+        );
+
+        super::set(&fixture.db, &file, "realize.version", "remote:peer2".into())?;
+
+        // peer1's version is now the active version. The local version is archived.
+        assert_eq!(
+            hash::digest("two").to_string(),
+            super::get(&fixture.db, &file, "realize.version")?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn select_alternative_from_peer_full() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file = Path::parse("file")?;
+        fixture.add_to_cache(&file, Peer::from("peer1"), "one")?;
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_cache(&file, Peer::from("peer3"), "three")?;
+        fixture.add_to_index(&file, "local")?;
+
+        // This makes sure that it is possible to feed the whole line
+        // as value to realize.version
+        let versions = super::get(&fixture.db, &file, "realize.versions")?;
+        let value = versions
+            .split('\n')
+            .filter(|line| line.starts_with("remote:peer2"))
+            .next()
+            .unwrap();
+
+        super::set(&fixture.db, &file, "realize.version", value.into())?;
+
+        // peer1's version is now the active version. The local version is archived.
+        assert_eq!(
+            hash::digest("two").to_string(),
+            super::get(&fixture.db, &file, "realize.version")?
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn get_and_set_version_not_supported() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let dir = Path::parse("dir")?;
@@ -646,6 +746,103 @@ archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
 
         assert_eq!(
             "local",
+            std::fs::read_to_string(file.within(fixture.datadir.path())).unwrap()
+        );
+
+        assert_eq!(
+            "modified",
+            super::get(&fixture.db, &file, "realize.version")?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn recover_locally_modified() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file = Path::parse("file")?;
+        let child = fixture.datadir.child(file.as_str());
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_index(&file, "local")?;
+        child.write_str("modified")?;
+
+        let txn = fixture.db.begin_write()?;
+        txn.write_cache()?.preindex(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_dirty()?,
+            &file,
+        )?;
+        txn.write_cache()?.unlink(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_history()?,
+            &mut txn.write_dirty()?,
+            &file,
+        )?;
+        txn.commit()?;
+
+        assert_eq!(
+            format!(
+                "remote:peer2 elKyUaNCihtklnhRFXBH0ikZzGEMaxOOmKJSgLFTSyE 3 2009-02-13T23:31:30.000
+archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
+                fixture.archive_ts(&file, 1)?
+            ),
+            super::get(&fixture.db, &file, "realize.versions")?
+        );
+
+        super::set(&fixture.db, &file, "realize.version", "archive:1".into()).unwrap();
+
+        assert_eq!(
+            "modified",
+            std::fs::read_to_string(file.within(fixture.datadir.path())).unwrap()
+        );
+
+        assert_eq!(
+            "modified",
+            super::get(&fixture.db, &file, "realize.version")?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn recover_locally_modified_full() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file = Path::parse("file")?;
+        let child = fixture.datadir.child(file.as_str());
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_index(&file, "local")?;
+        child.write_str("modified")?;
+
+        let txn = fixture.db.begin_write()?;
+        txn.write_cache()?.preindex(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_dirty()?,
+            &file,
+        )?;
+        txn.write_cache()?.unlink(
+            &mut txn.write_tree()?,
+            &mut txn.write_blobs()?,
+            &mut txn.write_history()?,
+            &mut txn.write_dirty()?,
+            &file,
+        )?;
+        txn.commit()?;
+
+        // This makes sure that it is possible to feed the full line
+        // from realize.versions to realize.version
+        let versions = super::get(&fixture.db, &file, "realize.versions")?;
+        let value = versions
+            .split('\n')
+            .filter(|line| line.starts_with("archive:1"))
+            .next()
+            .unwrap();
+        super::set(&fixture.db, &file, "realize.version", value.into()).unwrap();
+
+        assert_eq!(
+            "modified",
             std::fs::read_to_string(file.within(fixture.datadir.path())).unwrap()
         );
 

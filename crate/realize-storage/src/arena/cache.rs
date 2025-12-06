@@ -1503,51 +1503,152 @@ impl<'a> WritableOpenCache<'a> {
         if let Some(archived) = archived
             && archived.cache_status().is_complete()
         {
-            if let Some(original) = &original
-                && original.is_local()
-            {
-                self.archive_local_file(tree, blobs, &tree.backtrack(loc)?, original)?;
-            }
-            // We realize the blob as a modification and let the file
-            // tracker index and report any changes, so we don't
-            // report an incorrect version in case the file had
-            // undetected modifications. Remote peers are only
-            // notified once the file has been indexed.
-            let (sourcepath, destpath) = self.realize(
+            return self.recover_archived_internal(
                 tree,
                 blobs,
                 dirty,
-                archived.blobid,
-                Version::modification_of(original.as_ref().map(|o| o.version.clone())),
-            )?;
-
-            std::fs::rename(sourcepath, destpath)?;
-
-            return Ok(());
+                &archived,
+                original.as_ref(),
+            );
         }
 
         // Look for a remote file with the given version.
         let matching_peer_entry = find_peer_entry(&self.table, pathid, goal)?.next();
         if let Some(peer_entry) = matching_peer_entry {
-            let (_, entry) = peer_entry?;
+            let (_, peer_entry) = peer_entry?;
 
-            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
-            if let Some(original) = &original
-                && original.is_local()
-            {
-                let path = tree.backtrack(loc)?;
-                self.archive_local_file(tree, blobs, &path, original)?;
-
-                // Report it added (replaced) so other peers are aware
-                // of the user's decision, and then immediately drop
-                // it, since it's not downloadable from this peer.
-                history.report_added(&path, Some(&original.version))?;
-                history.report_dropped(&path, goal)?;
-            }
-            return Ok(());
+            return self.select_peer_version_internal(
+                tree,
+                blobs,
+                history,
+                dirty,
+                pathid,
+                &peer_entry,
+                original.as_ref(),
+            );
         }
 
         Err(StorageError::UnknownVersion)
+    }
+
+    /// Recover an archived blob as local file.
+    ///
+    /// If the given location is a local file already, it is archived
+    /// before its content is replaced with the content of the given
+    /// blob.
+    pub(crate) fn recover_archived(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        blobs: &mut WritableOpenBlob<'_>,
+        dirty: &mut WritableOpenDirty<'_>,
+        blobid: BlobId,
+    ) -> Result<(), StorageError> {
+        let original = match default_entry(&self.table, blobid.pathid())? {
+            None => None,
+            Some(CacheTableEntry::File(entry)) => Some(entry),
+            Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
+        };
+        let info = blobs
+            .get_with_blobid(blobid)?
+            .ok_or(StorageError::NotFound)?;
+
+        self.recover_archived_internal(tree, blobs, dirty, &info, original.as_ref())
+    }
+
+    /// Select the version of a specific peer.
+    ///
+    /// If the given location is a local file already, it is archived.
+    pub(crate) fn select_peer_version<'b, L: Into<TreeLoc<'b>>>(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        blobs: &mut WritableOpenBlob<'_>,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty<'_>,
+        loc: L,
+        peer: Peer,
+    ) -> Result<(), StorageError> {
+        let pathid = tree.expect(loc.into())?;
+        let original = match default_entry(&self.table, pathid)? {
+            None => None,
+            Some(CacheTableEntry::File(entry)) => Some(entry),
+            Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
+        };
+        let peer_entry = match peer_file_entry(&self.table, pathid, Some(peer))? {
+            None => return Err(StorageError::UnknownVersion),
+            Some(entry) => entry,
+        };
+
+        self.select_peer_version_internal(
+            tree,
+            blobs,
+            history,
+            dirty,
+            pathid,
+            &peer_entry,
+            original.as_ref(),
+        )
+    }
+
+    fn recover_archived_internal(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        blobs: &mut WritableOpenBlob<'_>,
+        dirty: &mut WritableOpenDirty<'_>,
+        info: &BlobInfo,
+        original: Option<&FileTableEntry>,
+    ) -> Result<(), StorageError> {
+        if let Some(original) = original
+            && original.is_local()
+        {
+            // The function takes a BlobInfo as proof that the blob
+            // exist. Without that we'd want to check the existence of
+            // the blob before archiving the file.
+            self.archive_local_file(
+                tree,
+                blobs,
+                &tree.backtrack(info.blobid.pathid())?,
+                original,
+            )?;
+        }
+
+        let (sourcepath, destpath) = self.realize(
+            tree,
+            blobs,
+            dirty,
+            info.blobid,
+            Version::modification_of(original.as_ref().map(|o| o.version.clone())),
+        )?;
+        std::fs::rename(sourcepath, destpath)?;
+
+        Ok(())
+    }
+
+    fn select_peer_version_internal(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        blobs: &mut WritableOpenBlob<'_>,
+        history: &mut WritableOpenHistory,
+        dirty: &mut WritableOpenDirty<'_>,
+        pathid: PathId,
+        peer_entry: &FileTableEntry,
+        original: Option<&FileTableEntry>,
+    ) -> Result<(), StorageError> {
+        self.write_default_file_entry(tree, blobs, dirty, pathid, peer_entry)?;
+        if let Some(original) = original
+            && original.is_local()
+        {
+            let path = tree.backtrack(pathid)?;
+            self.archive_local_file(tree, blobs, &path, original)?;
+
+            // Report it added (replaced) so other peers are aware
+            // of the user's decision, and then immediately drop
+            // it, since it's not downloadable from this peer.
+            history.report_added(&path, Some(&original.version))?;
+            if let Some(hash) = peer_entry.version.indexed_hash() {
+                history.report_dropped(&path, hash)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -7653,6 +7754,156 @@ mod tests {
         ));
         assert!(fixture.dir_metadata(Path::parse("a/b")?).is_ok());
         assert!(fixture.dir_metadata(Path::parse("a")?).is_ok());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_archived() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("recover_archived.txt")?;
+        let peer = Peer::from("remote_peer");
+        let local_hash = Hash([1u8; 32]);
+        let remote_hash = Hash([2u8; 32]);
+        let mtime = test_time();
+        let local_content = "local content";
+        let childpath = fixture.datadir.child("recover_archived.txt");
+
+        // Create local file first
+        let (size, actual_mtime, _) = create_test_file(&childpath, local_content)?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Index the local file
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            size,
+            actual_mtime,
+            local_hash.clone(),
+        )?;
+
+        // Add remote version from peer
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer,
+            file_path.clone(),
+            mtime,
+            200,
+            remote_hash.clone(),
+        )?;
+
+        // Select the remote alternative to archive the local file
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &remote_hash,
+        )?;
+
+        // Verify file is remote
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert!(!entry.is_local());
+
+        // Get the archived blob id
+        let archives = blobs
+            .archives(&tree, &file_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        let archive_info = &archives[0];
+
+        // Now recover the archived file
+        cache.recover_archived(&mut tree, &mut blobs, &mut dirty, archive_info.blobid)?;
+
+        // Verify file is local again and has correct content
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert!(entry.is_local());
+        assert!(matches!(entry.version, Version::Modified(_)));
+        assert_eq!(std::fs::read_to_string(childpath.path())?, local_content);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_peer_version_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("peer_version.txt")?;
+        let peer = Peer::from("peer1");
+        let hash = Hash([1u8; 32]);
+        let mtime = test_time();
+        let size = 100;
+
+        // Add file from peer
+        fixture.add_file_from_peer(peer.clone(), &file_path, size, mtime, hash.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Select the peer version
+        cache.select_peer_version(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            peer,
+        )?;
+
+        // Verify the file points to the correct version
+        let entry = cache.file_entry_or_err(&tree, &file_path)?;
+        assert_eq!(entry.version.expect_indexed()?, &hash);
+        assert_eq!(entry.size, size);
+        assert_eq!(entry.mtime, mtime);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_peer_version_unknown_peer() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("unknown_peer.txt")?;
+        let peer = Peer::from("peer1");
+        let unknown_peer = Peer::from("unknown");
+        let hash = Hash([1u8; 32]);
+        let mtime = test_time();
+
+        // Add file from peer
+        fixture.add_file_from_peer(peer, &file_path, 100, mtime, hash.clone())?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        // Try to select version from unknown peer
+        let result = cache.select_peer_version(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            unknown_peer,
+        );
+
+        assert!(matches!(result, Err(StorageError::UnknownVersion)));
 
         Ok(())
     }
