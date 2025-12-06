@@ -612,7 +612,7 @@ archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
     }
 
     #[test]
-    fn get_archive() -> anyhow::Result<()> {
+    fn get_and_set_archive() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
         let file = Path::parse("file")?;
         fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
@@ -634,6 +634,24 @@ archive:1 phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 5 {} 100%",
                 fixture.archive_ts(&file, 1)?
             ),
             super::get(&fixture.db, &file, "realize.versions")?
+        );
+
+        super::set(
+            &fixture.db,
+            &file,
+            "realize.version",
+            hash::digest("local").to_string().into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            "local",
+            std::fs::read_to_string(file.within(fixture.datadir.path())).unwrap()
+        );
+
+        assert_eq!(
+            "modified",
+            super::get(&fixture.db, &file, "realize.version")?
         );
 
         Ok(())

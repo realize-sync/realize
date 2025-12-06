@@ -3,8 +3,9 @@ use super::engine::{Engine, StorageJob};
 use super::types::LruQueueId;
 use crate::arena::blob::BlobExt;
 use crate::arena::cache::CacheReadOperations;
+use crate::arena::tree::TreeExt;
 use crate::types::PathId;
-use crate::{JobId, JobStatus, StorageError};
+use crate::{JobId, JobStatus, StorageError, Version};
 use realize_types::Hash;
 use std::fs::File;
 use std::path::PathBuf;
@@ -212,10 +213,11 @@ impl StorageJobProcessor {
                 &mut tree,
                 &mut blobs,
                 &mut dirty,
-                &mut history,
-                pathid,
-                false,
+                blobinfo.blobid,
+                Version::Indexed(hash.clone()),
             )?;
+            // TODO: should it be report_available?
+            history.report_added(&tree.backtrack(pathid)?, None)?;
 
             if dest.exists() {
                 return Ok(JobStatus::Abandoned("file_exists"));

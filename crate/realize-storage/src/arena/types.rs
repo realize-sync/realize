@@ -120,6 +120,17 @@ pub enum CacheStatus {
     Verified,
 }
 
+impl CacheStatus {
+    /// Return true if the status is at least complete.
+    pub(crate) fn is_complete(&self) -> bool {
+        match self {
+            CacheStatus::Complete => true,
+            CacheStatus::Verified => true,
+            _ => false,
+        }
+    }
+}
+
 /// LRU Queue ID enum
 pub use blob_capnp::LruQueueId;
 

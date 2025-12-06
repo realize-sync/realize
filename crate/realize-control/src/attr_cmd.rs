@@ -131,7 +131,6 @@ enum PathsOrArena<'a> {
 
 impl<'a> PathsOrArena<'a> {
     fn new(vec: &'a Vec<String>) -> Self {
-        log::debug!("====== ook vec={vec:?}");
         if vec.is_empty() {
             PathsOrArena::ArenaRoot(0)
         } else {

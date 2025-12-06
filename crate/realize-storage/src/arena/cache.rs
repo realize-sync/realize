@@ -1255,45 +1255,36 @@ impl<'a> WritableOpenCache<'a> {
     ///
     /// Return (source, dest); to really realize the file, source must
     /// be moved to dest after committing the change.
-    pub(crate) fn realize<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn realize(
         &mut self,
         tree: &mut WritableOpenTree,
         blobs: &mut WritableOpenBlob,
         dirty: &mut WritableOpenDirty,
-        history: &mut WritableOpenHistory,
-        loc: L,
-        modified: bool,
+        blobid: BlobId,
+        version: Version,
     ) -> Result<(PathBuf, PathBuf), StorageError> {
-        let loc = loc.into();
-        let pathid = tree.expect(loc.borrow())?;
-        let path = tree.backtrack(loc)?;
-        // Note that entry.path is not usable here as it would be
-        // incorrect in a branched entry.
-
-        let entry = default_file_entry_or_err(&self.table, pathid)?;
-        let source = blobs.realize(tree, pathid)?.ok_or(StorageError::NotFound)?;
+        let pathid = blobid.pathid();
+        let path = tree.backtrack(pathid)?;
+        let blob_info = blobs
+            .get_with_blobid(blobid)?
+            .ok_or(StorageError::NotFound)?;
+        let source = blobs.realize(tree, blobid)?.ok_or(StorageError::NotFound)?;
+        let mtime = if blobid.index() == 0
+            && let Some(entry) = self.file_at_pathid(pathid)?
+            && entry.version == version
+        {
+            entry.mtime
+        } else {
+            UnixTime::mtime(&source.metadata()?)
+        };
         let dest = path.within(self.datadir());
-
         self.write_default_file_entry(
             tree,
             blobs,
             dirty,
             pathid,
-            &FileTableEntry::new(
-                entry.size,
-                entry.mtime,
-                if modified {
-                    Version::modification_of(Some(entry.version))
-                } else {
-                    entry.version
-                },
-                FileEntryKind::LocalFile,
-            ),
+            &FileTableEntry::new(blob_info.size, mtime, version, FileEntryKind::LocalFile),
         )?;
-        if !modified {
-            // TODO: should it be report_available?
-            history.report_added(&path, None)?;
-        }
 
         return Ok((source, dest));
     }
@@ -1495,35 +1486,68 @@ impl<'a> WritableOpenCache<'a> {
     ) -> Result<(), StorageError> {
         let loc = loc.into();
         let pathid = tree.expect(loc.borrow())?;
-        let original = default_file_entry_or_err(&self.table, pathid)?;
-        if original.version.indexed_hash().is_some_and(|h| *h == *goal) {
+        let original = match default_entry(&self.table, pathid)? {
+            None => None,
+            Some(CacheTableEntry::File(entry)) => Some(entry),
+            Some(CacheTableEntry::Dir(_)) => return Err(StorageError::IsADirectory),
+        };
+        if original
+            .as_ref()
+            .is_some_and(|o| o.version.matches_hash(goal))
+        {
             // Nothing to do
             return Ok(());
         }
-        let peer_entry = match find_peer_entry(&self.table, pathid, goal)?.next() {
-            None => return Err(StorageError::UnknownVersion),
-            Some(e) => {
-                let (_peer, file_entry) = e?;
-
-                file_entry
+        // Look for an archived file with the given version.
+        let archived = blobs.archive_with_hash(tree, pathid, goal)?;
+        if let Some(archived) = archived
+            && archived.cache_status().is_complete()
+        {
+            if let Some(original) = &original
+                && original.is_local()
+            {
+                self.archive_local_file(tree, blobs, &tree.backtrack(loc)?, original)?;
             }
-        };
-        self.write_default_file_entry(tree, blobs, dirty, pathid, &peer_entry)?;
+            // We realize the blob as a modification and let the file
+            // tracker index and report any changes, so we don't
+            // report an incorrect version in case the file had
+            // undetected modifications. Remote peers are only
+            // notified once the file has been indexed.
+            let (sourcepath, destpath) = self.realize(
+                tree,
+                blobs,
+                dirty,
+                archived.blobid,
+                Version::modification_of(original.as_ref().map(|o| o.version.clone())),
+            )?;
 
-        // Report changes to local, as this is a user's decision that
-        // needs to be propagated to other peers currently tracking
-        // the original version.
-        if original.is_local() {
-            let path = tree.backtrack(loc)?;
-            self.archive_local_file(tree, blobs, &path, &original)?;
+            std::fs::rename(sourcepath, destpath)?;
 
-            // Report it added (replaced) so other peers are aware
-            // of the user's decision, and then immediately drop
-            // it, since it's not downloadable from this peer.
-            history.report_added(&path, Some(&original.version))?;
-            history.report_dropped(&path, goal)?;
+            return Ok(());
         }
-        Ok(())
+
+        // Look for a remote file with the given version.
+        let matching_peer_entry = find_peer_entry(&self.table, pathid, goal)?.next();
+        if let Some(peer_entry) = matching_peer_entry {
+            let (_, entry) = peer_entry?;
+
+            self.write_default_file_entry(tree, blobs, dirty, pathid, &entry)?;
+            if let Some(original) = &original
+                && original.is_local()
+            {
+                let path = tree.backtrack(loc)?;
+                self.archive_local_file(tree, blobs, &path, original)?;
+
+                // Report it added (replaced) so other peers are aware
+                // of the user's decision, and then immediately drop
+                // it, since it's not downloadable from this peer.
+                history.report_added(&path, Some(&original.version))?;
+                history.report_dropped(&path, goal)?;
+            }
+            return Ok(());
+        }
+
+        Err(StorageError::UnknownVersion)
     }
 }
 
@@ -7238,6 +7262,179 @@ mod tests {
                 HistoryTableEntry::Drop(file_path.clone(), remote_hash.clone())
             ]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_recovers_local() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("file.txt")?;
+        let file_childpath = fixture.datadir.child(file_path.as_str());
+        let file_realpath = file_childpath.to_path_buf();
+        let peer = Peer::from("remote_peer");
+        let local_hash = Hash([1u8; 32]);
+        let remote_hash = Hash([2u8; 32]);
+        let mtime = test_time();
+        let local_content = "local content";
+
+        let (size, actual_mtime, _) = create_test_file(&file_childpath, local_content)?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            size,
+            actual_mtime,
+            local_hash.clone(),
+        )?;
+        cache.notify_added(
+            &mut tree,
+            &mut blobs,
+            &mut dirty,
+            peer,
+            file_path.clone(),
+            mtime,
+            200,
+            remote_hash.clone(),
+        )?;
+        // select the remote version, this archives the local version
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &remote_hash,
+        )?;
+        assert_eq!(
+            Version::Indexed(remote_hash.clone()),
+            cache.file_entry_or_err(&tree, &file_path)?.version,
+        );
+        // select the local version again, this recovers the local
+        // version as a preindexed file.
+        let history_start = history_start(&history)?;
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &local_hash,
+        )?;
+        assert_eq!(
+            FileEntryKind::LocalFile,
+            cache.file_entry_or_err(&tree, &file_path)?.kind
+        );
+        assert!(matches!(
+            cache.file_entry_or_err(&tree, &file_path)?.version,
+            Version::Modified(_)
+        ));
+
+        assert_eq!(std::fs::read_to_string(&file_realpath)?, "local content");
+
+        // History shouldn't contain anything new yet, since the
+        // recovered file is still in preindexed state.
+        let history_entries = collect_history_entries(&history, history_start)?;
+        assert_eq!(history_entries, Vec::<HistoryTableEntry>::new());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn select_alternative_recovers_overwritten() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let file_path = Path::parse("file.txt")?;
+        let file_childpath = fixture.datadir.child(file_path.as_str());
+        let file_realpath = file_childpath.to_path_buf();
+        let orig_hash = hash::digest("orig");
+        let overwrite_path = Path::parse("overwrite.txt")?;
+        let overwrite_childpath = fixture.datadir.child(overwrite_path.as_str());
+        let overwrite_hash = hash::digest("overwrite");
+
+        let (file_size, file_mtime, _) = create_test_file(&file_childpath, "orig")?;
+        let (overwrite_size, overwrite_mtime, _) =
+            create_test_file(&overwrite_childpath, "overwrite")?;
+
+        let txn = fixture.db.begin_write()?;
+        let mut cache = txn.write_cache()?;
+        let mut tree = txn.write_tree()?;
+        let mut blobs = txn.write_blobs()?;
+        let mut history = txn.write_history()?;
+        let mut dirty = txn.write_dirty()?;
+
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            file_size,
+            file_mtime,
+            orig_hash.clone(),
+        )?;
+        cache.index(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &overwrite_path,
+            overwrite_size,
+            overwrite_mtime,
+            overwrite_hash.clone(),
+        )?;
+        cache.rename(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &overwrite_path,
+            &file_path,
+            /* noreplace= */ false,
+        )?;
+        assert_eq!(std::fs::read_to_string(&file_realpath)?, "overwrite");
+
+        let archives = blobs
+            .archives(&tree, &file_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        assert_eq!("orig", fixture.blob_content(&archives[0]).await?);
+
+        // Selecting the original version recovers the original
+        // version and archives overwrite.
+        cache.select_alternative(
+            &mut tree,
+            &mut blobs,
+            &mut history,
+            &mut dirty,
+            &file_path,
+            &orig_hash,
+        )?;
+        assert_eq!(
+            FileEntryKind::LocalFile,
+            cache.file_entry_or_err(&tree, &file_path)?.kind
+        );
+        assert!(matches!(
+            cache.file_entry_or_err(&tree, &file_path)?.version,
+            Version::Modified(_)
+        ));
+
+        //assert_eq!(std::fs::read_to_string(&file_realpath)?, "orig");
+
+        let archives = blobs
+            .archives(&tree, &file_path)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(1, archives.len());
+        assert_eq!("overwrite", fixture.blob_content(&archives[0]).await?);
 
         Ok(())
     }

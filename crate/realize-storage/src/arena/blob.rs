@@ -435,6 +435,13 @@ pub(crate) trait BlobExt {
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<BlobInfo>, StorageError>;
+
+    fn archive_with_hash<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+        hash: &Hash,
+    ) -> Result<Option<BlobInfo>, StorageError>;
 }
 
 impl<T: BlobReadOperations> BlobExt for T {
@@ -477,6 +484,21 @@ impl<T: BlobReadOperations> BlobExt for T {
                     .map(|info| info.timestamp)
                     .unwrap_or(UnixTime::ZERO)
             })
+            .transpose()
+    }
+
+    fn archive_with_hash<'b, L: Into<TreeLoc<'b>>>(
+        &self,
+        tree: &impl TreeReadOperations,
+        loc: L,
+        hash: &Hash,
+    ) -> Result<Option<BlobInfo>, StorageError> {
+        self.archives(tree, loc)
+            .filter(|b| {
+                b.as_ref()
+                    .is_ok_and(|b| b.version.indexed_hash().is_some_and(|h| *h == *hash))
+            })
+            .max_by_key(|b| b.as_ref().map(|b| b.timestamp).unwrap_or(UnixTime::ZERO))
             .transpose()
     }
 }
@@ -663,16 +685,11 @@ impl<'a> WritableOpenBlob<'a> {
     ///
     /// Upon success, return the path of the blob file. That file
     /// should be moved; The blob entry has been deleted already.
-    pub(crate) fn realize<'b, L: Into<TreeLoc<'b>>>(
+    pub(crate) fn realize(
         &mut self,
         tree: &mut WritableOpenTree,
-        loc: L,
+        blobid: BlobId,
     ) -> Result<Option<std::path::PathBuf>, StorageError> {
-        let pathid = match tree.resolve(loc)? {
-            Some(pathid) => pathid,
-            None => return Ok(None), // Nothing to export
-        };
-        let blobid = BlobId::from_pathid(pathid);
         let realpath = self.subsystem.blob_path(blobid);
         let m = match realpath.metadata() {
             Ok(m) => m,
@@ -1561,16 +1578,16 @@ impl Blob {
                 let mut blobs = txn.write_blobs()?;
                 let mut cache = txn.write_cache()?;
                 let mut dirty = txn.write_dirty()?;
-                let mut history = txn.write_history()?;
                 (source, dest) = cache.realize(
                     &mut tree,
                     &mut blobs,
                     &mut dirty,
-                    &mut history,
-                    pathid,
-                    true,
+                    BlobId::from(pathid),
+                    Version::modification_of(cache.file_at_pathid(pathid)?.map(|e| e.version)),
                 )?;
-
+                // We don't report this to history, as the file is
+                // created as local modification (preindex). It'll be
+                // modified once it's indexed.
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -2237,7 +2254,7 @@ mod tests {
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            let source = blobs.realize(&mut tree, &path)?.unwrap();
+            let source = blobs.realize(&mut tree, blobid)?.unwrap();
             std::fs::rename(source, &dest)?;
         }
         let watch = fixture.db.blobs().watch_disk_usage();
@@ -2259,13 +2276,14 @@ mod tests {
     #[tokio::test]
     async fn export_no_blob() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
-        let path = Path::parse("baa/baa")?;
-
         let txn = fixture.begin_write()?;
         {
             let mut blobs = txn.write_blobs()?;
             let mut tree = txn.write_tree()?;
-            assert_eq!(None, blobs.realize(&mut tree, &path)?);
+            assert_eq!(
+                None,
+                blobs.realize(&mut tree, BlobId::from_pathid(PathId(99)))?
+            );
         }
 
         Ok(())
