@@ -21,6 +21,7 @@ const XATTR_VERSION: &str = "realize.version";
 const XATTR_VERSIONS: &str = "realize.versions";
 const XATTR_QUOTA_MAX: &str = "realize.quota.max";
 const XATTR_QUOTA_LEAVE: &str = "realize.quota.leave";
+const XATTR_USAGE: &str = "realize.disk_usage";
 
 pub(crate) fn list(
     db: &Arc<ArenaDatabase>,
@@ -119,6 +120,22 @@ pub(crate) fn get(
             None => "".to_string(),
             Some(bop) => bop.to_string(),
         });
+    }
+
+    if xattr == XATTR_USAGE {
+        let txn = db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+        if pathid != tree.root() {
+            return Err(StorageError::NoSuchAttribute);
+        }
+        let blobs = txn.read_blobs()?;
+        let disk_usage = blobs.disk_usage()?;
+        return Ok(format!(
+            "total {} evictable {} archived {}",
+            disk_usage.total, disk_usage.evictable, disk_usage.archived
+        ));
     }
 
     Err(StorageError::NoSuchAttribute)
@@ -943,6 +960,46 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
         assert_eq!(
             DiskUsageConfig::default(),
             fixture.db.settings().borrow().disk_usage
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_disk_usage() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        assert_eq!(
+            "total 0 evictable 0 archived 0",
+            super::get(&fixture.db, Path::root(), "realize.disk_usage")?
+        );
+
+        let file = Path::parse("file")?;
+        fixture.add_to_cache(&file, Peer::from("peer2"), "two")?;
+        fixture.add_to_index(&file, "local")?;
+
+        let disk_usage;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut blobs = &mut txn.write_blobs()?;
+            txn.write_cache()?.unlink(
+                &mut txn.write_tree()?,
+                &mut blobs,
+                &mut txn.write_history()?,
+                &mut txn.write_dirty()?,
+                &file,
+            )?;
+            disk_usage = blobs.disk_usage()?;
+        }
+        txn.commit()?;
+
+        assert!(disk_usage.archived > 0);
+        assert_eq!(
+            format!(
+                "total {} evictable {} archived {}",
+                disk_usage.total, disk_usage.evictable, disk_usage.archived
+            ),
+            super::get(&fixture.db, Path::root(), "realize.disk_usage")?
         );
 
         Ok(())
