@@ -70,6 +70,13 @@ pub struct DiskUsageConfig {
     /// This is applied after the `max` value.
     pub leave: Option<BytesOrPercent>,
 
+    /// How long to keep cache data.
+    ///
+    /// Once data has been kept that long in the cache without being
+    /// accessed, it is deleted even if there's enough disk space
+    /// according to the other configuration options.
+    pub expiration: Option<Duration>,
+
     /// How long to keep data in the trash.
     ///
     /// Once data has been kept that long in the trash without being
@@ -86,15 +93,13 @@ impl DiskUsageConfig {
     pub fn max_bytes(v: u64) -> DiskUsageConfig {
         Self {
             max: Some(BytesOrPercent::Bytes(v)),
-            leave: None,
-            trash_expiration: None,
+            ..Default::default()
         }
     }
     pub fn max_percent(v: u32) -> DiskUsageConfig {
         Self {
             max: Some(BytesOrPercent::Percent(v)),
-            leave: None,
-            trash_expiration: None,
+            ..Default::default()
         }
     }
 }

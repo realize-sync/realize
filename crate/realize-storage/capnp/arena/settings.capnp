@@ -13,6 +13,7 @@ struct DiskUsageConfig {
   max @0: BytesOrPercent;
   leave @1: BytesOrPercent;
   trashExpiration @2: Float64;
+  expiration @3: Float64;
 }
 
 struct BytesOrPercent {

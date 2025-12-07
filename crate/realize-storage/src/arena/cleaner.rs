@@ -61,15 +61,34 @@ async fn next_expiration(
     db: &Arc<ArenaDatabase>,
     config: &DiskUsageConfig,
 ) -> Result<Option<UnixTime>, StorageError> {
-    if let Some(trash_expiration) = config.trash_expiration {
+    let expiration = config.expiration;
+    let trash_expiration = config.trash_expiration;
+    if expiration.is_some() || trash_expiration.is_some() {
         return tokio::task::spawn_blocking({
             let db = db.clone();
             move || {
                 let txn = db.begin_read()?;
                 let blobs = txn.read_blobs()?;
-                Ok(blobs
-                    .oldest_last_accessed(LruQueueId::Archived)?
-                    .map(|instant| instant.plus(trash_expiration)))
+
+                let next_cache_expiration = if let Some(expiration) = expiration {
+                    blobs
+                        .oldest_last_accessed(LruQueueId::Cached)?
+                        .map(|instant| instant.plus(expiration))
+                } else {
+                    None
+                };
+                let next_archive_expiration = if let Some(trash_expiration) = trash_expiration {
+                    blobs
+                        .oldest_last_accessed(LruQueueId::Archived)?
+                        .map(|instant| instant.plus(trash_expiration))
+                } else {
+                    None
+                };
+
+                Ok(std::cmp::min(
+                    next_cache_expiration,
+                    next_archive_expiration,
+                ))
             }
         })
         .await?;
@@ -82,7 +101,9 @@ async fn cleanup_expired(
     db: &Arc<ArenaDatabase>,
     config: &DiskUsageConfig,
 ) -> Result<(), StorageError> {
-    if let Some(trash_expiration) = config.trash_expiration {
+    let expiration = config.expiration;
+    let trash_expiration = config.trash_expiration;
+    if expiration.is_some() || trash_expiration.is_some() {
         tokio::task::spawn_blocking({
             let db = db.clone();
             move || {
@@ -90,7 +111,12 @@ async fn cleanup_expired(
                 {
                     let mut tree = txn.write_tree()?;
                     let mut blobs = txn.write_blobs()?;
-                    blobs.expire(&mut tree, trash_expiration, LruQueueId::Archived)?;
+                    if let Some(trash_expiration) = trash_expiration {
+                        blobs.expire(&mut tree, trash_expiration, LruQueueId::Archived)?;
+                    }
+                    if let Some(expiration) = expiration {
+                        blobs.expire(&mut tree, expiration, LruQueueId::Cached)?;
+                    }
                 }
                 txn.commit()?;
 
@@ -264,7 +290,7 @@ mod tests {
         fn create_blob_with_data<'b, L: Into<crate::arena::tree::TreeLoc<'b>>>(
             &self,
             loc: L,
-            test_data: String,
+            test_data: &str,
         ) -> anyhow::Result<crate::arena::blob::BlobInfo> {
             let hash = hash::digest(&test_data);
 
@@ -304,6 +330,13 @@ mod tests {
             let blobs = txn.read_blobs()?;
             Ok(blobs.archives(&tree, path).count())
         }
+
+        fn blob_exists(&self, path: &Path) -> anyhow::Result<bool> {
+            let txn = self.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+            Ok(blobs.get(&tree, path)?.is_some())
+        }
     }
 
     #[test]
@@ -311,7 +344,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         // Create a small blob that won't exceed limits
-        fixture.create_blob_with_data(Path::parse("small.txt")?, "small data".to_string())?;
+        fixture.create_blob_with_data(Path::parse("small.txt")?, "small data")?;
 
         let usage = fixture.get_disk_usage()?;
         let limits = DiskUsageConfig::max_bytes(1 * GB);
@@ -343,7 +376,7 @@ mod tests {
             let path = Path::parse(format!("blob{}.txt", i))?;
             // Use a static string that's large enough to trigger cleanup
             let data = "x".repeat(1 * MB as usize);
-            fixture.create_blob_with_data(&path, data)?;
+            fixture.create_blob_with_data(&path, &data)?;
         }
 
         let usage = fixture.get_disk_usage()?;
@@ -382,7 +415,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         // Create a blob
-        fixture.create_blob_with_data(Path::parse("test.txt")?, "test data".to_string())?;
+        fixture.create_blob_with_data(Path::parse("test.txt")?, "test data")?;
 
         let usage = fixture.get_disk_usage()?;
         let limits = DiskUsageConfig::max_percent(50);
@@ -410,11 +443,11 @@ mod tests {
         // Use smaller data to avoid lifetime issues
         fixture.create_blob_with_data(
             &protected_path,
-            "protected data that is long enough to be meaningful".to_string(),
+            "protected data that is long enough to be meaningful",
         )?;
         fixture.create_blob_with_data(
             &unprotected_path,
-            "unprotected data that is long enough to be meaningful".to_string(),
+            "unprotected data that is long enough to be meaningful",
         )?;
 
         // Mark protected blob as protected
@@ -476,7 +509,7 @@ mod tests {
 
         let path = Path::parse("large.txt")?;
 
-        fixture.create_blob_with_data(&path, "x".repeat(5 * MB as usize))?;
+        fixture.create_blob_with_data(&path, &"x".repeat(5 * MB as usize))?;
 
         let usage = fixture.get_disk_usage()?;
 
@@ -485,7 +518,7 @@ mod tests {
         let limits = DiskUsageConfig {
             max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Bytes(55 * GB)), // More than available free space
-            trash_expiration: None,
+            ..Default::default()
         };
 
         // there's enough free space for now
@@ -519,7 +552,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         // Create a blob
-        fixture.create_blob_with_data(Path::parse("test.txt")?, "x".repeat(1 * MB as usize))?;
+        fixture.create_blob_with_data(Path::parse("test.txt")?, &"x".repeat(1 * MB as usize))?;
 
         let usage = fixture.get_disk_usage()?;
 
@@ -527,7 +560,7 @@ mod tests {
         let limits = DiskUsageConfig {
             max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Percent(60)), // Leave 60% free (60GB out of 100GB)
-            trash_expiration: None,
+            ..Default::default()
         };
 
         // Should trigger cleanup because we need to leave 60GB free but only have 50GB
@@ -553,7 +586,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         // Create a blob that's just under the tolerance threshold
-        fixture.create_blob_with_data(Path::parse("test.txt")?, "x".repeat(1 * MB as usize))?;
+        fixture.create_blob_with_data(Path::parse("test.txt")?, &"x".repeat(1 * MB as usize))?;
 
         let usage = fixture.get_disk_usage()?;
 
@@ -584,7 +617,7 @@ mod tests {
 
         // Create only protected blobs
         let protected_path = Path::parse("protected.txt")?;
-        fixture.create_blob_with_data(&protected_path, "x".repeat(5 * MB as usize))?;
+        fixture.create_blob_with_data(&protected_path, &"x".repeat(5 * MB as usize))?;
 
         // Mark as protected
         let txn = fixture.begin_write()?;
@@ -625,7 +658,7 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         // Create a blob
-        fixture.create_blob_with_data(Path::parse("test.txt")?, "x".repeat(2 * MB as usize))?;
+        fixture.create_blob_with_data(Path::parse("test.txt")?, &"x".repeat(2 * MB as usize))?;
 
         let usage = fixture.get_disk_usage()?;
 
@@ -655,8 +688,8 @@ mod tests {
         let path2 = Path::parse("2")?;
         let fixture = Fixture::setup()?;
 
-        fixture.create_blob_with_data(&path1, "x".repeat(2 * MB as usize))?;
-        fixture.create_blob_with_data(&path2, "y".repeat(2 * MB as usize))?;
+        fixture.create_blob_with_data(&path1, &"x".repeat(2 * MB as usize))?;
+        fixture.create_blob_with_data(&path2, &"y".repeat(2 * MB as usize))?;
 
         let mut blob1 = Blob::open(&fixture.db, &path1)?;
         let mut blob2 = Blob::open(&fixture.db, &path2)?;
@@ -699,7 +732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expire() -> anyhow::Result<()> {
+    async fn expire_trash() -> anyhow::Result<()> {
         let fixture = Fixture::setup()?;
 
         fixture.configure(DiskUsageConfig {
@@ -752,6 +785,42 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(0, fixture.archive_count(&path)?);
+
+        shutdown.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expire() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        fixture.configure(DiskUsageConfig {
+            expiration: Some(Duration::from_millis(100)),
+            ..Default::default()
+        })?;
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let db = Arc::clone(&fixture.db);
+            let shutdown = shutdown.clone();
+            async move { run_loop(db, shutdown).await }
+        });
+
+        let path1 = Path::parse("one")?;
+        let path2 = Path::parse("two")?;
+        fixture.create_blob_with_data(&path1, "one")?;
+        fixture.create_blob_with_data(&path2, "two")?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let limit = Instant::now() + Duration::from_secs(3);
+        while (fixture.blob_exists(&path1)? || fixture.blob_exists(&path2)?)
+            && Instant::now() < limit
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!fixture.blob_exists(&path1)?);
+        assert!(!fixture.blob_exists(&path2)?);
 
         shutdown.cancel();
         handle.await?;

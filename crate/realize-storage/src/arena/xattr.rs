@@ -22,6 +22,7 @@ const XATTR_VERSIONS: &str = "realize.versions";
 const XATTR_QUOTA_MAX: &str = "realize.quota.max";
 const XATTR_QUOTA_LEAVE: &str = "realize.quota.leave";
 const XATTR_TRASH_EXPIRATION: &str = "realize.trash.expiration";
+const XATTR_EXPIRATION: &str = "realize.expiration";
 const XATTR_USAGE: &str = "realize.disk_usage";
 
 pub(crate) fn list(
@@ -37,6 +38,7 @@ pub(crate) fn list(
             XATTR_QUOTA_MAX,
             XATTR_QUOTA_LEAVE,
             XATTR_TRASH_EXPIRATION,
+            XATTR_EXPIRATION,
             XATTR_USAGE,
         ]);
     }
@@ -128,7 +130,7 @@ pub(crate) fn get(
         });
     }
 
-    if xattr == XATTR_TRASH_EXPIRATION {
+    if xattr == XATTR_TRASH_EXPIRATION || xattr == XATTR_EXPIRATION {
         let txn = db.begin_read()?;
         let tree = txn.read_tree()?;
         let cache = txn.read_cache()?;
@@ -136,11 +138,17 @@ pub(crate) fn get(
         if pathid != tree.root() {
             return Err(StorageError::NoSuchAttribute);
         }
-        return Ok(match db.settings().borrow().disk_usage.trash_expiration {
+        let disk_usage = &db.settings().borrow().disk_usage;
+        let val = if xattr == XATTR_TRASH_EXPIRATION {
+            disk_usage.trash_expiration
+        } else {
+            disk_usage.expiration
+        };
+        return Ok(match val {
             None => "".to_string(),
             Some(duration) => format!("{:.6}", duration.as_secs_f64()),
         });
-    }
+    };
 
     if xattr == XATTR_USAGE {
         let txn = db.begin_read()?;
@@ -164,10 +172,10 @@ pub(crate) fn get(
 pub(crate) fn set(
     db: &Arc<ArenaDatabase>,
     loc: impl Into<ArenaFsLoc>,
-    name: &str,
+    xattr: &str,
     value: Cow<'_, str>,
 ) -> Result<(), StorageError> {
-    if name == XATTR_MARK {
+    if xattr == XATTR_MARK {
         let mark = if value.is_empty() {
             None
         } else {
@@ -190,7 +198,7 @@ pub(crate) fn set(
         return Ok(());
     }
 
-    if name == XATTR_VERSION {
+    if xattr == XATTR_VERSION {
         let txn = db.begin_write()?;
         {
             let mut tree = txn.write_tree()?;
@@ -260,7 +268,7 @@ pub(crate) fn set(
         return Ok(());
     }
 
-    if name == XATTR_QUOTA_MAX || name == XATTR_QUOTA_LEAVE {
+    if xattr == XATTR_QUOTA_MAX || xattr == XATTR_QUOTA_LEAVE {
         let value = if value.is_empty() {
             None
         } else {
@@ -281,7 +289,7 @@ pub(crate) fn set(
 
             let mut settings = txn.write_settings()?;
             let mut disk_usage = settings.load()?.disk_usage;
-            if name == XATTR_QUOTA_MAX {
+            if xattr == XATTR_QUOTA_MAX {
                 disk_usage.max = value;
             } else {
                 disk_usage.leave = value;
@@ -292,7 +300,7 @@ pub(crate) fn set(
         return Ok(());
     }
 
-    if name == XATTR_TRASH_EXPIRATION {
+    if xattr == XATTR_TRASH_EXPIRATION || xattr == XATTR_EXPIRATION {
         let parsed_value = if value.is_empty() {
             None
         } else {
@@ -314,7 +322,11 @@ pub(crate) fn set(
 
             let mut settings = txn.write_settings()?;
             let mut disk_usage = settings.load()?.disk_usage;
-            disk_usage.trash_expiration = parsed_value;
+            if xattr == XATTR_TRASH_EXPIRATION {
+                disk_usage.trash_expiration = parsed_value;
+            } else {
+                disk_usage.expiration = parsed_value;
+            }
             settings.configure_disk_usage(&disk_usage)?;
         }
         txn.commit()?;
@@ -1005,7 +1017,7 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
             DiskUsageConfig {
                 max: Some(BytesOrPercent::Bytes(20 * 1024 * 1024)),
                 leave: Some(BytesOrPercent::Percent(15)),
-                trash_expiration: None,
+                ..Default::default()
             },
             fixture.db.settings().borrow().disk_usage
         );
@@ -1036,9 +1048,8 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
         )?;
         assert_eq!(
             DiskUsageConfig {
-                max: None,
-                leave: None,
                 trash_expiration: Some(std::time::Duration::from_secs(900)),
+                ..Default::default()
             },
             fixture.db.settings().borrow().disk_usage
         );
@@ -1055,9 +1066,8 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
         )?;
         assert_eq!(
             DiskUsageConfig {
-                max: None,
-                leave: None,
                 trash_expiration: Some(std::time::Duration::from_secs(300)),
+                ..Default::default()
             },
             fixture.db.settings().borrow().disk_usage
         );
@@ -1068,6 +1078,41 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
             "realize.trash.expiration",
             "".into(),
         )?;
+        assert_eq!(
+            DiskUsageConfig::default(),
+            fixture.db.settings().borrow().disk_usage
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_and_set_expiration() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        assert_eq!(
+            "",
+            super::get(&fixture.db, Path::root(), "realize.expiration")?
+        );
+
+        super::set(
+            &fixture.db,
+            Path::root(),
+            "realize.expiration",
+            "15m".into(),
+        )?;
+        assert_eq!(
+            DiskUsageConfig {
+                expiration: Some(std::time::Duration::from_secs(900)),
+                ..Default::default()
+            },
+            fixture.db.settings().borrow().disk_usage
+        );
+        assert_eq!(
+            "900.000000",
+            super::get(&fixture.db, Path::root(), "realize.expiration")?
+        );
+
+        super::set(&fixture.db, Path::root(), "realize.expiration", "".into())?;
         assert_eq!(
             DiskUsageConfig::default(),
             fixture.db.settings().borrow().disk_usage

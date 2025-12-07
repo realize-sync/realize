@@ -1597,6 +1597,11 @@ impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
         } else {
             Some(Duration::from_secs_f64(reader.get_trash_expiration()))
         };
+        let expiration = if reader.get_expiration() <= 0.0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(reader.get_expiration()))
+        };
 
         Ok(SettingsTableEntry {
             uuid,
@@ -1604,6 +1609,7 @@ impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
                 max,
                 leave,
                 trash_expiration,
+                expiration,
             },
         })
     }
@@ -1629,6 +1635,10 @@ impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
         }
         match self.disk_usage.trash_expiration {
             Some(duration) => builder.set_trash_expiration(duration.as_secs_f64()),
+            None => {}
+        }
+        match self.disk_usage.expiration {
+            Some(duration) => builder.set_expiration(duration.as_secs_f64()),
             None => {}
         }
 
@@ -2307,6 +2317,7 @@ mod tests {
                 max: Some(BytesOrPercent::Percent(12)),
                 leave: Some(BytesOrPercent::Bytes(1024)),
                 trash_expiration: Some(Duration::from_secs(30)),
+                expiration: Some(Duration::from_secs(15)),
             },
         };
 
@@ -2329,8 +2340,7 @@ mod tests {
             uuid: Uuid::now_v7(),
             disk_usage: DiskUsageConfig {
                 max: Some(BytesOrPercent::Bytes(1024)),
-                leave: None,
-                trash_expiration: None,
+                ..Default::default()
             },
         };
 
