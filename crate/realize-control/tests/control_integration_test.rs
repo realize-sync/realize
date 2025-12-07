@@ -176,8 +176,6 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
     Ok(())
 }
 
-
-
 #[tokio::test]
 async fn peer_query() -> anyhow::Result<()> {
     let local = LocalSet::new();
@@ -320,6 +318,89 @@ async fn arena_remove() -> anyhow::Result<()> {
             assert!(fixture.setup.storage.arenas().is_empty());
             assert!(fixture.arena_dir.exists());
             assert!(!fixture.arena_dir.child(".realize").exists());
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arena_empty_trash() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test empty trash with arena name
+            let mut control_cmd = fixture.control_command(&["arena", "empty-trash", "myarena"])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Trash emptied for myarena"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            // Test empty trash without arena name
+            let mut control_cmd = fixture.control_command(&["arena", "empty-trash"])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Trash emptied for all arenas"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn arena_empty_cache() -> anyhow::Result<()> {
+    let local = LocalSet::new();
+    let fixture = Fixture::setup(&local).await?;
+
+    local
+        .run_until(async move {
+            // Test empty cache with arena name
+            let mut control_cmd = fixture.control_command(&["arena", "empty-cache", "myarena"])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Cache emptied for myarena"),
+                "Expected success message, got '{}'",
+                output_str
+            );
+
+            // Test empty cache without arena name
+            let mut control_cmd = fixture.control_command(&["arena", "empty-cache"])?;
+            let output =
+                tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
+            if !output.status.success() {
+                panic!("Control command failed: {output:?}");
+            }
+            let output_str = String::from_utf8(output.stdout)?;
+            assert!(
+                output_str.contains("Cache emptied for all arenas"),
+                "Expected success message, got '{}'",
+                output_str
+            );
 
             Ok::<_, anyhow::Error>(())
         })

@@ -597,6 +597,54 @@ impl Filesystem {
         })
         .await?
     }
+
+    /// Delete cached data, but keep protected file data.
+    ///
+    /// If an arena is specified, the call only affects that arena,
+    /// otherwise archived files of all arenas are deleted.
+    pub async fn empty_cache(self: &Arc<Self>, arena: Option<Arena>) -> Result<(), StorageError> {
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || match arena {
+            Some(arena) => this.arena_fs(arena)?.empty_cache(),
+            None => {
+                for fs in this.all_fs() {
+                    fs.empty_cache()?;
+                }
+                Ok(())
+            }
+        })
+        .await?
+    }
+
+    /// Delete archived files.
+    ///
+    /// If an arena is specified, the call only affects that arena,
+    /// otherwise archived files of all arenas are deleted.
+    pub async fn empty_trash(self: &Arc<Self>, arena: Option<Arena>) -> Result<(), StorageError> {
+        let this = Arc::clone(self);
+
+        task::spawn_blocking(move || match arena {
+            Some(arena) => this.arena_fs(arena)?.empty_trash(),
+            None => {
+                for fs in this.all_fs() {
+                    fs.empty_trash()?;
+                }
+                Ok(())
+            }
+        })
+        .await?
+    }
+
+    fn all_fs(&self) -> Vec<Arc<ArenaFilesystem>> {
+        self.state
+            .write()
+            .unwrap()
+            .arena_fs
+            .values()
+            .map(|fs| Arc::clone(fs))
+            .collect::<Vec<_>>()
+    }
 }
 
 impl FilesystemState {

@@ -7,10 +7,9 @@ use super::control_capnp::churten::{
 };
 use super::control_capnp::control::{
     self, ChurtenParams, ChurtenResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
-    DisconnectResults, GetAttrParams, GetAttrResults,
-    KeepConnectedParams, KeepConnectedResults, ListAttrParams, ListAttrResults, ListPeersParams,
-    ListPeersResults, RemoveArenaParams, RemoveArenaResults, SetAttrParams, SetAttrResults,
-
+    DisconnectResults, GetAttrParams, GetAttrResults, KeepConnectedParams, KeepConnectedResults,
+    ListAttrParams, ListAttrResults, ListPeersParams, ListPeersResults, RemoveArenaParams,
+    RemoveArenaResults, SetAttrParams, SetAttrResults,
 };
 use super::convert;
 use crate::consensus::churten::{Churten, JobHandler};
@@ -63,8 +62,6 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
 
         Promise::ok(())
     }
-
-
 
     fn list_peers(
         &mut self,
@@ -262,6 +259,46 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
             Ok(())
         })
     }
+
+    fn empty_trash(
+        &mut self,
+        params: control::EmptyTrashParams,
+        _: control::EmptyTrashResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let params = params.get()?;
+            let arena = if params.has_arena() {
+                Some(parse_arena(params.get_arena()?)?)
+            } else {
+                None
+            };
+            match storage.cache().empty_trash(arena).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(from_storage_err(e)),
+            }
+        })
+    }
+
+    fn empty_cache(
+        &mut self,
+        params: control::EmptyCacheParams,
+        _: control::EmptyCacheResults,
+    ) -> Promise<(), capnp::Error> {
+        let storage = Arc::clone(&self.storage);
+        Promise::from_future(async move {
+            let params = params.get()?;
+            let arena = if params.has_arena() {
+                Some(parse_arena(params.get_arena()?)?)
+            } else {
+                None
+            };
+            match storage.cache().empty_cache(arena).await {
+                Ok(()) => Ok(()),
+                Err(e) => Err(from_storage_err(e)),
+            }
+        })
+    }
 }
 
 fn fill_attr_error(
@@ -452,8 +489,6 @@ fn parse_peer(reader: capnp::text::Reader<'_>) -> Result<Peer, capnp::Error> {
     Ok(Peer::from(reader.to_str()?))
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,8 +608,6 @@ mod tests {
             Ok(sockpath)
         }
     }
-
-
 
     #[tokio::test]
     async fn churten_rpc_job_succeeds() -> anyhow::Result<()> {
@@ -1483,6 +1516,66 @@ mod tests {
                     },
                 }
 
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_trash_succeeds() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+                let mut request = control.empty_trash_request();
+                request.get().set_arena(arena.as_str());
+                request.send().promise.await?;
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_cache_succeeds() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+        let storage = fixture.inner.storage(peer)?;
+        let sockpath = fixture
+            .bind_server(
+                &local,
+                peer,
+                household.clone(),
+                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+            )
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+                let mut request = control.empty_cache_request();
+                request.get().set_arena(arena.as_str());
+                request.send().promise.await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;

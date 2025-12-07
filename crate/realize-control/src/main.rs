@@ -117,6 +117,18 @@ enum ArenaCommands {
         #[arg(long)]
         keep_database: bool,
     },
+
+    /// Empty the trash of an arena
+    EmptyTrash {
+        /// Arena name (optional)
+        name: Option<String>,
+    },
+
+    /// Empty the cache of an arena
+    EmptyCache {
+        /// Arena name (optional)
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -252,6 +264,14 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                             keep_database,
                         )
                         .await
+                    }
+                    ArenaCommands::EmptyTrash { name } => {
+                        arena_cmd::execute_arena_empty_trash(&control, cli.output, name.as_deref())
+                            .await
+                    }
+                    ArenaCommands::EmptyCache { name } => {
+                        arena_cmd::execute_arena_empty_cache(&control, cli.output, name.as_deref())
+                            .await
                     }
                 },
                 Commands::Attr { command } => match command {

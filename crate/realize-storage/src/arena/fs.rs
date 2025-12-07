@@ -440,6 +440,32 @@ impl ArenaFilesystem {
 
         Ok(())
     }
+
+    /// Delete cached data, but keep protected file data.
+    pub(crate) fn empty_cache(&self) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            blobs.empty_cache(&mut tree)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    /// Delete archived files.
+    pub(crate) fn empty_trash(&self) -> Result<(), StorageError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut blobs = txn.write_blobs()?;
+            let mut tree = txn.write_tree()?;
+            blobs.empty_trash(&mut tree)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
 }
 
 pub(crate) enum ArenaFsLoc {

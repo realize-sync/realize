@@ -884,6 +884,28 @@ impl<'a> WritableOpenBlob<'a> {
         Ok(true)
     }
 
+    /// Delete archived blobs.
+    pub(crate) fn empty_trash(&mut self, tree: &mut WritableOpenTree) -> Result<(), StorageError> {
+        self.empty_queue(tree, LruQueueId::Archived)
+    }
+
+    /// Delete downloaded blobs.
+    pub(crate) fn empty_cache(&mut self, tree: &mut WritableOpenTree) -> Result<(), StorageError> {
+        self.empty_queue(tree, LruQueueId::Cached)
+    }
+
+    pub(crate) fn empty_queue(
+        &mut self,
+        tree: &mut WritableOpenTree,
+        queue_id: LruQueueId,
+    ) -> Result<(), StorageError> {
+        let (removed, _) = self.cleanup_queue(tree, 0, queue_id)?;
+        if removed > 0 {
+            self.report_disk_usage_changed();
+        }
+        Ok(())
+    }
+
     /// Delete blobs as necessary to reach the target total size, in bytes.
     pub(crate) fn cleanup(
         &mut self,

@@ -8,9 +8,7 @@ $Rust.parentModule("rpc::control");
 # Control the local realize server.
 interface Control {
   churten @0 () -> (churten: Churten);
-
-
-
+  
   listPeers @1 () -> (res:List(PeerConnectionInfo));
   # list peers and their connection status
   
@@ -27,7 +25,10 @@ interface Control {
 
   listAttr @6 (req: ListAttrRequest) -> (res: Result(ListAttrResponse, AttrError));
   getAttr @7 (req: GetAttrRequest) -> (res: Result(GetAttrResponse, AttrError));
-  setAttr @8 (req: SetAttrRequest) -> (res: Result(SetAttrResponse, AttrError));                             
+  setAttr @8 (req: SetAttrRequest) -> (res: Result(SetAttrResponse, AttrError));
+
+  emptyTrash @9 (arena: Text) -> ();
+  emptyCache @10 (arena: Text) -> ();
 }
 
 struct PeerConnectionInfo {

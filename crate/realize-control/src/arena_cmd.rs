@@ -95,3 +95,37 @@ pub(crate) async fn execute_arena_remove(
         }
     }
 }
+
+pub(crate) async fn execute_arena_empty_trash(
+    control: &control_capnp::control::Client,
+    output_mode: OutputMode,
+    name: Option<&str>,
+) -> Result<i32> {
+    let mut request = control.empty_trash_request();
+    if let Some(name) = name {
+        request.get().set_arena(name);
+    }
+
+    let _ = request.send().promise.await?;
+
+    let name_str = name.unwrap_or("all arenas");
+    output::print_success(output_mode, "OK", format!("Trash emptied for {name_str}"));
+    Ok(0)
+}
+
+pub(crate) async fn execute_arena_empty_cache(
+    control: &control_capnp::control::Client,
+    output_mode: OutputMode,
+    name: Option<&str>,
+) -> Result<i32> {
+    let mut request = control.empty_cache_request();
+    if let Some(name) = name {
+        request.get().set_arena(name);
+    }
+
+    let _ = request.send().promise.await?;
+
+    let name_str = name.unwrap_or("all arenas");
+    output::print_success(output_mode, "OK", format!("Cache emptied for {name_str}"));
+    Ok(0)
+}
