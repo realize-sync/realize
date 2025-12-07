@@ -8,7 +8,7 @@ use realize_types::{self, Arena, ByteRanges, Hash, Path, Peer, UnixTime};
 use redb::{Key, TypeName, Value};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 #[allow(dead_code)]
@@ -288,6 +288,9 @@ pub struct BlobTableEntry {
     /// Previous blob in the queue
     pub prev: Option<BlobId>,
 
+    /// Last access time.
+    pub last_access: UnixTime,
+
     /// Disk usage in bytes
     pub disk_usage: u64,
 
@@ -324,6 +327,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
 
         let queue = reader.get_queue()?;
         let timestamp = parse_time(reader.get_timestamp()?);
+        let last_access = parse_time(reader.get_last_access()?);
 
         Ok(BlobTableEntry {
             written_areas: parse_byte_ranges(reader.get_written_areas()?)?,
@@ -335,6 +339,7 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
             prev,
             disk_usage: reader.get_disk_usage(),
             timestamp,
+            last_access,
         })
     }
 
@@ -351,7 +356,8 @@ impl ByteConvertible<BlobTableEntry> for BlobTableEntry {
         builder.set_prev(self.prev.map(|b| b.0).unwrap_or(0));
         builder.set_disk_usage(self.disk_usage);
         fill_byte_ranges(&self.written_areas, builder.reborrow().init_written_areas());
-        fill_time(builder.init_timestamp(), self.timestamp);
+        fill_time(builder.reborrow().init_timestamp(), self.timestamp);
+        fill_time(builder.init_last_access(), self.last_access);
 
         let mut buffer: Vec<u8> = Vec::new();
         serialize_packed::write_message(&mut buffer, &message)?;
@@ -1586,10 +1592,19 @@ impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
         } else {
             None
         };
+        let trash_expiration = if reader.get_trash_expiration() <= 0.0 {
+            None
+        } else {
+            Some(Duration::from_secs_f64(reader.get_trash_expiration()))
+        };
 
         Ok(SettingsTableEntry {
             uuid,
-            disk_usage: DiskUsageConfig { max, leave },
+            disk_usage: DiskUsageConfig {
+                max,
+                leave,
+                trash_expiration,
+            },
         })
     }
 
@@ -1610,6 +1625,10 @@ impl ByteConvertible<SettingsTableEntry> for SettingsTableEntry {
         match self.disk_usage.leave {
             Some(BytesOrPercent::Percent(val)) => builder.reborrow().init_leave().set_percent(val),
             Some(BytesOrPercent::Bytes(val)) => builder.reborrow().init_leave().set_bytes(val),
+            None => {}
+        }
+        match self.disk_usage.trash_expiration {
+            Some(duration) => builder.set_trash_expiration(duration.as_secs_f64()),
             None => {}
         }
 
@@ -1793,6 +1812,7 @@ mod tests {
             ),
             disk_usage: 1024,
             timestamp: now,
+            last_access: UnixTime::from_secs(1234567890),
         };
 
         assert_eq!(
@@ -1808,6 +1828,7 @@ mod tests {
             queue: LruQueueId::Cached,
             next: None,
             prev: None,
+            last_access: now,
             disk_usage: 1024,
             timestamp: now,
         };
@@ -1825,6 +1846,7 @@ mod tests {
             queue: LruQueueId::Cached,
             next: None,
             prev: None,
+            last_access: now,
             disk_usage: 0,
             timestamp: now,
         };
@@ -2284,6 +2306,7 @@ mod tests {
             disk_usage: DiskUsageConfig {
                 max: Some(BytesOrPercent::Percent(12)),
                 leave: Some(BytesOrPercent::Bytes(1024)),
+                trash_expiration: Some(Duration::from_secs(30)),
             },
         };
 
@@ -2307,6 +2330,7 @@ mod tests {
             disk_usage: DiskUsageConfig {
                 max: Some(BytesOrPercent::Bytes(1024)),
                 leave: None,
+                trash_expiration: None,
             },
         };
 

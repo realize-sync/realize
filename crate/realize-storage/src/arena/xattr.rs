@@ -9,7 +9,7 @@ use crate::arena::fs::ArenaFsLoc;
 use crate::arena::mark::MarkExt;
 use crate::arena::tree::{TreeExt, TreeReadOperations};
 use crate::arena::types::FileAlternative;
-use crate::config::BytesOrPercent;
+use crate::config::{BytesOrPercent, HumanDuration};
 use crate::{CacheStatus, FileRealm, Mark, StorageError, Version};
 
 use super::blob::{BlobInfo, BlobReadOperations};
@@ -21,6 +21,7 @@ const XATTR_VERSION: &str = "realize.version";
 const XATTR_VERSIONS: &str = "realize.versions";
 const XATTR_QUOTA_MAX: &str = "realize.quota.max";
 const XATTR_QUOTA_LEAVE: &str = "realize.quota.leave";
+const XATTR_TRASH_EXPIRATION: &str = "realize.trash.expiration";
 const XATTR_USAGE: &str = "realize.disk_usage";
 
 pub(crate) fn list(
@@ -32,7 +33,12 @@ pub(crate) fn list(
     let cache = txn.read_cache()?;
     let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
     if pathid == tree.root() {
-        return Ok(vec![XATTR_QUOTA_MAX, XATTR_QUOTA_LEAVE]);
+        return Ok(vec![
+            XATTR_QUOTA_MAX,
+            XATTR_QUOTA_LEAVE,
+            XATTR_TRASH_EXPIRATION,
+            XATTR_USAGE,
+        ]);
     }
     match cache
         .metadata(&tree, pathid)?
@@ -119,6 +125,20 @@ pub(crate) fn get(
         return Ok(match val {
             None => "".to_string(),
             Some(bop) => bop.to_string(),
+        });
+    }
+
+    if xattr == XATTR_TRASH_EXPIRATION {
+        let txn = db.begin_read()?;
+        let tree = txn.read_tree()?;
+        let cache = txn.read_cache()?;
+        let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+        if pathid != tree.root() {
+            return Err(StorageError::NoSuchAttribute);
+        }
+        return Ok(match db.settings().borrow().disk_usage.trash_expiration {
+            None => "".to_string(),
+            Some(duration) => format!("{:.6}", duration.as_secs_f64()),
         });
     }
 
@@ -266,6 +286,35 @@ pub(crate) fn set(
             } else {
                 disk_usage.leave = value;
             }
+            settings.configure_disk_usage(&disk_usage)?;
+        }
+        txn.commit()?;
+        return Ok(());
+    }
+
+    if name == XATTR_TRASH_EXPIRATION {
+        let parsed_value = if value.is_empty() {
+            None
+        } else {
+            Some(
+                HumanDuration::parse(value.as_ref())
+                    .map_err(|_| StorageError::InvalidAttributeValue)?
+                    .into_duration(),
+            )
+        };
+
+        let txn = db.begin_write()?;
+        {
+            let tree = txn.read_tree()?;
+            let cache = txn.read_cache()?;
+            let pathid = tree.expect(loc.into().into_tree_loc(&cache)?)?;
+            if pathid != tree.root() {
+                return Err(StorageError::NoSuchAttribute);
+            }
+
+            let mut settings = txn.write_settings()?;
+            let mut disk_usage = settings.load()?.disk_usage;
+            disk_usage.trash_expiration = parsed_value;
             settings.configure_disk_usage(&disk_usage)?;
         }
         txn.commit()?;
@@ -499,7 +548,12 @@ mod tests {
         let fixture = Fixture::setup()?;
 
         assert_unordered::assert_eq_unordered!(
-            vec!["realize.quota.max", "realize.quota.leave"],
+            vec![
+                "realize.quota.max",
+                "realize.quota.leave",
+                "realize.trash.expiration",
+                "realize.disk_usage"
+            ],
             super::list(&fixture.db, Path::root())?
         );
 
@@ -950,13 +1004,70 @@ archive:1 modified:phJYEP8TihveNo6aOJCxLxq34AAOhSYayisOMnod+Kc 8 {} 100%",
         assert_eq!(
             DiskUsageConfig {
                 max: Some(BytesOrPercent::Bytes(20 * 1024 * 1024)),
-                leave: Some(BytesOrPercent::Percent(15))
+                leave: Some(BytesOrPercent::Percent(15)),
+                trash_expiration: None,
             },
             fixture.db.settings().borrow().disk_usage
         );
 
         super::set(&fixture.db, Path::root(), "realize.quota.max", "".into())?;
         super::set(&fixture.db, Path::root(), "realize.quota.leave", "".into())?;
+        assert_eq!(
+            DiskUsageConfig::default(),
+            fixture.db.settings().borrow().disk_usage
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn get_and_set_trash_expiration() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        assert_eq!(
+            "",
+            super::get(&fixture.db, Path::root(), "realize.trash.expiration")?
+        );
+
+        super::set(
+            &fixture.db,
+            Path::root(),
+            "realize.trash.expiration",
+            "15m".into(),
+        )?;
+        assert_eq!(
+            DiskUsageConfig {
+                max: None,
+                leave: None,
+                trash_expiration: Some(std::time::Duration::from_secs(900)),
+            },
+            fixture.db.settings().borrow().disk_usage
+        );
+        assert_eq!(
+            "900.000000",
+            super::get(&fixture.db, Path::root(), "realize.trash.expiration")?
+        );
+
+        super::set(
+            &fixture.db,
+            Path::root(),
+            "realize.trash.expiration",
+            "300".into(),
+        )?;
+        assert_eq!(
+            DiskUsageConfig {
+                max: None,
+                leave: None,
+                trash_expiration: Some(std::time::Duration::from_secs(300)),
+            },
+            fixture.db.settings().borrow().disk_usage
+        );
+
+        super::set(
+            &fixture.db,
+            Path::root(),
+            "realize.trash.expiration",
+            "".into(),
+        )?;
         assert_eq!(
             DiskUsageConfig::default(),
             fixture.db.settings().borrow().disk_usage

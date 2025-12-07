@@ -28,6 +28,9 @@ struct BlobTableEntry {
   # Previous blob in the queue (PathId)
   prev @4: UInt64;
 
+  # Time of last access, used for expiring blobs
+  lastAccess @9: Time;
+
   # Disk usage in bytes
   diskUsage @5: UInt64;
 

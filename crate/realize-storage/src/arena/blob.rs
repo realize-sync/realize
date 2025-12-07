@@ -339,8 +339,10 @@ pub(crate) trait BlobReadOperations {
     /// Returns (total, evictable) with total the total disk usage, in
     /// bytes and evictable the portion of total that
     /// [WritableOpenBlob::cleanup] can delete.
-    #[allow(dead_code)]
     fn disk_usage(&self) -> Result<DiskUsage, StorageError>;
+
+    /// Return the oldest recent last accessed time from the given queue
+    fn oldest_last_accessed(&self, queue_id: LruQueueId) -> Result<Option<UnixTime>, StorageError>;
 }
 
 impl<T, TQ> BlobReadOperations for ReadableOpenBlob<T, TQ>
@@ -371,6 +373,11 @@ where
     fn disk_usage(&self) -> Result<DiskUsage, StorageError> {
         disk_usage_op(&self.blob_lru_queue_table)
     }
+
+    /// Return the oldest recent last accessed time from the given queue
+    fn oldest_last_accessed(&self, queue_id: LruQueueId) -> Result<Option<UnixTime>, StorageError> {
+        oldest_last_accessed_op(&self.blob_table, self.tail(queue_id).next())
+    }
 }
 
 impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
@@ -396,6 +403,11 @@ impl<'a> BlobReadOperations for WritableOpenBlob<'a> {
 
     fn disk_usage(&self) -> Result<DiskUsage, StorageError> {
         disk_usage_op(&self.blob_lru_queue_table)
+    }
+
+    /// Return the oldest recent last accessed time from the given queue
+    fn oldest_last_accessed(&self, queue_id: LruQueueId) -> Result<Option<UnixTime>, StorageError> {
+        oldest_last_accessed_op(&self.blob_table, self.tail(queue_id).next())
     }
 }
 
@@ -430,12 +442,16 @@ pub(crate) trait BlobExt {
         loc: L,
     ) -> Result<CacheStatus, StorageError>;
 
+    /// Return the most recently created archive for the given
+    /// location, if any.
     fn most_recent_archive<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
         loc: L,
     ) -> Result<Option<BlobInfo>, StorageError>;
 
+    /// Return the most recently created archive for the given
+    /// location and hash, if any.
     fn archive_with_hash<'b, L: Into<TreeLoc<'b>>>(
         &self,
         tree: &impl TreeReadOperations,
@@ -570,6 +586,7 @@ impl<'a> WritableOpenBlob<'a> {
         };
         let blob_path = self.subsystem.blob_path(blobid);
         self.prepare_blob_file(&blob_path, size)?;
+        let now = UnixTime::now();
         let mut entry = BlobTableEntry {
             written_areas: ByteRanges::new(),
             version: version.clone(),
@@ -578,8 +595,9 @@ impl<'a> WritableOpenBlob<'a> {
             queue,
             next: None,
             prev: None,
+            last_access: now,
             disk_usage: calculate_disk_usage(&blob_path.metadata()?),
-            timestamp: UnixTime::now(),
+            timestamp: now,
         };
         log::debug!(
             "[{}] Creating blob {pathid} in {queue:?} at {blob_path:?} -> {entry:?}",
@@ -987,6 +1005,57 @@ impl<'a> WritableOpenBlob<'a> {
         Ok((removed_count, queue.disk_usage))
     }
 
+    /// Check last accessed time of elements in the given queue and
+    /// remove those >= cutoff.
+    pub(crate) fn expire(
+        &mut self,
+        tree: &mut WritableOpenTree<'_>,
+        expiration: Duration,
+        queue_id: LruQueueId,
+    ) -> Result<(), StorageError> {
+        let mut queue = match get_queue_if_available(&self.blob_lru_queue_table, queue_id)? {
+            Some(q) => q,
+            None => {
+                // Nothing to clean up
+                return Ok(());
+            }
+        };
+        let tag = self.tag;
+
+        let mut prev = queue.tail;
+        let mut removed_count = 0;
+        let now = UnixTime::now();
+        log::debug!("[{tag}] Expiring elements from {queue_id:?} expiration: {expiration:?}",);
+        while let Some(current_id) = prev {
+            let current = follow_queue_link(&self.blob_table, current_id)?;
+            prev = current.prev;
+
+            let elapsed = now.elapsed_since(current.last_access);
+            if elapsed < expiration {
+                break;
+            }
+            log::debug!(
+                "[{tag}] Expiring {current_id} from {queue_id:?} ({elapsed:?} >= {expiration:?})",
+            );
+            self.remove_from_queue_update_entry(&current, &mut queue)?;
+            removed_count += 1;
+            tree.remove_and_decref(current_id.pathid(), &mut self.blob_table, current_id)?;
+            let blob_path = self.subsystem.blob_path(current_id);
+            if blob_path.exists() {
+                std::fs::remove_file(&blob_path)?;
+            }
+        }
+
+        log::debug!("[{tag}] Expired {removed_count} {queue_id:?} entries.");
+
+        if removed_count > 0 {
+            self.blob_lru_queue_table
+                .insert(queue_id as u16, Holder::new(&queue)?)?;
+        }
+
+        Ok(())
+    }
+
     /// Add a blob to the front of the Cached queue.
     fn add_to_queue_front(
         &mut self,
@@ -1025,6 +1094,7 @@ impl<'a> WritableOpenBlob<'a> {
         blob_entry.next = queue.head;
         queue.head = Some(blobid);
         blob_entry.prev = None;
+        blob_entry.last_access = UnixTime::now();
         queue.disk_usage += blob_entry.disk_usage;
 
         Ok(())
@@ -1696,7 +1766,6 @@ fn get_read_op(
     }
 }
 
-#[allow(dead_code)]
 fn disk_usage_op(
     blob_lru_queue_table: &impl redb::ReadableTable<u16, Holder<'static, QueueTableEntry>>,
 ) -> Result<DiskUsage, StorageError> {
@@ -1721,6 +1790,20 @@ fn disk_usage_op(
         evictable,
         archived,
     })
+}
+
+/// Return the oldest recent last accessed time from the given queue
+fn oldest_last_accessed_op(
+    blob_table: &impl ReadableTable<BlobId, Holder<'static, BlobTableEntry>>,
+    tail: Option<Result<BlobId, StorageError>>,
+) -> Result<Option<UnixTime>, StorageError> {
+    if let Some(tail) = tail.transpose()?
+        && let Some(entry) = get_blob_entry(blob_table, tail)?
+    {
+        return Ok(Some(entry.last_access));
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -3928,6 +4011,55 @@ mod tests {
         assert!(blobs.archives(&tree, &path).next().is_none());
         blobs.create(&mut tree, &marks, &path, &hash::digest("test"), 4)?;
         assert!(blobs.archives(&tree, &path).next().is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expire() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.begin_write()?;
+        let mut blobs = txn.write_blobs()?;
+        let marks = txn.read_marks()?;
+        let mut tree = txn.write_tree()?;
+
+        let mut blob_ids = Vec::new();
+        for i in 0..3 {
+            let path = Path::parse(format!("blob_{}", i))?;
+            let info = blobs.create(
+                &mut tree,
+                &marks,
+                &path,
+                &hash::digest(format!("blob_{}", i)),
+                100,
+            )?;
+            blob_ids.push(info.blobid);
+        }
+        let initial_disk_usage = blobs.disk_usage()?;
+
+        // Manually update last_access for the first blob to be very old
+        // The first created blob is at the tail of the LRU queue.
+        {
+            let mut entry = get_blob_entry(&blobs.blob_table, blob_ids[0])?.unwrap();
+            entry.last_access = UnixTime::ZERO;
+            blobs
+                .blob_table
+                .insert(blob_ids[0], Holder::with_content(entry)?)?;
+        }
+
+        // Expire blobs older than 30 minutes
+        blobs.expire(&mut tree, Duration::from_secs(1800), LruQueueId::Cached)?;
+
+        assert!(blobs.get_with_blobid(blob_ids[0])?.is_none());
+        assert!(blobs.get_with_blobid(blob_ids[1])?.is_some());
+        assert!(blobs.get_with_blobid(blob_ids[2])?.is_some());
+
+        // Disk usage should have been updated
+        let final_disk_usage = blobs.disk_usage()?;
+        assert!(
+            final_disk_usage.evictable < initial_disk_usage.evictable,
+            "initial: {initial_disk_usage:?}, final: {final_disk_usage:?}"
+        );
 
         Ok(())
     }

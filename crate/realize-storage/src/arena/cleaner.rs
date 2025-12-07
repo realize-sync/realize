@@ -2,9 +2,11 @@
 
 use super::blob::DiskUsage;
 use super::db::ArenaDatabase;
+use super::types::LruQueueId;
 use crate::StorageError;
 use crate::arena::blob::BlobReadOperations;
 use crate::config::{BytesOrPercent, DiskUsageConfig};
+use realize_types::UnixTime;
 use std::cmp::min;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +18,7 @@ pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, shutdown: CancellationToken
 
     loop {
         let config = settings_rx.borrow_and_update().disk_usage.clone();
+        let next_expiration = next_expiration(&db, &config).await.ok().flatten();
         if !config.is_empty() {
             let usage = disk_usage_rx.borrow_and_update().clone();
             if let Err(err) = check_limits_async(&db, &config, usage).await {
@@ -38,8 +41,66 @@ pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, shutdown: CancellationToken
                 Err(_) => return,
                 Ok(_) => continue,
             }
+        }
+        _ = sleep_until(next_expiration) => {
+            if let Err(err) = cleanup_expired(&db, &config).await {
+                log::warn!("[{}] Expiration cleanup failed: {err:?}", db.tag())
+            }
         });
     }
+}
+
+async fn sleep_until(instant: Option<UnixTime>) {
+    match instant {
+        None => std::future::pending().await,
+        Some(instant) => tokio::time::sleep(instant.elapsed_since(UnixTime::now())).await,
+    }
+}
+
+async fn next_expiration(
+    db: &Arc<ArenaDatabase>,
+    config: &DiskUsageConfig,
+) -> Result<Option<UnixTime>, StorageError> {
+    if let Some(trash_expiration) = config.trash_expiration {
+        return tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || {
+                let txn = db.begin_read()?;
+                let blobs = txn.read_blobs()?;
+                Ok(blobs
+                    .oldest_last_accessed(LruQueueId::Archived)?
+                    .map(|instant| instant.plus(trash_expiration)))
+            }
+        })
+        .await?;
+    }
+
+    Ok(None)
+}
+
+async fn cleanup_expired(
+    db: &Arc<ArenaDatabase>,
+    config: &DiskUsageConfig,
+) -> Result<(), StorageError> {
+    if let Some(trash_expiration) = config.trash_expiration {
+        tokio::task::spawn_blocking({
+            let db = db.clone();
+            move || {
+                let txn = db.begin_write()?;
+                {
+                    let mut tree = txn.write_tree()?;
+                    let mut blobs = txn.write_blobs()?;
+                    blobs.expire(&mut tree, trash_expiration, LruQueueId::Archived)?;
+                }
+                txn.commit()?;
+
+                Ok::<(), StorageError>(())
+            }
+        })
+        .await??;
+    }
+
+    Ok(())
 }
 
 async fn check_limits_async(
@@ -142,7 +203,7 @@ mod tests {
     use crate::arena::types::LruQueueId;
     use crate::utils::hash;
     use crate::{Blob, Mark, Version};
-    use assert_fs::prelude::PathCreateDir;
+    use assert_fs::prelude::{FileWriteStr, PathCreateDir};
     use assert_fs::{TempDir, fixture::PathChild};
     use realize_types::{Arena, Path};
     use std::sync::Arc;
@@ -161,7 +222,7 @@ mod tests {
     struct Fixture {
         db: Arc<ArenaDatabase>,
         blob_dir: assert_fs::fixture::ChildPath,
-        _tempdir: TempDir,
+        tempdir: TempDir,
     }
 
     impl Fixture {
@@ -177,7 +238,7 @@ mod tests {
             Ok(Self {
                 db,
                 blob_dir,
-                _tempdir: tempdir,
+                tempdir,
             })
         }
 
@@ -235,6 +296,13 @@ mod tests {
             let txn = self.begin_read()?;
             let blobs = txn.read_blobs()?;
             Ok(blobs.disk_usage()?)
+        }
+
+        fn archive_count(&self, path: &Path) -> anyhow::Result<usize> {
+            let txn = self.begin_read()?;
+            let tree = txn.read_tree()?;
+            let blobs = txn.read_blobs()?;
+            Ok(blobs.archives(&tree, path).count())
         }
     }
 
@@ -417,6 +485,7 @@ mod tests {
         let limits = DiskUsageConfig {
             max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Bytes(55 * GB)), // More than available free space
+            trash_expiration: None,
         };
 
         // there's enough free space for now
@@ -458,6 +527,7 @@ mod tests {
         let limits = DiskUsageConfig {
             max: Some(BytesOrPercent::Bytes(10 * MB)),
             leave: Some(BytesOrPercent::Percent(60)), // Leave 60% free (60GB out of 100GB)
+            trash_expiration: None,
         };
 
         // Should trigger cleanup because we need to leave 60GB free but only have 50GB
@@ -622,6 +692,66 @@ mod tests {
         assert_eq!(b"xxxxx", &buf);
         blob2.read_exact(&mut buf).await?;
         assert_eq!(b"yyyyy", &buf);
+
+        shutdown.cancel();
+        handle.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expire() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        fixture.configure(DiskUsageConfig {
+            trash_expiration: Some(Duration::from_millis(100)),
+            ..Default::default()
+        })?;
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let db = Arc::clone(&fixture.db);
+            let shutdown = shutdown.clone();
+            async move { run_loop(db, shutdown).await }
+        });
+
+        let path = Path::parse("test")?;
+        let txn = fixture.db.begin_write()?;
+        {
+            let mut tree = txn.write_tree()?;
+            let mut blobs = txn.write_blobs()?;
+
+            let testfile = fixture.tempdir.child("one");
+            testfile.write_str("one")?;
+            let (_, dest) = blobs.import_into_archive(
+                &mut tree,
+                &path,
+                &Version::Modified(None),
+                &testfile.metadata()?,
+            )?;
+            std::fs::rename(testfile.path(), dest)?;
+
+            let testfile = fixture.tempdir.child("two");
+            testfile.write_str("two")?;
+            let (_, dest) = blobs.import_into_archive(
+                &mut tree,
+                &path,
+                &Version::Modified(None),
+                &testfile.metadata()?,
+            )?;
+            std::fs::rename(testfile.path(), dest)?;
+        }
+        txn.commit()?;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // It might take a while for expiration to be actually
+        // executed on a busy machine. What really matters is that
+        // run_loop eventually deletes the blobs without anything else
+        // happening; it should be triggered by a time out.
+        let limit = Instant::now() + Duration::from_secs(3);
+        while fixture.archive_count(&path)? > 0 && Instant::now() < limit {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(0, fixture.archive_count(&path)?);
 
         shutdown.cancel();
         handle.await?;

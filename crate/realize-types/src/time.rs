@@ -84,6 +84,17 @@ impl UnixTime {
         UnixTime(self.0 + duration)
     }
 
+    /// Return how much time passed since `other`.
+    ///
+    /// Returns 0 if `other` >= `self`.
+    pub fn elapsed_since(self, other: UnixTime) -> Duration {
+        if other.0 <= self.0 {
+            self.0 - other.0
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// Format the timestamp for display as a ISO 8601 without
     /// timezone information.
     pub fn display(&self) -> String {

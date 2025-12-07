@@ -69,6 +69,13 @@ pub struct DiskUsageConfig {
     ///
     /// This is applied after the `max` value.
     pub leave: Option<BytesOrPercent>,
+
+    /// How long to keep data in the trash.
+    ///
+    /// Once data has been kept that long in the trash without being
+    /// accessed, it is deleted even if there's enough disk space
+    /// according to the other configuration options.
+    pub trash_expiration: Option<Duration>,
 }
 
 impl DiskUsageConfig {
@@ -80,12 +87,14 @@ impl DiskUsageConfig {
         Self {
             max: Some(BytesOrPercent::Bytes(v)),
             leave: None,
+            trash_expiration: None,
         }
     }
     pub fn max_percent(v: u32) -> DiskUsageConfig {
         Self {
             max: Some(BytesOrPercent::Percent(v)),
             leave: None,
+            trash_expiration: None,
         }
     }
 }
@@ -173,8 +182,13 @@ impl HumanDuration {
         HumanDuration(Duration::from_millis(millis))
     }
 
+    /// Convert into a [Duration]
+    pub fn into_duration(self) -> Duration {
+        self.0
+    }
+
     /// Parse a string that can be either a number (seconds) or a human-readable duration with units
-    fn from_str(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         // Parse human-readable duration with units
         let (number_str, unit) = if s.ends_with("ms") {
             (&s[..s.len() - 2], "ms")
@@ -193,8 +207,10 @@ impl HumanDuration {
 
         let duration = match unit {
             "ms" => Duration::from_millis(number as u64),
-            "s" => Duration::from_secs_f64(number),
-            "m" => Duration::from_secs_f64(number * 60.0),
+            "s" => Duration::try_from_secs_f64(number)
+                .map_err(|_| format!("Invalid number in duration: {}", s))?,
+            "m" => Duration::try_from_secs_f64(number * 60.0)
+                .map_err(|_| format!("Invalid number in duration: {}", s))?,
             _ => return Err(format!("Unknown unit: {}", unit)),
         };
 
@@ -259,7 +275,7 @@ impl<'de> serde::Deserialize<'de> for HumanDuration {
             where
                 E: serde::de::Error,
             {
-                HumanDuration::from_str(v).map_err(E::custom)
+                HumanDuration::parse(v).map_err(E::custom)
             }
         }
 
@@ -384,65 +400,65 @@ mod tests {
     fn test_duration_wrapper_from_str() {
         // Test milliseconds parsing
         assert_eq!(
-            HumanDuration::from_str("500ms").unwrap(),
+            HumanDuration::parse("500ms").unwrap(),
             HumanDuration::from_millis(500)
         );
         assert_eq!(
-            HumanDuration::from_str("1000ms").unwrap(),
+            HumanDuration::parse("1000ms").unwrap(),
             HumanDuration::from_millis(1000)
         );
         assert_eq!(
-            HumanDuration::from_str("0ms").unwrap(),
+            HumanDuration::parse("0ms").unwrap(),
             HumanDuration::from_millis(0)
         );
 
         // Test seconds parsing
         assert_eq!(
-            HumanDuration::from_str("5s").unwrap(),
+            HumanDuration::parse("5s").unwrap(),
             HumanDuration::from_secs(5)
         );
         assert_eq!(
-            HumanDuration::from_str("0s").unwrap(),
+            HumanDuration::parse("0s").unwrap(),
             HumanDuration::from_secs(0)
         );
         assert_eq!(
-            HumanDuration::from_str("1.5s").unwrap(),
+            HumanDuration::parse("1.5s").unwrap(),
             HumanDuration::from_secs_f64(1.5)
         );
 
         // Test minutes parsing
         assert_eq!(
-            HumanDuration::from_str("3m").unwrap(),
+            HumanDuration::parse("3m").unwrap(),
             HumanDuration::from_secs(180)
         );
         assert_eq!(
-            HumanDuration::from_str("0m").unwrap(),
+            HumanDuration::parse("0m").unwrap(),
             HumanDuration::from_secs(0)
         );
         assert_eq!(
-            HumanDuration::from_str("1.5m").unwrap(),
+            HumanDuration::parse("1.5m").unwrap(),
             HumanDuration::from_secs_f64(90.0)
         );
 
         // Test no unit specified (assumes seconds)
         assert_eq!(
-            HumanDuration::from_str("5").unwrap(),
+            HumanDuration::parse("5").unwrap(),
             HumanDuration::from_secs(5)
         );
         assert_eq!(
-            HumanDuration::from_str("0").unwrap(),
+            HumanDuration::parse("0").unwrap(),
             HumanDuration::from_secs(0)
         );
         assert_eq!(
-            HumanDuration::from_str("1.5").unwrap(),
+            HumanDuration::parse("1.5").unwrap(),
             HumanDuration::from_secs_f64(1.5)
         );
 
         // Test error cases
-        assert!(HumanDuration::from_str("invalid").is_err());
-        assert!(HumanDuration::from_str("1.5X").is_err()); // Unknown unit
-        assert!(HumanDuration::from_str("").is_err()); // Empty string
-        assert!(HumanDuration::from_str("5msinvalid").is_err()); // Invalid format
+        assert!(HumanDuration::parse("invalid").is_err());
+        assert!(HumanDuration::parse("1.5X").is_err()); // Unknown unit
+        assert!(HumanDuration::parse("").is_err()); // Empty string
+        assert!(HumanDuration::parse("5msinvalid").is_err()); // Invalid format
     }
 
     #[test]
