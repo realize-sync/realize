@@ -1,3 +1,4 @@
+#![allow(refining_impl_trait)] // for capnp-rpc
 use super::peer_capnp::connected_peer;
 use super::result_capnp;
 use super::store_capnp::read_callback::{ChunkParams, FinishParams, FinishResults};
@@ -659,7 +660,9 @@ async fn execute_read(
 
     let mut request = store.read_request();
     let mut builder = request.get();
-    builder.set_cb(capnp_rpc::new_client(ReadCallbackServer { tx: Some(tx) }));
+    builder.set_cb(capnp_rpc::new_client(ReadCallbackServer {
+        tx: RefCell::new(Some(tx)),
+    }));
     let mut req = builder.init_req();
     req.set_arena(arena.as_str());
     req.set_path(path.as_str());
@@ -708,12 +711,12 @@ async fn execute_rsync(
 }
 
 struct ReadCallbackServer {
-    tx: Option<mpsc::Sender<Result<(u64, Vec<u8>), HouseholdOperationError>>>,
+    tx: RefCell<Option<mpsc::Sender<Result<(u64, Vec<u8>), HouseholdOperationError>>>>,
 }
 
 impl read_callback::Server for ReadCallbackServer {
-    fn chunk(&mut self, params: ChunkParams) -> Promise<(), capnp::Error> {
-        let tx = pry!(self.tx.as_ref().ok_or_else(already_finished)).clone();
+    fn chunk(self: Rc<Self>, params: ChunkParams) -> Promise<(), capnp::Error> {
+        let tx = pry!(self.tx.borrow().as_ref().ok_or_else(already_finished)).clone();
         Promise::from_future(async move {
             let params = params.get()?;
             let offset = params.get_offset();
@@ -724,8 +727,8 @@ impl read_callback::Server for ReadCallbackServer {
         })
     }
 
-    fn finish(&mut self, params: FinishParams, _: FinishResults) -> Promise<(), capnp::Error> {
-        let tx = pry!(self.tx.take().ok_or_else(already_finished));
+    fn finish(self: Rc<Self>, params: FinishParams, _: FinishResults) -> Promise<(), capnp::Error> {
+        let tx = pry!(self.tx.borrow_mut().take().ok_or_else(already_finished));
         Promise::from_future(async move {
             let result = params.get()?.get_result()?;
             match result.which()? {
@@ -812,7 +815,7 @@ impl ConnectedPeerServer {
 
 impl connected_peer::Server for ConnectedPeerServer {
     fn store(
-        &mut self,
+        self: Rc<Self>,
         _: connected_peer::StoreParams,
         mut results: connected_peer::StoreResults,
     ) -> Promise<(), capnp::Error> {
@@ -829,7 +832,7 @@ impl connected_peer::Server for ConnectedPeerServer {
     }
 
     fn register(
-        &mut self,
+        self: Rc<Self>,
         params: connected_peer::RegisterParams,
         _: connected_peer::RegisterResults,
     ) -> Promise<(), capnp::Error> {
@@ -975,7 +978,7 @@ fn read_errno(err: StorageError) -> io_error::Errno {
 
 impl store::Server for StoreServer {
     fn with_rate_limit(
-        &mut self,
+        self: Rc<Self>,
         params: WithRateLimitParams,
         mut results: WithRateLimitResults,
     ) -> Promise<(), capnp::Error> {
@@ -997,7 +1000,11 @@ impl store::Server for StoreServer {
         Promise::ok(())
     }
 
-    fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
+    fn arenas(
+        self: Rc<Self>,
+        _: ArenasParams,
+        mut results: ArenasResults,
+    ) -> Promise<(), capnp::Error> {
         let arenas = self.storage.arenas();
         let mut list = results.get().init_arenas(arenas.len() as u32);
         for (i, arena) in arenas.into_iter().enumerate() {
@@ -1008,7 +1015,7 @@ impl store::Server for StoreServer {
     }
 
     fn subscriptions(
-        &mut self,
+        self: Rc<Self>,
         params: SubscriptionsParams,
         results: SubscriptionsResults,
     ) -> Promise<(), capnp::Error> {
@@ -1020,12 +1027,16 @@ impl store::Server for StoreServer {
         })
     }
 
-    fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
+    fn read(self: Rc<Self>, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
         let this = self.clone();
         Promise::from_future(async move { this.do_read(params).await })
     }
 
-    fn rsync(&mut self, params: RsyncParams, results: RsyncResults) -> Promise<(), capnp::Error> {
+    fn rsync(
+        self: Rc<Self>,
+        params: RsyncParams,
+        results: RsyncResults,
+    ) -> Promise<(), capnp::Error> {
         let this = self.clone();
         Promise::from_future(async move { this.do_rsync(params, results).await })
     }

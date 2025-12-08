@@ -129,6 +129,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(refining_impl_trait)] // for capnp-rpc
 mod tests {
     use super::*;
     use crate::testing::hello_capnp::hello;
@@ -137,13 +138,14 @@ mod tests {
     use assert_fs::TempDir;
     use capnp::capability::Promise;
     use capnp_rpc::pry;
+    use std::rc::Rc;
     use tokio::task::LocalSet;
 
     struct HelloServer;
 
     impl hello::Server for HelloServer {
         fn hello(
-            &mut self,
+            self: Rc<Self>,
             params: HelloParams,
             mut results: HelloResults,
         ) -> Promise<(), capnp::Error> {

@@ -1,4 +1,5 @@
 #![allow(dead_code)] // work in progress
+#![allow(refining_impl_trait)] // for capnp-rpc
 
 use super::control_capnp;
 use super::control_capnp::churten::{
@@ -50,7 +51,7 @@ impl<H: JobHandler + 'static> ControlServer<H> {
 
 impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     fn churten(
-        &mut self,
+        self: Rc<Self>,
         _: ChurtenParams,
         mut results: ChurtenResults,
     ) -> Promise<(), capnp::Error> {
@@ -64,7 +65,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn list_peers(
-        &mut self,
+        self: Rc<Self>,
         _: ListPeersParams,
         mut results: ListPeersResults,
     ) -> Promise<(), capnp::Error> {
@@ -88,7 +89,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn keep_connected(
-        &mut self,
+        self: Rc<Self>,
         params: KeepConnectedParams,
         _: KeepConnectedResults,
     ) -> Promise<(), capnp::Error> {
@@ -106,7 +107,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn disconnect(
-        &mut self,
+        self: Rc<Self>,
         params: DisconnectParams,
         _: DisconnectResults,
     ) -> Promise<(), capnp::Error> {
@@ -124,7 +125,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn create_arena(
-        &mut self,
+        self: Rc<Self>,
         params: CreateArenaParams,
         mut results: CreateArenaResults,
     ) -> Promise<(), capnp::Error> {
@@ -157,7 +158,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn remove_arena(
-        &mut self,
+        self: Rc<Self>,
         params: RemoveArenaParams,
         mut results: RemoveArenaResults,
     ) -> Promise<(), capnp::Error> {
@@ -182,7 +183,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn list_attr(
-        &mut self,
+        self: Rc<Self>,
         params: ListAttrParams,
         mut results: ListAttrResults,
     ) -> Promise<(), capnp::Error> {
@@ -211,7 +212,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn get_attr(
-        &mut self,
+        self: Rc<Self>,
         params: GetAttrParams,
         mut results: GetAttrResults,
     ) -> Promise<(), capnp::Error> {
@@ -232,7 +233,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn set_attr(
-        &mut self,
+        self: Rc<Self>,
         params: SetAttrParams,
         mut results: SetAttrResults,
     ) -> Promise<(), capnp::Error> {
@@ -261,7 +262,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn empty_trash(
-        &mut self,
+        self: Rc<Self>,
         params: control::EmptyTrashParams,
         _: control::EmptyTrashResults,
     ) -> Promise<(), capnp::Error> {
@@ -281,7 +282,7 @@ impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
     }
 
     fn empty_cache(
-        &mut self,
+        self: Rc<Self>,
         params: control::EmptyCacheParams,
         _: control::EmptyCacheResults,
     ) -> Promise<(), capnp::Error> {
@@ -347,7 +348,7 @@ struct ChurtenServer<H: JobHandler + 'static> {
 
 impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
     fn subscribe(
-        &mut self,
+        self: Rc<Self>,
         params: SubscribeParams,
         _: SubscribeResults,
     ) -> Promise<(), capnp::Error> {
@@ -400,20 +401,24 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         })
     }
 
-    fn start(&mut self, _: StartParams, _: StartResults) -> Promise<(), capnp::Error> {
+    fn start(self: Rc<Self>, _: StartParams, _: StartResults) -> Promise<(), capnp::Error> {
         self.churten.borrow_mut().start();
 
         Promise::ok(())
     }
 
-    fn shutdown(&mut self, _: ShutdownParams, _: ShutdownResults) -> Promise<(), capnp::Error> {
+    fn shutdown(
+        self: Rc<Self>,
+        _: ShutdownParams,
+        _: ShutdownResults,
+    ) -> Promise<(), capnp::Error> {
         self.churten.borrow_mut().shutdown();
 
         Promise::ok(())
     }
 
     fn is_running(
-        &mut self,
+        self: Rc<Self>,
         _: IsRunningParams,
         mut results: IsRunningResults,
     ) -> Promise<(), capnp::Error> {
@@ -425,7 +430,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
     }
 
     fn recent_jobs(
-        &mut self,
+        self: Rc<Self>,
         _: RecentJobsParams,
         mut results: RecentJobsResults,
     ) -> Promise<(), capnp::Error> {

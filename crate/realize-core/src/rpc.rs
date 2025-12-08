@@ -5,6 +5,7 @@ mod household;
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod peer_capnp {
     include!(concat!(env!("OUT_DIR"), "/rpc/peer_capnp.rs"));
 }
@@ -13,6 +14,7 @@ mod peer_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 pub mod result_capnp {
     include!(concat!(env!("OUT_DIR"), "/rpc/result_capnp.rs"));
 }
@@ -21,6 +23,7 @@ pub mod result_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod store_capnp {
     include!(concat!(env!("OUT_DIR"), "/rpc/store_capnp.rs"));
 }

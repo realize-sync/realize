@@ -12,7 +12,7 @@ use std::rc::Rc;
 pub(crate) struct FakeConnectedPeer(pub(crate) Rc<RefCell<Vec<String>>>);
 impl connected_peer::Server for FakeConnectedPeer {
     fn store(
-        &mut self,
+        self: Rc<Self>,
         _: connected_peer::StoreParams,
         mut results: connected_peer::StoreResults,
     ) -> Promise<(), capnp::Error> {
@@ -30,7 +30,7 @@ impl connected_peer::Server for FakeConnectedPeer {
 struct FakeStore(Rc<RefCell<Vec<String>>>, Option<f64>);
 impl store::Server for FakeStore {
     fn with_rate_limit(
-        &mut self,
+        self: Rc<Self>,
         params: WithRateLimitParams,
         mut results: WithRateLimitResults,
     ) -> Promise<(), capnp::Error> {
@@ -47,7 +47,7 @@ impl store::Server for FakeStore {
         Promise::ok(())
     }
 
-    fn arenas(&mut self, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
+    fn arenas(self: Rc<Self>, _: ArenasParams, mut results: ArenasResults) -> Promise<(), capnp::Error> {
         let mut list = results.get().init_arenas(1);
         list.set(0, HouseholdFixture::test_arena().as_str());
 
@@ -55,7 +55,7 @@ impl store::Server for FakeStore {
     }
 
     fn subscriptions(
-        &mut self,
+        self: Rc<Self>,
         _: SubscriptionsParams,
         _: SubscriptionsResults,
     ) -> Promise<(), capnp::Error> {
@@ -66,7 +66,7 @@ impl store::Server for FakeStore {
         Promise::ok(())
     }
 
-    fn read(&mut self, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
+    fn read(self: Rc<Self>, params: ReadParams, _: ReadResults) -> Promise<(), capnp::Error> {
         self.0
             .borrow_mut()
             .push(format!("Store.read() rate_limit={:?}", self.1));
@@ -79,7 +79,7 @@ impl store::Server for FakeStore {
         Promise::ok(())
     }
 
-    fn rsync(&mut self, _: RsyncParams, _: RsyncResults) -> Promise<(), capnp::Error> {
+    fn rsync(self: Rc<Self>, _: RsyncParams, _: RsyncResults) -> Promise<(), capnp::Error> {
         self.0
             .borrow_mut()
             .push(format!("Store.rsync() rate_limit={:?}", self.1));

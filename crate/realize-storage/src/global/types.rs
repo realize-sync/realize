@@ -13,6 +13,7 @@ use std::path::PathBuf;
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod cache_capnp {
     include!(concat!(env!("OUT_DIR"), "/global/cache_capnp.rs"));
 }

@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use std::rc::Rc;
 
 /// Subscribe to notifications from the given client and use it to
 /// update the cache.
@@ -113,7 +114,7 @@ impl SubscriberServer {
 
 impl subscriber::Server for SubscriberServer {
     fn notify(
-        &mut self,
+        self: Rc<Self>,
         params: NotifyParams,
         _: NotifyResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
@@ -250,7 +251,7 @@ impl Subscriptions {
 
 impl subscriptions::Server for Subscriptions {
     fn subscribe(
-        &mut self,
+        self: Rc<Self>,
         params: SubscribeParams,
         _: SubscribeResults,
     ) -> capnp::capability::Promise<(), capnp::Error> {
@@ -386,7 +387,7 @@ mod tests {
         }
         impl store_capnp::store::Server for FakeStore {
             fn subscriptions(
-                &mut self,
+                self: std::rc::Rc<Self>,
                 params: SubscriptionsParams,
                 results: SubscriptionsResults,
             ) -> Promise<(), capnp::Error> {

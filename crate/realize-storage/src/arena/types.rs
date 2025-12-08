@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod history_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/history_capnp.rs"));
 }
@@ -22,6 +23,7 @@ mod history_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod blob_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/blob_capnp.rs"));
 }
@@ -29,6 +31,7 @@ mod blob_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod cache_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/cache_capnp.rs"));
 }
@@ -36,6 +39,7 @@ mod cache_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod mark_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/mark_capnp.rs"));
 }
@@ -43,6 +47,7 @@ mod mark_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod engine_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/engine_capnp.rs"));
 }
@@ -50,6 +55,7 @@ mod engine_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod settings_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/settings_capnp.rs"));
 }
@@ -57,6 +63,7 @@ mod settings_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod time_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/time_capnp.rs"));
 }
@@ -64,6 +71,7 @@ mod time_capnp {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 mod version_capnp {
     include!(concat!(env!("OUT_DIR"), "/arena/version_capnp.rs"));
 }

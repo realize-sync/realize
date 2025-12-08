@@ -1,6 +1,8 @@
+#![allow(refining_impl_trait)]
 use crate::consensus::{tracker::JobInfo, types::ChurtenNotification};
 use capnp::capability::Promise;
 use realize_network::unixsocket;
+use std::rc::Rc;
 use tokio::sync::mpsc;
 
 use super::{
@@ -81,7 +83,7 @@ impl TxChurtenSubscriber {
 }
 
 impl control_capnp::churten::subscriber::Server for TxChurtenSubscriber {
-    fn reset(&mut self, params: ResetParams) -> Promise<(), capnp::Error> {
+    fn reset(self: Rc<Self>, params: ResetParams) -> Promise<(), capnp::Error> {
         let tx = self.tx.clone();
         Promise::from_future(async move {
             let job_list = params.get().and_then(|p| p.get_jobs())?;
@@ -97,7 +99,7 @@ impl control_capnp::churten::subscriber::Server for TxChurtenSubscriber {
         })
     }
 
-    fn notify(&mut self, params: NotifyParams) -> Promise<(), capnp::Error> {
+    fn notify(self: Rc<Self>, params: NotifyParams) -> Promise<(), capnp::Error> {
         let tx = self.tx.clone();
         Promise::from_future(async move {
             let reader = params.get().and_then(|p| p.get_notification())?;

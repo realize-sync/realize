@@ -397,6 +397,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(refining_impl_trait)] // for capnp-rpc
 mod tests {
     use super::*;
     use crate::hostport::HostPort;
@@ -535,7 +536,7 @@ mod tests {
 
     impl hello::Server for HelloServer {
         fn hello(
-            &mut self,
+            self: std::rc::Rc<Self>,
             params: HelloParams,
             mut results: HelloResults,
         ) -> Promise<(), capnp::Error> {

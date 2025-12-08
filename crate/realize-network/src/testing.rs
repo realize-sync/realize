@@ -233,6 +233,7 @@ impl TestingPeers {
 #[allow(unknown_lints)]
 #[allow(clippy::uninlined_format_args)]
 #[allow(clippy::extra_unused_type_parameters)]
+#[allow(refining_impl_trait)]
 pub mod hello_capnp {
     include!(concat!(env!("OUT_DIR"), "/testing/hello_capnp.rs"));
 }
