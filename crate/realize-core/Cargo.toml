@@ -46,7 +46,7 @@ serial_test = "3.2.0"
 tempfile = "3.21"
 test-tag = "0.1"
 tokio = { version = "1", features = ["process"] }
-toml = { version = "0.8.23", features = ["display", "parse"] }
+toml = { version = "0.9.8", features = ["display", "parse"] }
 rand = "0.9.2"
 xattr = "1.6.1"
 

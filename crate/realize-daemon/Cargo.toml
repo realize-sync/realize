@@ -20,7 +20,7 @@ log = "0.4"
 signal-hook-tokio = { version = "0.3.1", features = ["futures-v0_3"] }
 signal-hook = "0.3.18"
 futures-util = "0.3.31"
-toml = {version="0.8.23", features = ["parse"]}
+toml = {version="0.9.8", features = ["parse"]}
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -32,6 +32,6 @@ test-tag = "0.1"
 assert_unordered = "0.3"
 tokio = { version = "1", features = ["process"] }
 nix = { version = "0.30.1", features = ["signal"] }
-toml = {version="0.8.23", features = ["display"]}
+toml = {version="0.9.8", features = ["display"]}
 tokio-retry = "0.3.0"
 scopeguard = "1.2.0"
