@@ -21,12 +21,6 @@ default remote version if there are more than one.
 
 Use this mark to replace exclude.
 
-## generic set/get realize-control command
-
-Allow setting and getting attributes (xattr) through the
-realize-control command instead of creating custom commands for things
-like setting and getting marks.
-
 ## configure "auth" logs {#logauth}
 
 setup configuration so that connection attempts and auth error/accept
