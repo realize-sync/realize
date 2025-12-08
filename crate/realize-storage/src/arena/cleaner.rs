@@ -85,15 +85,15 @@ async fn next_expiration(
                     None
                 };
 
-                Ok(std::cmp::min(
-                    next_cache_expiration,
-                    next_archive_expiration,
-                ))
+                Ok(match (next_cache_expiration, next_archive_expiration) {
+                    (None, e) => e,
+                    (e, None) => e,
+                    (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+                })
             }
         })
         .await?;
     }
-
     Ok(None)
 }
 
