@@ -558,10 +558,11 @@ mod tests {
 
         assert_unordered::assert_eq_unordered!(
             vec![
-                "realize.quota.max",
+                "realize.disk_usage",
+                "realize.expiration",
                 "realize.quota.leave",
+                "realize.quota.max",
                 "realize.trash.expiration",
-                "realize.disk_usage"
             ],
             super::list(&fixture.db, Path::root())?
         );
