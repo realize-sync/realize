@@ -932,7 +932,6 @@ impl<'a> WritableOpenBlob<'a> {
     ) -> Result<(), StorageError> {
         let (archived_removed, remaining) =
             self.cleanup_queue(tree, target_bytes, LruQueueId::Archived)?;
-        log::debug!("==== target {target_bytes} remaining {remaining}");
         let (cached_removed, _) = self.cleanup_queue(
             tree,
             target_bytes.saturating_sub(remaining),

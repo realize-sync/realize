@@ -215,11 +215,8 @@ pub(crate) fn set(
                     .into_iter()
                     .filter_map(|alt| {
                         if let FileAlternative::Remote(peer, hash, _, _) = alt
-                            && {
-                                log::debug!("=== ook peer:'{peer}' rest:'{rest}");
-
-                                peer.as_str() == rest || rest.starts_with(&format!("{peer} {hash}"))
-                            }
+                            && (peer.as_str() == rest
+                                || rest.starts_with(&format!("{peer} {hash}")))
                         {
                             Some((peer, hash))
                         } else {

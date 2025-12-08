@@ -888,8 +888,6 @@ fn remove_arena_from_database(
         }
     }
 
-    log::debug!("=== REMOVED {arena}");
-
     Ok(())
 }
 

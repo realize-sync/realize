@@ -29,20 +29,22 @@ pub(crate) async fn run_loop(db: Arc<ArenaDatabase>, shutdown: CancellationToken
             }
         }
         tokio::select!(
-        _ = shutdown.cancelled() => { return; }
+            _ = shutdown.cancelled() => {
+                return;
+            }
             ret = settings_rx.changed() => {
                 match ret {
                     Err(_) => return,
                     Ok(_) => continue,
                 }
             },
-        ret = disk_usage_rx.changed() => {
-            match ret {
-                Err(_) => return,
-                Ok(_) => continue,
+            ret = disk_usage_rx.changed() => {
+                match ret {
+                    Err(_) => return,
+                    Ok(_) => continue,
+                }
             }
-        }
-        _ = sleep_until(next_expiration) => {
+            _ = sleep_until(next_expiration) => {
             if let Err(err) = cleanup_expired(&db, &config).await {
                 log::warn!("[{}] Expiration cleanup failed: {err:?}", db.tag())
             }
