@@ -2511,7 +2511,7 @@ mod tests {
                 )
                 .display();
                 assert_eq!(
-                    format!("b jTvZv9AF9BeWmbkhInMoTG3oUa6RDu4v0bsNlu3mWj0 12 {ts}\n"),
+                    format!("remote:b jTvZv9AF9BeWmbkhInMoTG3oUa6RDu4v0bsNlu3mWj0 12 {ts}\n"),
                     getxattr(&file_realpath, "realize.versions")
                         .await
                         .unwrap()
@@ -2562,7 +2562,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    Some("remote 0%".to_string()),
+                    Some("0%".to_string()),
                     getxattr(&file_realpath, "realize.status").await.unwrap()
                 );
 
@@ -2579,7 +2579,7 @@ mod tests {
                 .await??;
 
                 assert_eq!(
-                    Some("remote 75%".to_string()),
+                    Some("75%".to_string()),
                     getxattr(&file_realpath, "realize.status").await.unwrap()
                 );
 
@@ -2587,7 +2587,7 @@ mod tests {
                 tokio::fs::read(&file_realpath).await?;
 
                 assert_eq!(
-                    Some("remote 100%".to_string()),
+                    Some("100%".to_string()),
                     getxattr(&file_realpath, "realize.status").await.unwrap()
                 );
 
@@ -2603,7 +2603,7 @@ mod tests {
                 assert!(verified);
 
                 assert_eq!(
-                    Some("remote 100% verified".to_string()),
+                    Some("100% verified".to_string()),
                     getxattr(&file_realpath, "realize.status").await.unwrap()
                 );
 
@@ -2624,7 +2624,7 @@ mod tests {
                 .await??;
 
                 assert_eq!(
-                    Some("local 100%".to_string()),
+                    Some("local".to_string()),
                     getxattr(&local_realpath, "realize.status").await.unwrap()
                 );
 
@@ -2702,7 +2702,7 @@ mod tests {
 
                     // Verify file is initially remote
                     let initial_status = get_file_status(&file_path).await?;
-                    assert_status_contains(&initial_status, "remote");
+                    assert_status_contains(&initial_status, "%");
 
                     // Open with O_TRUNC | O_RDWR - should realize and truncate immediately
                     let flags = libc::O_TRUNC | libc::O_RDWR;
@@ -2767,7 +2767,7 @@ mod tests {
 
                     // Verify file is initially remote
                     let initial_status = get_file_status(&file_path).await?;
-                    assert_status_contains(&initial_status, "remote");
+                    assert_status_contains(&initial_status, "%");
 
                     // Open with O_APPEND | O_WRONLY - should realize before writing
                     let flags = libc::O_APPEND | libc::O_WRONLY;
@@ -2837,7 +2837,7 @@ mod tests {
 
                     // Verify file is initially remote
                     let initial_status = get_file_status(&file_path).await?;
-                    assert_status_contains(&initial_status, "remote");
+                    assert_status_contains(&initial_status, "%");
 
                     // Open with O_TRUNC | O_APPEND | O_RDWR - should realize, truncate, then append
                     let flags = libc::O_TRUNC | libc::O_APPEND | libc::O_RDWR;
@@ -2907,7 +2907,7 @@ mod tests {
 
                     // Verify file is initially remote
                     let initial_status = get_file_status(&file_path).await?;
-                    assert_status_contains(&initial_status, "remote");
+                    assert_status_contains(&initial_status, "%");
 
                     // Open with O_RDWR (no O_TRUNC or O_APPEND) - should enable COW
                     let flags = libc::O_RDWR;
@@ -2928,7 +2928,7 @@ mod tests {
 
                     // After read-only access, file should still be remote
                     let status_after_read = get_file_status(&file_path).await?;
-                    assert_status_contains(&status_after_read, "remote");
+                    assert_status_contains(&status_after_read, "%");
 
                     // Now write to the file - this should trigger COW
                     tokio::task::spawn_blocking({
@@ -3015,7 +3015,7 @@ mod tests {
                 assert_eq!(remote_hash.to_string(), initial_version);
 
                 let initial_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
-                assert!(initial_status.contains("remote"));
+                assert!(initial_status.contains("%"));
 
                 // Create a local version by writing to the file
                 let local_content = "local version from peer a";
@@ -3034,7 +3034,7 @@ mod tests {
                 let versions_list = getxattr(&file_realpath, "realize.versions").await?.unwrap();
                 assert_eq!(
                     format!(
-                        "local {local_hash}\nb {remote_hash} 26 {}\n",
+                        "local {local_hash}\nremote:b {remote_hash} 26 {}\n",
                         remote_mtime.display()
                     ),
                     versions_list
@@ -3049,7 +3049,7 @@ mod tests {
 
                 // Verify the status changed back to remote
                 let new_status = getxattr(&file_realpath, "realize.status").await?.unwrap();
-                assert!(new_status.contains("remote"));
+                assert!(new_status.contains("%"));
 
                 // Test error cases
                 // 1. Invalid hash format should return EINVAL
