@@ -18,7 +18,7 @@ use crate::types::{PartialInode, PathId};
 use crate::utils::fs_utils;
 use crate::utils::holder::Holder;
 use realize_types::{Arena, Path, PathSet};
-use redb::TableDefinition;
+use redb::{ReadableDatabase, TableDefinition};
 use std::cell::RefCell;
 use std::os::unix::fs::MetadataExt;
 use std::panic::Location;

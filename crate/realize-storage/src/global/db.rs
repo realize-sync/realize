@@ -2,7 +2,7 @@ use crate::global::types::{ArenaTableEntry, PathTableEntry};
 use crate::types::PathId;
 use crate::utils::holder::Holder;
 use crate::{Inode, StorageError};
-use redb::{ReadOnlyTable, Table, TableDefinition};
+use redb::{ReadOnlyTable, ReadableDatabase, Table, TableDefinition};
 use std::sync::Arc;
 
 /// Track current pathid range for each arena.
