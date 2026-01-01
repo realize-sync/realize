@@ -21,6 +21,7 @@ use std::io::{self, SeekFrom};
 use std::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncSeekExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -650,6 +651,30 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
         Ok(())
     }
 
+    async fn keep_alive(&self, peer: Peer, client: connected_peer::Client) -> anyhow::Result<()> {
+        log::trace!("@{peer} Keepalive");
+        loop {
+            tokio::time::sleep(Duration::from_secs(6 * 60)).await;
+            match tokio::time::timeout(
+                Duration::from_secs(5 * 60),
+                client.ping_request().send().promise,
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    log::trace!("@{peer} Ping OK");
+                }
+                Ok(Err(err)) => {
+                    anyhow::bail!("@{peer} Ping failed: {err}");
+                }
+                Err(_) => {
+                    log::trace!("@{peer} Ping timed out");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     fn unregister(&self, peer: Peer) {
         self.clients.unregister(peer, Side::Server);
     }
@@ -831,6 +856,14 @@ impl ConnectedPeerServer {
 }
 
 impl connected_peer::Server for ConnectedPeerServer {
+    fn ping(
+        self: Rc<Self>,
+        _: connected_peer::PingParams,
+        _: connected_peer::PingResults,
+    ) -> Promise<(), capnp::Error> {
+        Promise::ok(())
+    }
+
     fn store(
         self: Rc<Self>,
         _: connected_peer::StoreParams,

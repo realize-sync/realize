@@ -9,4 +9,6 @@ interface ConnectedPeer {
   store @0 () -> (store: Store); # Return a handle on the store.
 
   register @1 (store: Store) -> (); # Register another peer's store
+
+  ping @2 () -> ();
 }
