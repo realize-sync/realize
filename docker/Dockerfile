@@ -13,8 +13,11 @@ COPY ./Cargo.lock Cargo.lock
 COPY ./Cargo.toml Cargo.toml
 COPY ./crate crate
 
-# --- 1.2 build application
+# --- 1.2 build daemon
 RUN cargo build -p realize-daemon --release
+
+# --- 1.3 build control executable
+RUN cargo build -p realize-control --release
 
 # --- 2. Runtime stage
 FROM alpine:3.21 AS runtime
@@ -41,8 +44,9 @@ RUN chmod +x /entrypoint.sh
 # --- 2.3 environment
 WORKDIR /app
 
-# --- 2.4 binary
+# --- 2.4 binaries
 COPY --from=builder /usr/src/app/target/release/realized /usr/local/bin/realized
+COPY --from=builder /usr/src/app/target/release/realize /usr/local/bin/realize
 
 # --- 2.5 run
 EXPOSE 9771
