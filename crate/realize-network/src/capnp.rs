@@ -61,11 +61,15 @@ where
 #[allow(async_fn_in_trait, unused_variables)]
 pub trait ConnectionTracker<C> {
     fn server(&self, peer: Peer) -> capnp::capability::Client;
-    async fn register(&self, peer: Peer, client: C) -> anyhow::Result<()> {
+    async fn register(&self, peer: Peer, client: &mut C) -> anyhow::Result<()> {
         Ok(())
     }
     fn unregister(&self, peer: Peer) {}
     fn client_disconnected(&self, peer: Peer) {}
+    async fn keep_alive(&self, peer: Peer, client: C) -> anyhow::Result<()> {
+        drop(client);
+        Ok(std::future::pending().await)
+    }
 }
 
 pub struct ConnectionManager {
@@ -377,7 +381,7 @@ where
             ));
             let until_shutdown = net.drive_until_shutdown();
             let mut system = RpcSystem::new(net, None);
-            let client: C = system.bootstrap(Side::Server);
+            let mut client: C = system.bootstrap(Side::Server);
             let disconnector = system.get_disconnector();
             scopeguard::defer!({
                 tokio::task::spawn_local(disconnector);
@@ -387,7 +391,7 @@ where
             scopeguard::defer!({
                 self.tracker.unregister(peer);
             });
-            if let Err(err) = self.tracker.register(peer, client).await {
+            if let Err(err) = self.tracker.register(peer, &mut client).await {
                 log::debug!("@{peer} Registration failed: {err}");
                 continue;
             }
@@ -399,6 +403,16 @@ where
                 _ = cancel.cancelled() => {
                     return;
                 }
+                res = self.tracker.keep_alive(peer, client) => {
+                    match res {
+                        Err(err) => {
+                            log::debug!("@{peer} Keepalive failed; Will reconnect: {err}");
+                        }
+                        Ok(_) => {
+                            log::debug!("@{peer} Keepalive disconnected; Will reconnect");
+                        }
+                    }
+                },
                 res = until_shutdown => if let Err(err) = res {
                     log::debug!("@{peer} Connection shutdown; Will reconnect: {err}")
                 },
@@ -514,7 +528,7 @@ mod tests {
             c.client
         }
 
-        async fn register(&self, peer: Peer, client: hello::Client) -> anyhow::Result<()> {
+        async fn register(&self, peer: Peer, client: &mut hello::Client) -> anyhow::Result<()> {
             let mut request = client.hello_request();
             request.get().set_name(self.peer.as_str());
 

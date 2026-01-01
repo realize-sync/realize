@@ -60,7 +60,7 @@ mod tests {
                 tracker
                     .register(
                         b,
-                        capnp_rpc::new_client(testing::FakeConnectedPeer(calls.clone())),
+                        &mut capnp_rpc::new_client(testing::FakeConnectedPeer(calls.clone())),
                     )
                     .await?;
 
