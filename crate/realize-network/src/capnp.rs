@@ -351,6 +351,10 @@ where
                 _ = cancel.cancelled() => {
                     return;
                 }
+                _ = tokio::time::sleep(Duration::from_secs(5 * 60)) => {
+                    log::debug!("@{peer} Timed out trying to connect");
+                    continue;
+                }
                 connected = self.networking.connect_raw(peer, self.tag) =>  match connected {
                     Ok(stream) => {
                         log::debug!("@{peer} Connected");
