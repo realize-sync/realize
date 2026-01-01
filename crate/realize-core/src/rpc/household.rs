@@ -427,18 +427,12 @@ impl PeerConnectionTracker {
                 limit,
             } => {
                 let tx_clone = tx.clone();
-                if let Err(err) = execute_read(
-                    self.clients.find_store(&peers, mode),
-                    arena,
-                    path,
-                    offset,
-                    limit,
-                    tx,
-                )
-                .await
-                {
-                    let _ = tx_clone.send(Err(err)).await;
-                }
+                let client = self.clients.find_store(&peers, mode);
+                tokio::task::spawn_local(async move {
+                    if let Err(err) = execute_read(client, arena, path, offset, limit, tx).await {
+                        let _ = tx_clone.send(Err(err)).await;
+                    }
+                });
             }
             HouseholdOperation::Rsync {
                 peers,
@@ -449,15 +443,11 @@ impl PeerConnectionTracker {
                 range,
                 sig,
             } => {
-                let res = execute_rsync(
-                    self.clients.find_store(&peers, mode),
-                    arena,
-                    &path,
-                    &range,
-                    sig,
-                )
-                .await;
-                let _ = tx.send(res);
+                let client = self.clients.find_store(&peers, mode);
+                tokio::task::spawn_local(async move {
+                    let res = execute_rsync(client, arena, &path, &range, sig).await;
+                    let _ = tx.send(res);
+                });
             }
             HouseholdOperation::QueryConnectedPeers { tx } => {
                 let _ = tx.send(self.clients.connected_peers());
