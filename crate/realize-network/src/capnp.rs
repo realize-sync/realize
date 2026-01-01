@@ -21,6 +21,7 @@ use realize_types::Peer;
 use crate::{Networking, Server};
 
 /// Messages used to communicate with capnp on the main thread.
+#[derive(Debug)]
 enum ConnectionMessage {
     /// Send incoming (server) TCP connections to the capnp threads to
     /// be handled there.
@@ -95,7 +96,11 @@ impl ConnectionManager {
             async move {
                 let tracker = handler.create_tracker().await;
                 let ctx = AppContext::new(networking, tag, tracker);
+                log::trace!("Connection manager running");
+                let mut msgcount = 0;
                 while let Some(conn) = rx.recv().await {
+                    log::trace!("Connection manager handling #{msgcount}: {conn:?}");
+                    msgcount += 1;
                     match conn {
                         ConnectionMessage::Incoming {
                             peer,
@@ -114,7 +119,9 @@ impl ConnectionManager {
                             ctx.peers_to_keep_connected(tx)
                         }
                     }
+                    log::trace!("Connection manager done handling #{msgcount}");
                 }
+                log::trace!("Connection manager ended");
             }
         });
 

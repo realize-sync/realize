@@ -217,14 +217,11 @@ impl Household {
     /// May return empty if no peer is connected and we're not trying
     /// to connect to any peers.
     pub async fn query_peers(&self) -> anyhow::Result<HashMap<Peer, ConnectionInfo>> {
-        let (tx, rx) = oneshot::channel();
-        self.operation_tx
-            .send(HouseholdOperation::QueryConnectedPeers { tx })
-            .await?;
-        let (connected, keep_connected) = tokio::join!(rx, self.manager.peers_to_keep_connected());
-        let connected = connected?;
-        let keep_connected = keep_connected?;
-
+        log::trace!("Query connected peers");
+        let connected = self.connected_peers().await?;
+        log::trace!("Connected peers: {connected:?}");
+        let keep_connected = self.manager.peers_to_keep_connected().await?;
+        log::trace!("Peers to keep connected: {keep_connected:?}");
         let mut connection_info: HashMap<Peer, ConnectionInfo> = HashMap::new();
         for peer in &self.known_peers {
             let info = connection_info.entry(*peer).or_default();
@@ -235,6 +232,15 @@ impl Household {
         }
 
         Ok(connection_info)
+    }
+
+    /// Return the set of connected peers.
+    async fn connected_peers(&self) -> Result<HashSet<Peer>, anyhow::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.operation_tx
+            .send(HouseholdOperation::QueryConnectedPeers { tx })
+            .await?;
+        Ok(rx.await?)
     }
 }
 
@@ -304,6 +310,7 @@ impl HouseholdOperationError {
     }
 }
 
+#[derive(Debug)]
 enum HouseholdOperation {
     Read {
         peers: Vec<Peer>,
@@ -374,9 +381,15 @@ impl ConnectionHandler<PeerConnectionTracker, connected_peer::Client> for PeerCo
             let tracker = Rc::clone(&tracker);
 
             async move {
+                log::trace!("Handling household operations");
+                let mut opcount = 0;
                 while let Some(op) = rx.recv().await {
+                    log::trace!("Execute household operation #{opcount}: {op:?}");
+                    opcount += 1;
                     tracker.execute(op).await;
+                    log::trace!("Done executing household operation #{opcount}");
                 }
+                log::trace!("Done handling household operations");
             }
         });
 
@@ -453,7 +466,7 @@ impl PeerConnectionTracker {
 
     // Offer our local store to the peer we just connected to (best
     // effort).
-    async fn share_local_store_with_peer(&self, peer: Peer, client: connected_peer::Client) {
+    async fn share_local_store_with_peer(&self, peer: Peer, client: &mut connected_peer::Client) {
         let mut request = client.register_request();
         request.get().set_store(
             StoreServer {
@@ -622,8 +635,12 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
             .client
     }
 
-    async fn register(&self, peer: Peer, mut client: connected_peer::Client) -> anyhow::Result<()> {
-        let store = get_connected_peer_store(&mut client).await?;
+    async fn register(
+        &self,
+        peer: Peer,
+        client: &mut connected_peer::Client,
+    ) -> anyhow::Result<()> {
+        let store = get_connected_peer_store(client).await?;
         self.clients
             .register(peer, store, &self.storage, Side::Server)
             .await?;
