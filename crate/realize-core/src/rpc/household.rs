@@ -851,7 +851,9 @@ impl connected_peer::Server for ConnectedPeerServer {
         params: connected_peer::PingParams,
         mut results: connected_peer::PingResults,
     ) -> Promise<(), capnp::Error> {
-        results.get().set_out(pry!(params.get()).get_in());
+        let num = pry!(params.get()).get_in();
+        results.get().set_out(num);
+        log::trace!("@{} Got ping #{num}", self.peer);
 
         Promise::ok(())
     }
