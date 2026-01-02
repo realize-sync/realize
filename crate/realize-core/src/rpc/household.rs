@@ -11,6 +11,7 @@ use async_speed_limit::Limiter;
 use capnp::capability::Promise;
 use capnp_rpc::pry;
 use capnp_rpc::rpc_twoparty_capnp::Side;
+use rand::Rng;
 use realize_network::capnp::{ConnectionHandler, ConnectionManager, ConnectionTracker};
 use realize_network::{Networking, Server};
 use realize_storage::{Storage, StorageError};
@@ -643,16 +644,15 @@ impl ConnectionTracker<connected_peer::Client> for PeerConnectionTracker {
 
     async fn keep_alive(&self, peer: Peer, client: connected_peer::Client) -> anyhow::Result<()> {
         log::trace!("@{peer} Keepalive");
+        let mut rng = rand::rng();
         loop {
             tokio::time::sleep(Duration::from_secs(6 * 60)).await;
-            match tokio::time::timeout(
-                Duration::from_secs(5 * 60),
-                client.ping_request().send().promise,
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    log::trace!("@{peer} Ping OK");
+            let mut req = client.ping_request();
+            let num = rng.random();
+            req.get().set_in(num);
+            match tokio::time::timeout(Duration::from_secs(5 * 60), req.send().promise).await {
+                Ok(Ok(res)) => {
+                    log::trace!("@{peer} Ping OK #{}({num})", res.get()?.get_out());
                 }
                 Ok(Err(err)) => {
                     anyhow::bail!("@{peer} Ping failed: {err}");
@@ -848,9 +848,11 @@ impl ConnectedPeerServer {
 impl connected_peer::Server for ConnectedPeerServer {
     fn ping(
         self: Rc<Self>,
-        _: connected_peer::PingParams,
-        _: connected_peer::PingResults,
+        params: connected_peer::PingParams,
+        mut results: connected_peer::PingResults,
     ) -> Promise<(), capnp::Error> {
+        results.get().set_out(pry!(params.get()).get_in());
+
         Promise::ok(())
     }
 

@@ -10,5 +10,5 @@ interface ConnectedPeer {
 
   register @1 (store: Store) -> (); # Register another peer's store
 
-  ping @2 () -> ();
+  ping @2 (in: UInt32) -> (out: UInt32);
 }
