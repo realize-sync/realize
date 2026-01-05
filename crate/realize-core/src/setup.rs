@@ -97,6 +97,7 @@ impl SetupHelper {
 
         let token = CancellationToken::new();
         let mut churten = Churten::new(&self.storage, &self.household);
+        churten.start();
         let control_server =
             ControlServer::new(Arc::clone(&self.storage), churten, self.household.clone());
         unixsocket::bind(
