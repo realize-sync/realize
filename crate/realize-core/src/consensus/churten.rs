@@ -52,9 +52,9 @@ pub(crate) struct Churten<H: JobHandler> {
 }
 
 impl Churten<JobHandlerImpl> {
-    pub(crate) fn new(storage: Arc<Storage>, household: Arc<Household>) -> Self {
+    pub(crate) fn new(storage: &Arc<Storage>, household: &Arc<Household>) -> Self {
         Self::with_handler(
-            Arc::clone(&storage),
+            Arc::clone(storage),
             household.clone(),
             JobHandlerImpl::new(storage, household),
         )
@@ -255,8 +255,11 @@ pub(crate) struct JobHandlerImpl {
 }
 
 impl JobHandlerImpl {
-    pub(crate) fn new(storage: Arc<Storage>, household: Arc<Household>) -> Self {
-        Self { storage, household }
+    pub(crate) fn new(storage: &Arc<Storage>, household: &Arc<Household>) -> Self {
+        Self {
+            storage: Arc::clone(storage),
+            household: Arc::clone(household),
+        }
     }
 }
 
@@ -330,7 +333,7 @@ mod tests {
                 let mut churten = Churten::with_handler(
                     Arc::clone(&storage),
                     household_a.clone(),
-                    JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
+                    JobHandlerImpl::new(&storage, &household_a),
                 );
                 let mut rx = churten.subscribe();
                 churten.start();
@@ -444,7 +447,7 @@ mod tests {
                 let mut churten = Churten::with_handler(
                     Arc::clone(&storage),
                     household_a.clone(),
-                    JobHandlerImpl::new(Arc::clone(&storage), household_a.clone()),
+                    JobHandlerImpl::new(&storage, &household_a),
                 );
                 let mut rx = churten.subscribe();
                 churten.start();

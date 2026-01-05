@@ -1190,7 +1190,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
         local
@@ -1232,7 +1232,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
         local
@@ -1290,7 +1290,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
         local
@@ -1338,7 +1338,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 
@@ -1388,7 +1388,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 
@@ -1434,7 +1434,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 
@@ -1478,7 +1478,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 
@@ -1541,7 +1541,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 
@@ -1571,7 +1571,7 @@ mod tests {
                 &local,
                 peer,
                 household.clone(),
-                JobHandlerImpl::new(Arc::clone(storage), household.clone()),
+                JobHandlerImpl::new(storage, &household),
             )
             .await?;
 

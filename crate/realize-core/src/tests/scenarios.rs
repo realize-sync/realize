@@ -3,7 +3,6 @@ use crate::rpc::testing::{self, HouseholdFixture};
 use realize_storage::utils::hash;
 use realize_storage::{CacheStatus, FileRealm, Mark, Version};
 use realize_types::Path;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -32,7 +31,7 @@ async fn file_drop() -> anyhow::Result<()> {
 
             // write a file to a; it'll get downloaded by b then a's
             // copy will be deleted.
-            let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());
+            let mut churten = Churten::new(&storage_b, &household_b);
             churten.start();
 
             let content = b"foo!".repeat(2 * 1024 * 1024 / 4); // 2M
@@ -125,7 +124,7 @@ async fn link_to_own() -> anyhow::Result<()> {
                 .branch((arena, &Path::parse("work/foo")?), (store_inode, "foo"))
                 .await?;
 
-            let mut churten = Churten::new(Arc::clone(&storage_b), household_b.clone());
+            let mut churten = Churten::new(&storage_b, &household_b);
             churten.start();
 
             let store_foo = Path::parse("store/foo")?;
