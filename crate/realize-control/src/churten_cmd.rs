@@ -49,8 +49,8 @@ pub(crate) async fn execute_churten_is_running(
     }
 }
 
-/// Execute the churten run command
-pub(crate) async fn execute_churten_run(
+/// Execute the churten connect command
+pub(crate) async fn execute_churten_connect(
     control: &control_capnp::control::Client,
     output_mode: OutputMode,
 ) -> Result<i32> {
@@ -69,28 +69,22 @@ pub(crate) async fn execute_churten_run(
 
     let rx = client::subscribe_to_churten(&churten).await?;
 
-    // Have run_churten run in a normal Tokio environment (outside
-    // LocalSet).
-    let res = task::spawn(async move {
+    // Run in a normal Tokio environmen, outside LocalSet).
+    task::spawn(async move {
         let mut display = ChurtenDisplay::new(output_mode);
-        let res = run_churten(&mut display, rx, shutdown).await;
+        let res = connect(&mut display, rx, shutdown).await;
         display.finished().await;
 
         res
     })
-    .await;
+    .await??;
 
-    // Shutdown even if run_churten failed and prioritize showing the
-    // error from churten over the error from shutdown.
-    let shutdown_res = churten.shutdown_request().send().promise.await;
-    res??;
-    shutdown_res?;
     output::print_info(output_mode, "Churten stopped");
 
     Ok(0)
 }
 
-async fn run_churten(
+async fn connect(
     display: &mut ChurtenDisplay,
     mut rx: mpsc::Receiver<ChurtenUpdates>,
     shutdown: CancellationToken,

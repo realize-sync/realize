@@ -68,11 +68,10 @@ enum ChurtenCommands {
     /// In quiet mode, print nothing and exit with status 10 if
     /// churten is not running.
     IsRunning,
-    /// Run churten and print notifications
-    Run,
+    /// Connect and print statusnotifications, start churten if
+    /// necessary.
+    Connect,
 }
-
-
 
 #[derive(Subcommand, Debug)]
 enum PeerCommands {
@@ -231,12 +230,10 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                     ChurtenCommands::IsRunning => {
                         churten_cmd::execute_churten_is_running(&control, cli.output).await
                     }
-                    ChurtenCommands::Run => {
-                        churten_cmd::execute_churten_run(&control, cli.output).await
+                    ChurtenCommands::Connect => {
+                        churten_cmd::execute_churten_connect(&control, cli.output).await
                     }
                 },
-
-
 
                 Commands::Peer { command } => match command {
                     PeerCommands::Query => peer_cmd::execute_peer_query(&control, cli.output).await,
