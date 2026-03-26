@@ -5,6 +5,7 @@ use super::dirty::DirtyReadOperations;
 use super::mark::MarkExt;
 use super::tree::{TreeExt, TreeLoc};
 use super::types::{CacheStatus, LruQueueId};
+use crate::arena::dirty::DirtyExt;
 use crate::arena::tree::TreeReadOperations;
 use crate::types::{JobId, PathId};
 use crate::{Mark, StorageError};
@@ -338,8 +339,10 @@ impl Engine {
                         retry_lower_bound = Some(backoff_until);
                     }
 
-                    Ok(mut jobs) = self.jobs_to_retry_missing_peers(&mut retry_jobs_missing_peers) => {
-                        jobs_to_retry.append(&mut jobs);
+                    Ok(jobs) = self.jobs_to_retry_missing_peers(&mut retry_jobs_missing_peers) => {
+                        for job in jobs {
+                            jobs_to_retry.push(job.as_u64());
+                        }
                     }
                 );
                 for counter in jobs_to_retry {
@@ -586,7 +589,7 @@ impl Engine {
     async fn jobs_to_retry_missing_peers(
         self: &Arc<Self>,
         rx: &mut broadcast::Receiver<()>,
-    ) -> Result<Vec<u64>, StorageError> {
+    ) -> Result<Vec<JobId>, StorageError> {
         loop {
             let _ = rx.recv().await;
             let this = Arc::clone(self);

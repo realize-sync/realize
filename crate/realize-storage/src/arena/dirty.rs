@@ -94,7 +94,7 @@ pub(crate) trait DirtyReadOperations {
     fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError>;
     fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
-    fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError>;
+    fn get_failed_jobs(&self) -> Result<Vec<(JobId, RetryJob)>, StorageError>;
     fn get_earliest_backoff(
         &self,
         lower_bound: Option<UnixTime>,
@@ -127,8 +127,8 @@ where
         is_job_failed(&self.failed_job_table, job_id)
     }
 
-    fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError> {
-        get_jobs_waiting_for_peers(&self.failed_job_table)
+    fn get_failed_jobs(&self) -> Result<Vec<(JobId, RetryJob)>, StorageError> {
+        get_failed_jobs(&self.failed_job_table)
     }
 
     fn get_earliest_backoff(
@@ -160,8 +160,8 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         is_job_failed(&self.failed_job_table, job_id)
     }
 
-    fn get_jobs_waiting_for_peers(&self) -> Result<Vec<u64>, StorageError> {
-        get_jobs_waiting_for_peers(&self.failed_job_table)
+    fn get_failed_jobs(&self) -> Result<Vec<(JobId, RetryJob)>, StorageError> {
+        get_failed_jobs(&self.failed_job_table)
     }
 
     fn get_earliest_backoff(
@@ -169,6 +169,21 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         lower_bound: Option<UnixTime>,
     ) -> Result<Option<(UnixTime, Vec<u64>)>, StorageError> {
         get_earliest_backoff(&self.failed_job_table, lower_bound)
+    }
+}
+
+/// Extend [DirtyReadOperations] with convenience functions.
+pub(crate) trait DirtyExt {
+    fn get_jobs_waiting_for_peers(&self) -> Result<Vec<JobId>, StorageError>;
+}
+impl<T: DirtyReadOperations> DirtyExt for T {
+    fn get_jobs_waiting_for_peers(&self) -> Result<Vec<JobId>, StorageError> {
+        Ok(self
+            .get_failed_jobs()?
+            .iter()
+            .filter(|(_, retry)| *retry == RetryJob::WhenPeerConnects)
+            .map(|(id, _)| *id)
+            .collect())
     }
 }
 
@@ -363,22 +378,15 @@ fn is_job_failed(
     Ok(failed_job_table.get(job_id.as_u64())?.is_some())
 }
 
-fn get_jobs_waiting_for_peers(
+fn get_failed_jobs(
     failed_job_table: &impl ReadableTable<u64, Holder<'static, FailedJobTableEntry>>,
-) -> Result<Vec<u64>, StorageError> {
+) -> Result<Vec<(JobId, RetryJob)>, StorageError> {
     let mut jobs = vec![];
     for e in failed_job_table.iter()? {
         let (key, val) = e?;
         let counter = key.value();
         let entry = val.value().parse()?;
-        match entry.retry {
-            RetryJob::After(_) => {
-                continue;
-            }
-            RetryJob::WhenPeerConnects => {
-                jobs.push(counter);
-            }
-        }
+        jobs.push((JobId(counter), entry.retry));
     }
     Ok(jobs)
 }
@@ -621,7 +629,7 @@ mod tests {
 
         // Verify job is waiting for peers
         let waiting_jobs = dirty.get_jobs_waiting_for_peers()?;
-        assert_eq!(waiting_jobs, vec![1]);
+        assert_eq!(waiting_jobs, vec![JobId(1)]);
 
         Ok(())
     }
@@ -785,7 +793,38 @@ mod tests {
 
         // Get jobs waiting for peers
         let waiting_jobs = dirty.get_jobs_waiting_for_peers()?;
-        assert_eq!(waiting_jobs, vec![1, 2]);
+        assert_eq!(waiting_jobs, vec![JobId(1), JobId(2)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_failed_jobs() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+        let txn = fixture.db.begin_write()?;
+        let mut dirty = txn.write_dirty()?;
+        let mut tree = txn.write_tree()?;
+        let path1 = tree.setup(Path::parse("path1.txt")?)?;
+        let path2 = tree.setup(Path::parse("path2.txt")?)?;
+        let job_id1 = JobId(1);
+        let job_id2 = JobId(2);
+
+        // First mark paths as dirty to create the job entries
+        dirty.mark_dirty(path1, "test")?;
+        dirty.mark_dirty(path2, "test")?;
+
+        // Mark jobs as waiting for peers
+        dirty.mark_job_missing_peers(job_id1)?;
+        let retry_strategy = |_| Some(Duration::from_secs(1));
+        dirty.mark_job_failed(job_id2, &retry_strategy)?;
+
+        let failed = dirty.get_failed_jobs()?;
+        assert_eq!(
+            vec![job_id1, job_id2],
+            failed.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+        assert!(matches!(failed[0].1, RetryJob::WhenPeerConnects));
+        assert!(matches!(failed[1].1, RetryJob::After(_)));
 
         Ok(())
     }
