@@ -112,7 +112,7 @@ where
     }
 
     fn highest_counter(&self) -> Result<u64, StorageError> {
-        7~highest_counter(&self.log_table)
+        highest_counter(&self.log_table)
     }
 
     fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {

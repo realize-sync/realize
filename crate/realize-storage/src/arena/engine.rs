@@ -7,9 +7,11 @@ use super::tree::{TreeExt, TreeLoc};
 use super::types::{CacheStatus, LruQueueId};
 use crate::arena::dirty::DirtyExt;
 use crate::arena::tree::TreeReadOperations;
+use crate::arena::types::RetryJob;
 use crate::types::{JobId, PathId};
 use crate::{Mark, StorageError};
 use realize_types::{Hash, Path, UnixTime};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -425,6 +427,33 @@ impl Engine {
                 }
             }
             return Ok::<_, StorageError>(None);
+        })
+        .await?
+    }
+
+    pub(crate) async fn all_jobs(
+        self: &Arc<Self>,
+    ) -> Result<Vec<(JobId, StorageJob, Option<RetryJob>)>, StorageError> {
+        let this = Arc::clone(self);
+        task::spawn_blocking(move || {
+            let txn = this.db.begin_read()?;
+            let tree = txn.read_tree()?;
+            let dirty = txn.read_dirty()?;
+            let mut start_counter = 0;
+            let mut ret = vec![];
+            let mut failed = dirty
+                .get_failed_jobs()?
+                .into_iter()
+                .collect::<HashMap<JobId, RetryJob>>();
+            while let Some((pathid, counter)) = dirty.next_dirty(start_counter)? {
+                if let Some(job) = this.build_job(&txn, &tree, pathid)? {
+                    let job_id = JobId(counter);
+                    ret.push((job_id, job, failed.remove(&job_id)));
+                }
+                start_counter = counter + 1;
+            }
+
+            Ok::<_, StorageError>(ret)
         })
         .await?
     }
@@ -1522,6 +1551,83 @@ mod tests {
         let (new_job_id, new_job) = fixture.engine.job_for_loc(&barfile).await?.unwrap();
         assert_eq!(job, new_job);
         assert!(new_job_id > job_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_jobs_empty() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+
+        let jobs = fixture.engine.all_jobs().await?;
+        assert!(jobs.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_jobs_returns_pending_jobs() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let jobs = fixture.engine.all_jobs().await?;
+        assert_eq!(1, jobs.len());
+        assert_eq!(
+            (JobId(1), StorageJob::External(Job::Download(barfile, test_hash())), None),
+            jobs[0]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_jobs_returns_failed_jobs() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+
+        let jobs = fixture.engine.all_jobs().await?;
+        assert_eq!(1, jobs.len());
+        let job_id = jobs[0].0;
+
+        fixture.engine.job_finished(job_id, Err(anyhow::anyhow!("fake error")))?;
+
+        let jobs = fixture.engine.all_jobs().await?;
+        assert_eq!(1, jobs.len());
+        let (id, job, retry) = &jobs[0];
+        assert_eq!(job_id, *id);
+        assert!(matches!(job, StorageJob::External(Job::Download(..))));
+        assert!(retry.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_jobs_multiple() -> anyhow::Result<()> {
+        let fixture = EngineFixture::setup().await?;
+        let barfile = Path::parse("foo/bar.txt")?;
+        let otherfile = Path::parse("foo/other.txt")?;
+        mark::set_arena_mark(&fixture.db, Mark::Keep)?;
+        fixture.add_file_to_cache(&barfile)?;
+        fixture.add_file_to_cache(&otherfile)?;
+
+        let mut jobs = fixture.engine.all_jobs().await?;
+        assert_eq!(2, jobs.len());
+        jobs.sort_by_key(|j| j.0.as_u64());
+        
+        let job1_id = jobs[0].0;
+        
+        fixture.engine.job_finished(job1_id, Err(anyhow::anyhow!("error")))?;
+        
+        let mut jobs = fixture.engine.all_jobs().await?;
+        assert_eq!(2, jobs.len());
+        jobs.sort_by_key(|j| j.0.as_u64());
+        
+        assert!(jobs[0].2.is_some());
+        assert!(jobs[1].2.is_none());
 
         Ok(())
     }

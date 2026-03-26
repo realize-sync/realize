@@ -1,4 +1,5 @@
 use crate::arena::db::ArenaDatabase;
+use crate::arena::engine::StorageJob;
 use crate::config::WatcherConfig;
 use anyhow::Context;
 use arena::engine::Engine;
@@ -30,7 +31,8 @@ pub use arena::engine::{Job, JobStatus};
 pub use arena::notifier::Notification;
 pub use arena::notifier::Progress;
 pub use arena::types::{
-    CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability, Version,
+    CacheStatus, DirMetadata, FileMetadata, FileRealm, Mark, Metadata, RemoteAvailability,
+    RetryJob, Version,
 };
 pub use error::{SanityCheck, StorageError};
 pub use global::fs::{FileContent, Filesystem, FsLoc};
@@ -260,6 +262,25 @@ impl Storage {
             })
             .collect::<StreamMap<Arena, _>>()
             .map(|(arena, (job_id, job))| (arena, job_id, job))
+    }
+
+    /// Return all pending or active jobs.
+    ///
+    /// The returned set of jobs may include jobs not yet returned by
+    /// the job stream.
+    pub async fn all_jobs(
+        &self,
+    ) -> Result<Vec<(Arena, JobId, Job, Option<RetryJob>)>, StorageError> {
+        let mut ret = vec![];
+        for (arena, engine) in self.engines() {
+            for (jobid, job, retry) in engine.all_jobs().await? {
+                if let StorageJob::External(job) = job {
+                    ret.push((arena, jobid, job, retry));
+                }
+            }
+        }
+
+        Ok(ret)
     }
 
     /// Tell the engine to retry job missing peers.
