@@ -16,7 +16,7 @@ pub(crate) struct Dirty {
 
 impl Dirty {
     pub(crate) fn setup(log_table: &impl ReadableTable<u64, PathId>) -> Result<Self, StorageError> {
-        let last_counter = last_counter(log_table)?;
+        let last_counter = highest_counter(log_table)?;
         let (watch_tx, watch_rx) = watch::channel(last_counter);
 
         Ok(Self {
@@ -90,7 +90,7 @@ impl<'a> WritableOpenDirty<'a> {
 pub(crate) trait DirtyReadOperations {
     fn next_dirty(&self, start_counter: u64) -> Result<Option<(PathId, u64)>, StorageError>;
     #[allow(dead_code)] // for testing
-    fn last_counter(&self) -> Result<u64, StorageError>;
+    fn highest_counter(&self) -> Result<u64, StorageError>;
     fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError>;
     fn get_counter(&self, pathid: PathId) -> Result<Option<u64>, StorageError>;
     fn is_job_failed(&self, job_id: JobId) -> Result<bool, StorageError>;
@@ -111,8 +111,8 @@ where
         next_dirty(&self.log_table, start_counter)
     }
 
-    fn last_counter(&self) -> Result<u64, StorageError> {
-        last_counter(&self.log_table)
+    fn highest_counter(&self) -> Result<u64, StorageError> {
+        7~highest_counter(&self.log_table)
     }
 
     fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
@@ -144,8 +144,8 @@ impl<'a> DirtyReadOperations for WritableOpenDirty<'a> {
         next_dirty(&self.log_table, start_counter)
     }
 
-    fn last_counter(&self) -> Result<u64, StorageError> {
-        last_counter(&self.log_table)
+    fn highest_counter(&self) -> Result<u64, StorageError> {
+        highest_counter(&self.log_table)
     }
 
     fn get_pathid_for_counter(&self, counter: u64) -> Result<Option<PathId>, StorageError> {
@@ -345,7 +345,7 @@ fn next_dirty(
     Ok(None)
 }
 
-fn last_counter(log_table: &impl ReadableTable<u64, PathId>) -> Result<u64, StorageError> {
+fn highest_counter(log_table: &impl ReadableTable<u64, PathId>) -> Result<u64, StorageError> {
     Ok(log_table.last()?.map(|(k, _)| k.value()).unwrap_or(0))
 }
 
@@ -860,14 +860,14 @@ mod tests {
         let path1 = tree.setup(Path::parse("path1.txt")?)?;
         let path2 = tree.setup(Path::parse("path2.txt")?)?;
 
-        assert_eq!(0, dirty.last_counter()?);
+        assert_eq!(0, dirty.highest_counter()?);
 
         // Mark paths as dirty
         dirty.mark_dirty(path1, "test")?;
         dirty.mark_dirty(path2, "test")?;
 
         // Get last counter
-        assert_eq!(2, dirty.last_counter()?);
+        assert_eq!(2, dirty.highest_counter()?);
 
         Ok(())
     }
