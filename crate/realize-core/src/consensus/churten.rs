@@ -10,19 +10,25 @@ use realize_storage::{Job, JobId, JobStatus, RetryJob, Storage, StorageError};
 use realize_types::Arena;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 /// Capacity of the broadcast channel.
 ///
-/// Used by [TxByteCountProgress] to scale down the number of bytes
-/// notifications.
+/// If the capacity is too small, byte count progress may overwhelm
+/// the channel and cause many resets. The resolution and burst limits
+/// below are meant reduce the number of updates to avoid that.
 const BROADCAST_CHANNEL_CAPACITY: usize = 128;
 
 /// Update byte count when the difference with the last update is at
 /// least that many.
-const BROADCAST_CHANNEL_RESOLUTION_BYTES: u64 = 64 * 1024;
+const BROADCAST_CHANNEL_RESOLUTION_BYTES: u64 = 1024;
+
+/// After a byte count update, wait that long to let another update
+/// through.
+const BROADCAST_CHANNEL_BURST_LIMIT: Duration = Duration::from_millis(500);
 
 /// A type that processes jobs and returns the result for [Churten].
 ///
@@ -273,8 +279,8 @@ async fn run_job<H: JobHandler>(
     log::debug!("[{arena}] Job #{job_id} Starting {job:?}");
     let _ = tx.send(ChurtenNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
-        .adaptive(BROADCAST_CHANNEL_CAPACITY)
-        .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES);
+        .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES)
+        .with_burst_limit(BROADCAST_CHANNEL_BURST_LIMIT);
     let result = handler
         .run(arena, job_id, &job, &mut progress, shutdown)
         .await;

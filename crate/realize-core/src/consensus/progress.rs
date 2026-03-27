@@ -1,10 +1,8 @@
-use std::cmp::min;
-
+use super::types::{ChurtenNotification, JobAction};
 use realize_storage::JobId;
 use realize_types::Arena;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-
-use super::types::{ChurtenNotification, JobAction};
 
 /// A trait that let job implementation report internal progress.
 pub(crate) trait ByteCountProgress {
@@ -15,16 +13,14 @@ pub(crate) trait ByteCountProgress {
 /// Implementation of [ByteCountProgress] that sends updates to a
 /// channel.
 ///
-/// The bytecount updates are limited. If
-/// [TxByteCountProgress::adaptive] is called, the limits adapt to how
-/// full the channel is.
+/// The number of bytecount update may optionally be limited.
 pub(crate) struct TxByteCountProgress {
     tx: broadcast::Sender<ChurtenNotification>,
     arena: Arena,
     job_id: JobId,
     resolution_bytes: u64,
-    last_bytecount_update: Option<(u64, u64)>,
-    channel_capacity: Option<usize>,
+    burst_limiter: Duration,
+    last_bytecount_update: Option<(u64, u64, Instant)>,
     index: u32,
 }
 
@@ -40,8 +36,8 @@ impl TxByteCountProgress {
             job_id,
             tx,
             resolution_bytes: 1,
+            burst_limiter: Duration::ZERO,
             last_bytecount_update: None,
-            channel_capacity: None,
             // Start at 0, this way New is 0 and Start is 1.
             index: 2,
         }
@@ -56,9 +52,11 @@ impl TxByteCountProgress {
         self
     }
 
-    /// Adapt bytecount update resolution to how full the channel is.
-    pub(crate) fn adaptive(mut self, channel_capacity: usize) -> Self {
-        self.channel_capacity = Some(channel_capacity);
+    /// After sending a bytecount update, wait that long to let
+    /// another through.
+    pub(crate) fn with_burst_limit(mut self, limit: Duration) -> Self {
+        self.burst_limiter = limit;
+
         self
     }
 
@@ -70,46 +68,19 @@ impl TxByteCountProgress {
 
         match self.last_bytecount_update {
             None => true,
-            Some((prev_current_bytes, prev_total_bytes)) => {
+            Some((prev_current_bytes, prev_total_bytes, last_update_time)) => {
                 if prev_total_bytes == total_bytes {
                     if delta(current_bytes, prev_current_bytes) < self.resolution_bytes {
                         return false;
                     }
-
-                    // Limit to percentage counts; the minimum
-                    // percentage depends on how full the channel is
-                    // if adaptive() was called.
-                    let prev_p = percent(prev_current_bytes, prev_total_bytes);
-                    let p = percent(current_bytes, total_bytes);
-                    let limit = self.resolution_p();
-                    if delta(p, prev_p) < limit {
+                    if self.burst_limiter > Duration::ZERO
+                        && Instant::now().duration_since(last_update_time) < self.burst_limiter
+                    {
                         return false;
                     }
                 }
 
                 true
-            }
-        }
-    }
-
-    /// Only send an update if the bytecount is increased by that many
-    /// percent.
-    fn resolution_p(&self) -> u64 {
-        match self.channel_capacity {
-            None => 1,
-            Some(capacity) => {
-                let capacity_p = percent_usize(min(self.tx.len(), capacity), capacity);
-                if capacity_p < 10 {
-                    1
-                } else if capacity_p < 25 {
-                    5
-                } else if capacity_p < 50 {
-                    10
-                } else if capacity_p < 75 {
-                    25
-                } else {
-                    100
-                }
             }
         }
     }
@@ -134,7 +105,7 @@ impl ByteCountProgress for TxByteCountProgress {
     }
     fn update(&mut self, current_bytes: u64, total_bytes: u64) {
         if self.should_send(current_bytes, total_bytes) {
-            self.last_bytecount_update = Some((current_bytes, total_bytes));
+            self.last_bytecount_update = Some((current_bytes, total_bytes, Instant::now()));
             let index = self.next_index();
             let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
                 arena: self.arena,
@@ -151,24 +122,6 @@ impl ByteCountProgress for TxByteCountProgress {
 #[inline]
 fn delta(a: u64, b: u64) -> u64 {
     if a > b { a - b } else { b - a }
-}
-
-/// Compute percentage of u64 values.
-#[inline]
-fn percent(current: u64, total: u64) -> u64 {
-    percent_f64(current as f64, total as f64)
-}
-
-/// Compute percentage of usize values.
-#[inline]
-fn percent_usize(current: usize, total: usize) -> u64 {
-    percent_f64(current as f64, total as f64)
-}
-
-/// Compute percentage of positive values
-#[inline]
-fn percent_f64(current: f64, total: f64) -> u64 {
-    (current * 100.0 / total) as u64
 }
 
 #[cfg(any(test))]
@@ -214,6 +167,8 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::min;
+
     use super::*;
     use tokio::task::{self, JoinHandle};
 
@@ -297,27 +252,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_limits_updates_to_percent() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup();
-        let k: u64 = 1024;
-        let m: u64 = 1024 * k;
-        let total: u64 = 100 * m;
-        // send 400 notifications, but only 100 are received, because
-        // of the minimum required percentage update.
-        let mut progress = fixture.create_progress();
-        for i in (0..total).step_by(256 * k as usize) {
-            progress.update(i as u64, total);
-        }
-        drop(progress); // closes tx, so accumulator ends
-
-        let notifications = fixture.take_notifications().await?;
-        assert_eq!(100, notifications.len(), "{notifications:?}");
-        assert_eq!(1 * m, min_delta(notifications));
-
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn channel_limits_updates_to_bytecount() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup();
 
@@ -350,79 +284,6 @@ mod tests {
 
         let notifications = fixture.take_notifications().await?;
         assert_eq!(3, notifications.len(), "{notifications:?}");
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn adaptive_progress() -> anyhow::Result<()> {
-        let _ = env_logger::try_init();
-
-        let capacity = 16;
-        let (tx, mut rx) = broadcast::channel(capacity);
-        let mut progress =
-            TxByteCountProgress::new(Arena::from("myarena"), JobId(1), tx).adaptive(capacity);
-
-        progress.update(0, 100);
-        assert_eq!(1, rx.len());
-        let _ = rx.recv().await;
-
-        progress.update(1, 100);
-        assert_eq!(1, rx.len());
-        progress.update(2, 100);
-        assert_eq!(2, rx.len());
-
-        // 10% capacity, updates are now sent every 5%
-        for i in 3..7 {
-            progress.update(i, 100);
-            assert_eq!(2, rx.len());
-        }
-        progress.update(8, 100);
-        assert_eq!(3, rx.len());
-
-        for i in 9..13 {
-            progress.update(i, 100);
-            assert_eq!(3, rx.len());
-        }
-        progress.update(14, 100);
-        assert_eq!(4, rx.len());
-
-        // 25% capacity, updates are now sent every 10%
-        for i in 15..24 {
-            progress.update(i, 100);
-            assert_eq!(4, rx.len());
-        }
-        progress.update(25, 100);
-        assert_eq!(5, rx.len());
-
-        for i in 26..35 {
-            progress.update(i, 100);
-            assert_eq!(5, rx.len());
-        }
-        progress.update(36, 100);
-        assert_eq!(6, rx.len());
-
-        for i in 37..46 {
-            progress.update(i, 100);
-            assert_eq!(6, rx.len());
-        }
-        progress.update(47, 100);
-        assert_eq!(7, rx.len());
-
-        for i in 48..57 {
-            progress.update(i, 100);
-            assert_eq!(7, rx.len());
-        }
-        progress.update(58, 100);
-        assert_eq!(8, rx.len());
-
-        // 50% capacity, updates are now sent every 25%
-        for i in 59..83 {
-            progress.update(i, 100);
-            assert_eq!(8, rx.len());
-        }
-        progress.update(84, 100);
-        assert_eq!(9, rx.len());
 
         Ok(())
     }
