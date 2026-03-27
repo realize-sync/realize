@@ -44,7 +44,7 @@ interface Churten {
   start @1 () -> ();
   shutdown @2 () -> ();
   isRunning @3 () -> (running: Bool);
-  recentJobs @4 () -> (res: List(JobInfo));
+  allJobs @4 () -> (res: List(JobInfo));
 
   interface Subscriber {
     notify @0 (notification: ChurtenNotification) -> stream;

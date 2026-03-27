@@ -3,7 +3,7 @@
 
 use super::control_capnp;
 use super::control_capnp::churten::{
-    self, IsRunningParams, IsRunningResults, RecentJobsParams, RecentJobsResults, ShutdownParams,
+    self, IsRunningParams, IsRunningResults, AllJobsParams, AllJobsResults, ShutdownParams,
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
@@ -429,17 +429,17 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         Promise::ok(())
     }
 
-    fn recent_jobs(
+    fn all_jobs(
         self: Rc<Self>,
-        _: RecentJobsParams,
-        mut results: RecentJobsResults,
+        _: AllJobsParams,
+        mut results: AllJobsResults,
     ) -> Promise<(), capnp::Error> {
         let churten = self.churten.clone();
         Promise::from_future(async move {
-            let recent_jobs = churten.borrow().recent_jobs().await;
+            let all_jobs = churten.borrow().all_jobs().await;
 
-            let mut job_list = results.get().init_res(recent_jobs.len() as u32);
-            for (i, job_info) in recent_jobs.into_iter().enumerate() {
+            let mut job_list = results.get().init_res(all_jobs.len() as u32);
+            for (i, job_info) in all_jobs.into_iter().enumerate() {
                 convert::fill_job_info(&job_info, job_list.reborrow().get(i as u32));
             }
 
@@ -772,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_jobs() -> anyhow::Result<()> {
+    async fn all_jobs() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let arena = HouseholdFixture::test_arena();
         let peer = HouseholdFixture::a();
@@ -841,8 +841,8 @@ mod tests {
                 }
 
                 // Get recent jobs
-                let recent_jobs_result = churten.recent_jobs_request().send().promise.await?;
-                let jobs = recent_jobs_result.get()?.get_res()?;
+                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                let jobs = all_jobs_result.get()?.get_res()?;
 
                 // Should have at least one job
                 assert!(jobs.len() > 0);

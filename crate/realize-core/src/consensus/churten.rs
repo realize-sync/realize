@@ -48,7 +48,7 @@ pub(crate) struct Churten<H: JobHandler> {
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
-    recent_jobs: Arc<RwLock<JobInfoTracker>>,
+    all_jobs: Arc<RwLock<JobInfoTracker>>,
 }
 
 impl Churten<JobHandlerImpl> {
@@ -85,7 +85,7 @@ impl<H: JobHandler + 'static> Churten<H> {
             task: None,
             tx,
             household,
-            recent_jobs: tracker,
+            all_jobs: tracker,
         }
     }
 
@@ -94,15 +94,15 @@ impl<H: JobHandler + 'static> Churten<H> {
     /// The number of finished jobs reported by this method is limited.
     ///
     /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
-    pub(crate) async fn recent_jobs(&self) -> Vec<JobInfo> {
-        self.recent_jobs.read().await.iter().cloned().collect()
+    pub(crate) async fn all_jobs(&self) -> Vec<JobInfo> {
+        self.all_jobs.read().await.iter().cloned().collect()
     }
 
     /// Return a list of active jobs.
     ///
     /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
     pub(crate) async fn active_jobs(&self) -> Vec<JobInfo> {
-        self.recent_jobs.read().await.active().cloned().collect()
+        self.all_jobs.read().await.active().cloned().collect()
     }
 
     /// Subscribe to [ChurtenNotification]s.
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recent_jobs() -> anyhow::Result<()> {
+    async fn all_jobs() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -980,19 +980,19 @@ mod tests {
                     }
                 }
 
-                let recent_jobs = churten.recent_jobs().await.into_iter().collect::<Vec<_>>();
+                let all_jobs = churten.all_jobs().await.into_iter().collect::<Vec<_>>();
                 assert_unordered::assert_eq_unordered!(
                     vec![
                         Job::Download(foo1, hash1),
                         Job::Download(foo2, hash2),
                         Job::Download(foo3, hash3)
                     ],
-                    recent_jobs
+                    all_jobs
                         .iter()
                         .map(|j| (*j.job).clone())
                         .collect::<Vec<_>>()
                 );
-                for job in recent_jobs {
+                for job in all_jobs {
                     assert_eq!(job.arena, job.arena);
                     assert_eq!(job.progress, JobProgress::Done);
                 }
