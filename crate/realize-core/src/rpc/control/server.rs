@@ -3,7 +3,7 @@
 
 use super::control_capnp;
 use super::control_capnp::churten::{
-    self, IsRunningParams, IsRunningResults, AllJobsParams, AllJobsResults, ShutdownParams,
+    self, AllJobsParams, AllJobsResults, IsRunningParams, IsRunningResults, ShutdownParams,
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
@@ -436,7 +436,11 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
     ) -> Promise<(), capnp::Error> {
         let churten = self.churten.clone();
         Promise::from_future(async move {
-            let all_jobs = churten.borrow().all_jobs().await;
+            let all_jobs = churten
+                .borrow()
+                .all_jobs()
+                .await
+                .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
             let mut job_list = results.get().init_res(all_jobs.len() as u32);
             for (i, job_info) in all_jobs.into_iter().enumerate() {
@@ -512,6 +516,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
+    use tokio::sync::Barrier;
     use tokio::sync::mpsc;
     use tokio::task::LocalSet;
     use tokio_util::sync::CancellationToken;
@@ -527,6 +532,7 @@ mod tests {
     struct FakeJobHandler {
         result_fn: Arc<dyn Fn() -> Result<JobStatus, JobError> + Send + Sync>,
         should_send_progress: bool,
+        barrier: Option<Arc<Barrier>>,
     }
 
     impl FakeJobHandler {
@@ -537,11 +543,18 @@ mod tests {
             Self {
                 result_fn: Arc::new(result_fn),
                 should_send_progress: false,
+                barrier: None,
             }
         }
 
         fn with_progress(mut self, should_send: bool) -> Self {
             self.should_send_progress = should_send;
+            self
+        }
+
+        fn with_barrier(mut self, barrier: &Arc<Barrier>) -> Self {
+            self.barrier = Some(Arc::clone(barrier));
+
             self
         }
     }
@@ -559,9 +572,13 @@ mod tests {
                 return Ok(JobStatus::Cancelled);
             }
 
-            // Send progress updates if requested
             if self.should_send_progress {
                 progress.update_action(JobAction::Download);
+            }
+            if let Some(barrier) = &self.barrier {
+                barrier.wait().await;
+            }
+            if self.should_send_progress {
                 progress.update(50, 100);
                 progress.update(100, 100);
             }
@@ -772,7 +789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_jobs() -> anyhow::Result<()> {
+    async fn all_jobs_success() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let arena = HouseholdFixture::test_arena();
         let peer = HouseholdFixture::a();
@@ -780,7 +797,8 @@ mod tests {
         let household = fixture.inner.create_household(&local, peer)?;
 
         // Create a fake job handler that succeeds
-        let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+        let barrier = Arc::new(Barrier::new(2));
+        let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_barrier(&barrier);
         let sockpath = fixture
             .bind_server(&local, peer, household, handler)
             .await?;
@@ -830,7 +848,29 @@ mod tests {
                     )
                     .await?;
 
-                // Wait for it to be processed
+                // The job should be listed right away, whether or not
+                // it has been picked up by churten.
+                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                let jobs = all_jobs_result.get()?.get_res()?;
+
+                assert_eq!(jobs.len(), 1);
+
+                let job = jobs.get(0);
+                assert_eq!(job.get_arena()?, arena.as_str());
+                assert_eq!(job.get_id(), 1);
+                assert!(matches!(
+                    job.get_progress()?.get_type()?,
+                    control_capnp::job_progress::Type::Pending
+                        | control_capnp::job_progress::Type::Running
+                ));
+                assert_eq!(job.get_action()?, control_capnp::JobAction::None);
+
+                let job_info = job.get_job()?;
+                assert_eq!(job_info.get_path()?, "foo");
+
+                // Allow the job to be processed, wait for it to be
+                // done, which should make it disappear from the list.
+                barrier.wait().await;
                 while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
                         ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
@@ -840,24 +880,103 @@ mod tests {
                     }
                 }
 
-                // Get recent jobs
+                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                let jobs = all_jobs_result.get()?.get_res()?;
+                assert_eq!(jobs.len(), 0);
+
+                // Shutdown churten
+                churten.shutdown_request().send().promise.await?;
+
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_jobs_nopeers() -> anyhow::Result<()> {
+        let fixture = Fixture::setup().await?;
+        let arena = HouseholdFixture::test_arena();
+        let peer = HouseholdFixture::a();
+        let local = LocalSet::new();
+        let household = fixture.inner.create_household(&local, peer)?;
+
+        // Create a fake job handler that never succeeds
+        let handler = FakeJobHandler::new(|| Ok(JobStatus::NoPeers));
+        let sockpath = fixture
+            .bind_server(&local, peer, household, handler)
+            .await?;
+
+        local
+            .run_until(async move {
+                let control: control::Client = unixsocket::connect(&sockpath).await?;
+                let churten = control
+                    .churten_request()
+                    .send()
+                    .promise
+                    .await?
+                    .get()?
+                    .get_churten()?;
+
+                // Start churten
+                churten.start_request().send().promise.await?;
+                let (tx, mut rx) = mpsc::channel(10);
+                let mut subscribe_request = churten.subscribe_request();
+                subscribe_request
+                    .get()
+                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                subscribe_request.send().promise.await?;
+
+                // Create a job by setting up a file to download
+                // Set arena mark using the RPC method
+                let mut request = control.set_attr_request();
+                let mut req = request.get().init_req();
+                req.set_arena(arena.as_str());
+                req.set_path(""); // Empty path means arena mark
+                req.set_attr("mark");
+                req.set_value("keep");
+                request.send().promise.await?;
+                fixture
+                    .inner
+                    .cache(peer)?
+                    .update(
+                        Peer::from("other"),
+                        Notification::Add {
+                            arena,
+                            index: 1,
+                            path: Path::parse("foo")?,
+                            mtime: UnixTime::from_secs(1234567890),
+                            size: 100,
+                            hash: Hash([1; 32]),
+                        },
+                    )
+                    .await?;
+                // Wait for the job to fail
+                while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
+                    match n {
+                        ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Make sure it's listed with the right status
                 let all_jobs_result = churten.all_jobs_request().send().promise.await?;
                 let jobs = all_jobs_result.get()?.get_res()?;
 
-                // Should have at least one job
-                assert!(jobs.len() > 0);
+                assert_eq!(jobs.len(), 1);
 
-                // Check the first job
                 let job = jobs.get(0);
                 assert_eq!(job.get_arena()?, arena.as_str());
                 assert_eq!(job.get_id(), 1);
                 assert_eq!(
                     job.get_progress()?.get_type()?,
-                    control_capnp::job_progress::Type::Done
+                    control_capnp::job_progress::Type::NoPeers
                 );
                 assert_eq!(job.get_action()?, control_capnp::JobAction::None);
 
-                // Check the job details
                 let job_info = job.get_job()?;
                 assert_eq!(job_info.get_path()?, "foo");
 

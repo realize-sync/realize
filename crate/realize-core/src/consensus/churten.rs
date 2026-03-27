@@ -6,8 +6,9 @@ use super::tracker::{JobInfo, JobInfoTracker};
 use super::types::{ChurtenNotification, JobProgress};
 use crate::rpc::{Household, HouseholdOperationError, PeerStatus};
 use futures::StreamExt;
-use realize_storage::{Job, JobId, JobStatus, Storage, StorageError};
+use realize_storage::{Job, JobId, JobStatus, RetryJob, Storage, StorageError};
 use realize_types::Arena;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::{sync::broadcast, task::JoinHandle};
@@ -48,7 +49,7 @@ pub(crate) struct Churten<H: JobHandler> {
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
     tx: broadcast::Sender<ChurtenNotification>,
-    all_jobs: Arc<RwLock<JobInfoTracker>>,
+    tracker: Arc<RwLock<JobInfoTracker>>,
 }
 
 impl Churten<JobHandlerImpl> {
@@ -85,7 +86,7 @@ impl<H: JobHandler + 'static> Churten<H> {
             task: None,
             tx,
             household,
-            all_jobs: tracker,
+            tracker,
         }
     }
 
@@ -94,15 +95,49 @@ impl<H: JobHandler + 'static> Churten<H> {
     /// The number of finished jobs reported by this method is limited.
     ///
     /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
-    pub(crate) async fn all_jobs(&self) -> Vec<JobInfo> {
-        self.all_jobs.read().await.iter().cloned().collect()
+    pub(crate) async fn all_jobs(&self) -> Result<Vec<JobInfo>, StorageError> {
+        let all_jobs = self.storage.all_jobs().await?;
+        let mut ret: HashMap<(Arena, JobId), JobInfo> = self
+            .tracker
+            .read()
+            .await
+            .active()
+            .map(|info| ((info.arena, info.id), info.clone()))
+            .collect();
+        for (arena, id, job, retry) in all_jobs {
+            let key = (arena, id);
+            if ret.contains_key(&key) {
+                continue;
+            }
+            let progress = match retry {
+                None => JobProgress::Pending,
+                Some(RetryJob::WhenPeerConnects) => JobProgress::NoPeers,
+                Some(RetryJob::After(retry)) => {
+                    JobProgress::Failed(format!("will retry on {:?}", retry))
+                }
+            };
+            ret.insert(
+                key,
+                JobInfo {
+                    arena,
+                    id,
+                    job: Arc::new(job),
+                    progress,
+                    action: None,
+                    byte_progress: None,
+                    notification_index: 0,
+                },
+            );
+        }
+
+        Ok(ret.into_values().collect())
     }
 
     /// Return a list of active jobs.
     ///
     /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
     pub(crate) async fn active_jobs(&self) -> Vec<JobInfo> {
-        self.all_jobs.read().await.active().cloned().collect()
+        self.tracker.read().await.active().cloned().collect()
     }
 
     /// Subscribe to [ChurtenNotification]s.
@@ -951,7 +986,7 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
+                let handler = FakeJobHandler::new(|| Ok(JobStatus::NoPeers));
                 let mut churten =
                     Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
                 let mut rx = churten.subscribe();
@@ -964,7 +999,7 @@ mod tests {
                 let (foo2, hash2) = fixture.inner.write_file(b, "foo2", "content2").await?;
                 let (foo3, hash3) = fixture.inner.write_file(b, "foo3", "content3").await?;
 
-                // Collect all notifications
+                // Wait for file processing to fail.
                 let mut finished_count = 0;
                 while let Ok(notification) =
                     tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
@@ -980,7 +1015,8 @@ mod tests {
                     }
                 }
 
-                let all_jobs = churten.all_jobs().await.into_iter().collect::<Vec<_>>();
+                // Make sure the jobs are reported
+                let all_jobs = churten.all_jobs().await.unwrap();
                 assert_unordered::assert_eq_unordered!(
                     vec![
                         Job::Download(foo1, hash1),
@@ -994,7 +1030,7 @@ mod tests {
                 );
                 for job in all_jobs {
                     assert_eq!(job.arena, job.arena);
-                    assert_eq!(job.progress, JobProgress::Done);
+                    assert_eq!(job.progress, JobProgress::NoPeers);
                 }
 
                 Ok::<(), anyhow::Error>(())

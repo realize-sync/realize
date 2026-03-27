@@ -33,7 +33,7 @@ interface Control {
 
 struct PeerConnectionInfo {
   peer @0:Text;
-  connected @1:Bool; # if ture, peer is currently connected
+  connected @1:Bool; # if true, peer is currently connected
   keepConnected @2:Bool; # if true, the server will keep trying to connect
 }
 
@@ -44,18 +44,18 @@ interface Churten {
   start @1 () -> ();
   shutdown @2 () -> ();
   isRunning @3 () -> (running: Bool);
-  allJobs @4 () -> (res: List(JobInfo));
+  allJobs @4 () -> (res: List(JobInfo)); # List pending, active and failed jobs.
 
   interface Subscriber {
     notify @0 (notification: ChurtenNotification) -> stream;
 
+    reset @1 (jobs: List(JobInfo)) -> stream;
     # Provide a list of active jobs as catchup and as a
     # way to reset the stream when the channel is full.
     #
     # Whenever sent, this should overwrite the state
     # built from previous notifications. Jobs not reported
-    # should be considered finished (with unknown result).
-    reset @1 (jobs: List(JobInfo)) -> stream;
+    # should be considered finished, successfully or not.
   }
 }
 
