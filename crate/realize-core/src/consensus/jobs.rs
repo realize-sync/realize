@@ -3,20 +3,25 @@ use super::types::JobAction;
 use crate::rpc::HouseholdOperationError;
 use crate::rpc::{ExecutionMode, Household};
 use fast_rsync::ApplyError;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use realize_storage::{
     Blob, CacheStatus, FileContent, JobId, JobStatus, RemoteAvailability, Storage, StorageError,
 };
 use realize_types::{Arena, ByteRanges, Hash, Path, Signature};
 use std::io::SeekFrom;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum byterange to sync with rsync. This is also the worst-case
 /// size of the Delta to send back, so must be something that fits
 /// reasonably well into one message without slowing everything down.
 const RSYNC_BLOCK_SIZE: usize = 32 * 1024; // 32K
+
+/// A large timeout used on household operations in case they get stuck.
+const HOUSEHOLD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum JobError {
@@ -34,6 +39,12 @@ pub(crate) enum JobError {
 
     #[error("Hashes inconsistent after repair")]
     InconsistentHash,
+
+    #[error("Timed out")]
+    Timeout,
+
+    #[error("Cancelled")]
+    Cancelled,
 }
 
 /// Make a local copy of a specific version of a remote file.
@@ -123,10 +134,11 @@ async fn write_to_blob(
     if missing.is_empty() {
         return Ok(JobStatus::Done);
     }
-    let total_bytes = missing.bytecount();
-    let mut current_bytes: u64 = 0;
+    let total_bytes = blob.size();
+    let missing_bytes = missing.bytecount();
+    let mut current_bytes: u64 = total_bytes - missing_bytes;
     progress.update_action(JobAction::Download);
-    progress.update(0, total_bytes);
+    progress.update(current_bytes, total_bytes);
     let arena = avail.arena;
     log::debug!("[{arena}] Job #{job_id} Blob incomplete; Download {missing}");
 
@@ -140,13 +152,9 @@ async fn write_to_blob(
             Some(range.bytecount()),
         )?;
 
-        while let Some(chunk) = tokio::select!(
-            res = stream.next() => {res}
-            _ = shutdown.cancelled() => {
-                return Ok(JobStatus::Cancelled);
-            }
-        ) {
-            let (chunk_offset, chunk) = chunk?;
+        while let Some((chunk_offset, chunk)) =
+            run_household_cmd(stream.next().map(|r| r.transpose()), &shutdown).await?
+        {
             blob.update(chunk_offset, &chunk).await?;
 
             current_bytes += chunk.len() as u64;
@@ -175,7 +183,7 @@ pub(crate) async fn verify(
     let verified = tokio::select!(
     res = blob.verify() => { res? },
     _ = shutdown.cancelled() => {
-        return Ok(JobStatus::Cancelled);
+        return Err(JobError::Cancelled);
     });
     if verified {
         log::debug!(
@@ -208,12 +216,18 @@ pub(crate) async fn verify(
         assert_eq!(range_len, limited_buf.len());
 
         let sig = Signature(fast_rsync::Signature::calculate(limited_buf, opts).into_serialized());
-        let delta = tokio::select!(
-            res = household.rsync(avail.peers.clone(), ExecutionMode::Batch, arena, &avail.path, &range, sig) => {res?},
-            _ = shutdown.cancelled() => {
-                return Ok(JobStatus::Cancelled);
-            }
-        );
+        let delta = run_household_cmd(
+            household.rsync(
+                avail.peers.clone(),
+                ExecutionMode::Batch,
+                arena,
+                &avail.path,
+                &range,
+                sig,
+            ),
+            &shutdown,
+        )
+        .await?;
         fixed_buf.clear();
         fast_rsync::apply_limited(limited_buf, delta.0.as_slice(), &mut fixed_buf, range_len)?;
         assert_eq!(range_len, fixed_buf.len());
@@ -227,7 +241,7 @@ pub(crate) async fn verify(
     let verified = tokio::select!(
     res = blob.verify() => { res? },
     _ = shutdown.cancelled() => {
-        return Ok(JobStatus::Cancelled);
+        return Err(JobError::Cancelled);
     });
     if !verified {
         log::debug!(
@@ -242,6 +256,33 @@ pub(crate) async fn verify(
     );
 
     Ok(JobStatus::Done)
+}
+
+/// Safely run a household command.
+///
+/// This function takes care of interrupting or timing out household
+/// commands which can take a long time to return, depending on
+/// the peer connection.
+///
+/// All calls to household commands that can fail called from this
+/// file MUST be wrapped inside of this function.
+async fn run_household_cmd<T>(
+    fut: impl Future<Output = Result<T, HouseholdOperationError>>,
+    shutdown: &CancellationToken,
+) -> Result<T, JobError> {
+    tokio::select!(
+        res = time::timeout(HOUSEHOLD_TIMEOUT, fut) => {
+            match res {
+                Err(_) => {
+                    return Err(JobError::Timeout)
+                }
+                Ok(res) => res.map_err(|e| JobError::from(e)),
+            }
+        }
+        _ = shutdown.cancelled() => {
+            return Err(JobError::Cancelled);
+        }
+    )
 }
 
 #[cfg(test)]
@@ -708,8 +749,7 @@ mod tests {
                 let cancelled_token = CancellationToken::new();
                 cancelled_token.cancel();
 
-                assert_eq!(
-                    JobStatus::Cancelled,
+                assert!(matches!(
                     download(
                         fixture.inner.storage(a)?,
                         &household_a,
@@ -720,8 +760,9 @@ mod tests {
                         &mut NoOpByteCountProgress,
                         cancelled_token,
                     )
-                    .await?
-                );
+                    .await,
+                    Err(JobError::Cancelled)
+                ));
 
                 let blob = fixture.open_file(a, "foobar").await?;
                 assert!(blob.available_range().is_empty());
@@ -827,9 +868,9 @@ mod tests {
                     )
                     .await?,
                 );
-                // 18 = "baa, baa, black sheep".len() - 3 already written
-                assert_eq!(18, progress.current_bytes);
-                assert_eq!(18, progress.total_bytes);
+                // 18 = "baa, baa, black sheep".len()
+                assert_eq!(21, progress.current_bytes);
+                assert_eq!(21, progress.total_bytes);
 
                 // Verify that update_action was called
                 assert_eq!(

@@ -235,6 +235,8 @@ async fn background_job<H: JobHandler>(
                         Ok(status) => Ok(status),
                         Err(JobError::Household(HouseholdOperationError::NoPeers))  => Ok(JobStatus::NoPeers),
                         Err(JobError::Household(HouseholdOperationError::Disconnected))  => Ok(JobStatus::NoPeers),
+                        Err(JobError::Timeout) => Ok(JobStatus::NoPeers),
+                        Err(JobError::Cancelled) => Ok(JobStatus::Cancelled),
                         Err(JobError::Storage(StorageError::InvalidBlobState))  => Ok(JobStatus::Abandoned("invalid blob state")),
                         Err(err) => {
                             if shutdown.is_cancelled() {
