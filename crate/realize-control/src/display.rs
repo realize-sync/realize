@@ -20,8 +20,9 @@ pub(crate) struct ChurtenDisplay {
 }
 
 impl ChurtenDisplay {
-    pub(crate) fn new(output_mode: OutputMode) -> Self {
-        let tracker = JobInfoTracker::new(16);
+    pub(crate) fn new(output_mode: OutputMode, initial: Vec<JobInfo>) -> Self {
+        let mut tracker = JobInfoTracker::new(16);
+        tracker.init(initial);
         let multi = MultiProgress::with_draw_target(if output_mode == OutputMode::Progress {
             ProgressDrawTarget::stdout()
         } else {

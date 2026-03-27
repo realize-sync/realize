@@ -442,7 +442,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
                 .await
                 .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-            let mut job_list = results.get().init_res(all_jobs.len() as u32);
+            let mut job_list = results.get().init_jobs(all_jobs.len() as u32);
             for (i, job_info) in all_jobs.into_iter().enumerate() {
                 convert::fill_job_info(&job_info, job_list.reborrow().get(i as u32));
             }
@@ -851,7 +851,7 @@ mod tests {
                 // The job should be listed right away, whether or not
                 // it has been picked up by churten.
                 let all_jobs_result = churten.all_jobs_request().send().promise.await?;
-                let jobs = all_jobs_result.get()?.get_res()?;
+                let jobs = all_jobs_result.get()?.get_jobs()?;
 
                 assert_eq!(jobs.len(), 1);
 
@@ -881,7 +881,7 @@ mod tests {
                 }
 
                 let all_jobs_result = churten.all_jobs_request().send().promise.await?;
-                let jobs = all_jobs_result.get()?.get_res()?;
+                let jobs = all_jobs_result.get()?.get_jobs()?;
                 assert_eq!(jobs.len(), 0);
 
                 // Shutdown churten
@@ -964,7 +964,7 @@ mod tests {
 
                 // Make sure it's listed with the right status
                 let all_jobs_result = churten.all_jobs_request().send().promise.await?;
-                let jobs = all_jobs_result.get()?.get_res()?;
+                let jobs = all_jobs_result.get()?.get_jobs()?;
 
                 assert_eq!(jobs.len(), 1);
 

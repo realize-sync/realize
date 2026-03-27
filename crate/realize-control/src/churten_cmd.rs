@@ -68,10 +68,11 @@ pub(crate) async fn execute_churten_connect(
     churten.start_request().send().promise.await?;
 
     let rx = client::subscribe_to_churten(&churten).await?;
+    let jobs = client::all_jobs(&churten).await?;
 
     // Run in a normal Tokio environmen, outside LocalSet).
     task::spawn(async move {
-        let mut display = ChurtenDisplay::new(output_mode);
+        let mut display = ChurtenDisplay::new(output_mode, jobs);
         let res = connect(&mut display, rx, shutdown).await;
         display.finished().await;
 

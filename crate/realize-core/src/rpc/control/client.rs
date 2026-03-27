@@ -48,6 +48,20 @@ pub async fn subscribe_to_churten(
     Ok(rx)
 }
 
+/// Subscribe to churten and get a stream of [ChurtenUpdates].
+pub async fn all_jobs(
+    churten: &control_capnp::churten::Client,
+) -> Result<Vec<JobInfo>, capnp::Error> {
+    let res = churten.all_jobs_request().send().promise.await?;
+    let job_list = res.get()?.get_jobs()?;
+    let mut job_vec = Vec::with_capacity(job_list.len() as usize);
+    for i in 0..job_list.len() {
+        job_vec.push(parse_job_info(job_list.get(i as u32))?);
+    }
+
+    Ok(job_vec)
+}
+
 /// Updates to churten, running in another process.
 #[derive(Clone, PartialEq, Debug)]
 pub enum ChurtenUpdates {

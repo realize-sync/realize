@@ -44,7 +44,7 @@ interface Churten {
   start @1 () -> ();
   shutdown @2 () -> ();
   isRunning @3 () -> (running: Bool);
-  allJobs @4 () -> (res: List(JobInfo)); # List pending, active and failed jobs.
+  allJobs @4 () -> (jobs: List(JobInfo)); # List pending, active and failed jobs.
 
   interface Subscriber {
     notify @0 (notification: ChurtenNotification) -> stream;
