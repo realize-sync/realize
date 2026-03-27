@@ -1,9 +1,10 @@
 use super::db::ArenaDatabase;
 use super::engine::{Engine, StorageJob};
 use super::types::LruQueueId;
-use crate::arena::blob::BlobExt;
+use crate::arena::blob::{BlobExt, BlobReadOperations};
 use crate::arena::cache::CacheReadOperations;
 use crate::arena::tree::TreeExt;
+use crate::arena::types::BlobId;
 use crate::types::PathId;
 use crate::{JobId, JobStatus, StorageError, Version};
 use realize_types::Hash;
@@ -156,9 +157,27 @@ impl StorageJobProcessor {
         // file is moved/deleted and the database is not updated it
         // would look like the user deleted the file, which then might
         // be propagated to other peers.
-        log::debug!("[{tag}] Rename {realpath:?} to {cachepath:?}");
-        std::fs::rename(&realpath, cachepath)?;
-
+        //
+        // We open a new write transaction to prevent other parts of
+        // the code from running - especially cache eviction. The
+        // check for existence is there to make sure the blob was not
+        // already evicted.
+        let txn = self.db.begin_write()?;
+        {
+            let blobs = txn.read_blobs()?;
+            if blobs
+                .get_with_blobid(BlobId::from_pathid(pathid))?
+                .is_some_and(|b| b.version.matches_hash(&hash))
+            {
+                log::debug!("[{tag}] Rename {realpath:?} to {cachepath:?}");
+                std::fs::rename(&realpath, cachepath)?;
+            } else {
+                log::debug!(
+                    "[{tag}] Drop {realpath:?} instead of unrealize (blob was evicted from cache)"
+                );
+                std::fs::remove_file(&realpath)?;
+            }
+        }
         log::info!("[{tag}] Unrealized pathid {pathid} {hash} from {realpath:?}",);
 
         return Ok(JobStatus::Done);
