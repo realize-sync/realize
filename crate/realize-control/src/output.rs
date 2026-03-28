@@ -201,48 +201,8 @@ pub(crate) fn progress_style(msg: MessageType, with_bytes: bool) -> ProgressStyl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indicatif::InMemoryTerm;
-
-    fn forced_style<T: AsRef<str>>(val: T) -> StyledObject<T> {
-        style(val).force_styling(true)
-    }
-
-    struct Fixture {
-        actual: InMemoryTerm,
-        expected: InMemoryTerm,
-        output: Output,
-    }
-
-    impl Fixture {
-        fn setup(mode: OutputMode) -> anyhow::Result<Self> {
-            let _ = env_logger::try_init();
-            let actual = InMemoryTerm::new(24, 80);
-            let expected = InMemoryTerm::new(24, 80);
-            let mut output = Output::new(
-                mode,
-                Some(Box::new(actual.clone())),
-                Some(Box::new(actual.clone())),
-            );
-            output.set_stdout_style(true);
-            output.set_stderr_style(true);
-
-            Ok(Self {
-                actual,
-                expected,
-                output,
-            })
-        }
-
-        /// Return the actual terminal content.
-        fn actual(&self) -> String {
-            String::from_utf8(self.actual.contents_formatted()).unwrap()
-        }
-
-        /// Return the expected terminal content
-        fn expected(&self) -> String {
-            String::from_utf8(self.expected.contents_formatted()).unwrap()
-        }
-    }
+    use crate::testing::OutputFixture;
+    use crate::testing::forced_style;
 
     #[test]
     fn default_quiet() -> anyhow::Result<()> {
@@ -281,7 +241,7 @@ mod tests {
 
     #[test]
     fn print_success() -> anyhow::Result<()> {
-        let fixture = Fixture::setup(OutputMode::Progress)?;
+        let fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.print_success("OK", "This is a test");
 
         fixture.expected.write_line(&format!(
@@ -295,7 +255,7 @@ mod tests {
 
     #[test]
     fn print_success_no_style() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        let mut fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.set_stdout_style(false);
         fixture.output.print_success("OK", "This is a test");
 
@@ -307,7 +267,7 @@ mod tests {
 
     #[test]
     fn print_warning() -> anyhow::Result<()> {
-        let fixture = Fixture::setup(OutputMode::Progress)?;
+        let fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.print_warning("WARN", "This is a test");
 
         fixture.expected.write_line(&format!(
@@ -321,7 +281,7 @@ mod tests {
 
     #[test]
     fn print_warning_no_style() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        let mut fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.set_stderr_style(false);
         fixture.output.print_warning("WARN", "This is a test");
 
@@ -333,7 +293,7 @@ mod tests {
 
     #[test]
     fn print_progress() -> anyhow::Result<()> {
-        let fixture = Fixture::setup(OutputMode::Progress)?;
+        let fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.print_progress("Download", "This is a test");
 
         fixture.expected.write_line(&format!(
@@ -347,7 +307,7 @@ mod tests {
 
     #[test]
     fn print_progress_no_style() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        let mut fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.set_stdout_style(false);
         fixture.output.print_success("Download", "This is a test");
 
@@ -359,7 +319,7 @@ mod tests {
 
     #[test]
     fn print_error() -> anyhow::Result<()> {
-        let fixture = Fixture::setup(OutputMode::Progress)?;
+        let fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.print_error("This is a test");
 
         fixture.expected.write_line(&format!(
@@ -373,7 +333,7 @@ mod tests {
 
     #[test]
     fn print_error_no_style() -> anyhow::Result<()> {
-        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        let mut fixture = OutputFixture::setup(OutputMode::Progress)?;
         fixture.output.set_stderr_style(false);
         fixture.output.print_error("This is a test");
 

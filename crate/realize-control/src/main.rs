@@ -13,9 +13,10 @@ mod arena_cmd;
 mod attr_cmd;
 mod churten_cmd;
 mod display;
-
 mod output;
 mod peer_cmd;
+#[cfg(test)]
+mod testing;
 
 /// Command-line tool for controlling a running instance of realize-daemon
 #[derive(Parser, Debug)]
