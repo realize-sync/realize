@@ -1,7 +1,7 @@
 #![allow(dead_code)] // WIP
 
 use clap::ValueEnum;
-use console::{Term, style};
+use console::{StyledObject, Term, style};
 use indicatif::{ProgressStyle, TermLike};
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub(crate) struct Output {
     mode: OutputMode,
     stdout: Option<Box<dyn TermLike>>,
     stderr: Option<Box<dyn TermLike>>,
+    stdout_style: bool,
+    stderr_style: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -59,7 +61,21 @@ impl Output {
             mode,
             stdout,
             stderr,
+            stdout_style: console::colors_enabled(),
+            stderr_style: console::colors_enabled_stderr(),
         }
+    }
+
+    /// Enable or disable style on stdout, ignoring automatic
+    /// detection.
+    pub(crate) fn set_stdout_style(&mut self, enabled: bool) {
+        self.stdout_style = enabled;
+    }
+
+    /// Enable or disable style on stderr, ignoring automatic
+    /// detection.
+    pub(crate) fn set_stderr_style(&mut self, enabled: bool) {
+        self.stderr_style = enabled;
     }
 
     /// Returns the current output mode.
@@ -73,7 +89,7 @@ impl Output {
         let msg = msg.as_ref();
         log::warn!("{tag} {msg}");
         if let Some(term) = &self.stderr {
-            let tag = style(tag).for_stderr().yellow().bold();
+            let tag = self.for_stderr(tag).warn();
             let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
@@ -84,7 +100,7 @@ impl Output {
         let msg = msg.as_ref();
         log::warn!("{tag} {msg}");
         if let Some(term) = &self.stdout {
-            let tag = style(tag).for_stdout().cyan().bold();
+            let tag = self.for_stdout(tag).progress();
             let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
@@ -94,7 +110,7 @@ impl Output {
         let msg = msg.as_ref();
         log::error!("{msg}");
         if let Some(term) = &self.stderr {
-            let tag = style("ERROR").for_stderr().red().bold();
+            let tag = self.for_stderr("ERROR").error();
             let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
@@ -105,7 +121,7 @@ impl Output {
         let msg = msg.as_ref();
         log::info!("{tag} {msg}");
         if let Some(term) = &self.stdout {
-            let tag = style(tag).for_stdout().green().bold();
+            let tag = self.for_stdout(tag).success();
             let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
@@ -118,8 +134,43 @@ impl Output {
             let _ = term.write_line(msg);
         }
     }
+
+    /// Build a [StyledObject] appropriate for stdout.
+    pub(crate) fn for_stdout<T: AsRef<str>>(&self, val: T) -> StyledObject<T> {
+        style(val).force_styling(self.stdout_style)
+    }
+
+    /// Build a [StyledObject] appropriate for stderr.
+    pub(crate) fn for_stderr<T: AsRef<str>>(&self, val: T) -> StyledObject<T> {
+        style(val).force_styling(self.stderr_style)
+    }
 }
 
+/// Extends StyledObject with application-specific styles.
+trait StyledObjectExt<T: AsRef<str>> {
+    fn success(self) -> StyledObject<T>;
+    fn warn(self) -> StyledObject<T>;
+    fn progress(self) -> StyledObject<T>;
+    fn error(self) -> StyledObject<T>;
+}
+
+impl<T: AsRef<str>> StyledObjectExt<T> for StyledObject<T> {
+    fn success(self) -> StyledObject<T> {
+        self.green().bold()
+    }
+
+    fn warn(self) -> StyledObject<T> {
+        self.yellow().bold()
+    }
+
+    fn progress(self) -> StyledObject<T> {
+        self.cyan().bold()
+    }
+
+    fn error(self) -> StyledObject<T> {
+        self.red().bold()
+    }
+}
 /// Build a progress bar style.
 ///
 /// Formatting is compatible with success/warning/error messages
@@ -145,4 +196,190 @@ pub(crate) fn progress_style(msg: MessageType, with_bytes: bool) -> ProgressStyl
     })
     .unwrap()
     .progress_chars("=> ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indicatif::InMemoryTerm;
+
+    fn forced_style<T: AsRef<str>>(val: T) -> StyledObject<T> {
+        style(val).force_styling(true)
+    }
+
+    struct Fixture {
+        actual: InMemoryTerm,
+        expected: InMemoryTerm,
+        output: Output,
+    }
+
+    impl Fixture {
+        fn setup(mode: OutputMode) -> anyhow::Result<Self> {
+            let _ = env_logger::try_init();
+            let actual = InMemoryTerm::new(24, 80);
+            let expected = InMemoryTerm::new(24, 80);
+            let mut output = Output::new(
+                mode,
+                Some(Box::new(actual.clone())),
+                Some(Box::new(actual.clone())),
+            );
+            output.set_stdout_style(true);
+            output.set_stderr_style(true);
+
+            Ok(Self {
+                actual,
+                expected,
+                output,
+            })
+        }
+
+        /// Return the actual terminal content.
+        fn actual(&self) -> String {
+            String::from_utf8(self.actual.contents_formatted()).unwrap()
+        }
+
+        /// Return the expected terminal content
+        fn expected(&self) -> String {
+            String::from_utf8(self.expected.contents_formatted()).unwrap()
+        }
+    }
+
+    #[test]
+    fn default_quiet() -> anyhow::Result<()> {
+        let output = Output::default(OutputMode::Quiet);
+        assert!(output.stdout.is_none());
+        assert!(output.stderr.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn default_plain() -> anyhow::Result<()> {
+        let output = Output::default(OutputMode::Plain);
+        assert!(output.stdout.is_some());
+        assert!(output.stderr.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_progress() -> anyhow::Result<()> {
+        let output = Output::default(OutputMode::Progress);
+        assert!(output.stdout.is_some());
+        assert!(output.stderr.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn default_log() -> anyhow::Result<()> {
+        let output = Output::default(OutputMode::Log);
+        assert!(output.stdout.is_none());
+        assert!(output.stderr.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_success() -> anyhow::Result<()> {
+        let fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.print_success("OK", "This is a test");
+
+        fixture.expected.write_line(&format!(
+            "{} This is a test",
+            forced_style("OK").green().bold()
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_success_no_style() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.set_stdout_style(false);
+        fixture.output.print_success("OK", "This is a test");
+
+        fixture.expected.write_line("OK This is a test")?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_warning() -> anyhow::Result<()> {
+        let fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.print_warning("WARN", "This is a test");
+
+        fixture.expected.write_line(&format!(
+            "{} This is a test",
+            forced_style("WARN").yellow().bold()
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_warning_no_style() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.set_stderr_style(false);
+        fixture.output.print_warning("WARN", "This is a test");
+
+        fixture.expected.write_line("WARN This is a test")?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_progress() -> anyhow::Result<()> {
+        let fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.print_progress("Download", "This is a test");
+
+        fixture.expected.write_line(&format!(
+            "{} This is a test",
+            forced_style("Download").cyan().bold()
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_progress_no_style() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.set_stdout_style(false);
+        fixture.output.print_success("Download", "This is a test");
+
+        fixture.expected.write_line("Download This is a test")?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_error() -> anyhow::Result<()> {
+        let fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.print_error("This is a test");
+
+        fixture.expected.write_line(&format!(
+            "{} This is a test",
+            forced_style("ERROR").red().bold()
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn print_error_no_style() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup(OutputMode::Progress)?;
+        fixture.output.set_stderr_style(false);
+        fixture.output.print_error("This is a test");
+
+        fixture.expected.write_line("ERROR This is a test")?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
 }
