@@ -1,3 +1,5 @@
+use crate::output::Output;
+
 use super::output::{self, MessageType, OutputMode};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
 use realize_core::consensus::tracker::{JobInfo, JobInfoTracker};
@@ -7,8 +9,8 @@ use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::collections::HashMap;
 
-pub(crate) struct ChurtenDisplay {
-    output_mode: OutputMode,
+pub(crate) struct ChurtenDisplay<'a> {
+    output: &'a Output,
     tracker: JobInfoTracker,
     multi: MultiProgress,
     overall_bar: ProgressBar,
@@ -19,20 +21,30 @@ pub(crate) struct ChurtenDisplay {
     had_jobs: bool,
 }
 
-impl ChurtenDisplay {
-    pub(crate) fn new(output_mode: OutputMode, initial: Vec<JobInfo>) -> Self {
-        let mut tracker = JobInfoTracker::new(16);
-        tracker.init(initial);
-        let multi = MultiProgress::with_draw_target(if output_mode == OutputMode::Progress {
+impl<'a> ChurtenDisplay<'a> {
+    pub(crate) fn default(output: &'a Output, initial: Vec<JobInfo>) -> Self {
+        let target = if output.mode() == OutputMode::Progress {
             ProgressDrawTarget::stdout()
         } else {
             ProgressDrawTarget::hidden()
-        });
+        };
+
+        Self::new(output, initial, target)
+    }
+
+    pub(crate) fn new(
+        output: &'a Output,
+        initial: Vec<JobInfo>,
+        target: ProgressDrawTarget,
+    ) -> Self {
+        let mut tracker = JobInfoTracker::new(16);
+        tracker.init(initial);
+        let multi = MultiProgress::with_draw_target(target);
         let overall_bar = multi.add(ProgressBar::no_length());
         update_overall_bar(&overall_bar, tracker.active_len());
 
         Self {
-            output_mode,
+            output,
             tracker,
             multi,
             overall_bar,
@@ -50,7 +62,7 @@ impl ChurtenDisplay {
             ChurtenUpdates::Reset(jobs) => {
                 let total = jobs.len();
                 log_jobs(&jobs, total);
-                if self.output_mode == OutputMode::Progress {
+                if self.output.mode() == OutputMode::Progress {
                     self.init_bars(&jobs);
                 }
                 self.tracker.init(jobs);
@@ -61,7 +73,7 @@ impl ChurtenDisplay {
                 }
 
                 self.log_notification(&n); // log in all modes
-                match self.output_mode {
+                match self.output.mode() {
                     OutputMode::Log => {}
                     OutputMode::Progress => self.update_bar_from_notification(&n),
                     OutputMode::Plain => {
@@ -82,19 +94,14 @@ impl ChurtenDisplay {
                 JobProgress::Pending | JobProgress::Done => {}
                 JobProgress::Failed(msg) => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
-                        output::print_error(
-                            self.output_mode,
-                            format!("{}: {}", display_path(job), msg),
-                        );
+                        self.output
+                            .print_error(format!("{}: {}", display_path(job), msg));
                     }
                 }
                 _ => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
-                        output::print_warning(
-                            self.output_mode,
-                            format!("{progress:?}"),
-                            display_path(job),
-                        );
+                        self.output
+                            .print_warning(format!("{progress:?}"), display_path(job));
                     }
                 }
             },
@@ -108,11 +115,8 @@ impl ChurtenDisplay {
             ChurtenNotification::Finish { progress, .. } => match progress {
                 JobProgress::Done => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
-                        output::print_success(
-                            self.output_mode,
-                            finished_job_name(job),
-                            display_path(job),
-                        );
+                        self.output
+                            .print_success(finished_job_name(job), display_path(job));
                     }
                 }
                 _ => {}
@@ -126,17 +130,14 @@ impl ChurtenDisplay {
             ChurtenNotification::New { .. } => {
                 if !self.had_jobs && self.tracker.has_active_jobs() {
                     self.had_jobs = true;
-                    output::print_progress(self.output_mode, "Processing", "...");
+                    self.output.print_progress("Processing", "...");
                 }
             }
             ChurtenNotification::Finish { .. } => {
                 if self.had_jobs && !self.tracker.has_active_jobs() {
                     self.had_jobs = false;
-                    output::print_progress(
-                        self.output_mode,
-                        "Waiting",
-                        "for more jobs. Press Ctrl-C to stop",
-                    );
+                    self.output
+                        .print_progress("Waiting", "for more jobs. Press Ctrl-C to stop");
                 }
             }
             _ => {}

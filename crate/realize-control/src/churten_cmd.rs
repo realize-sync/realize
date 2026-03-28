@@ -1,5 +1,5 @@
 use super::display::ChurtenDisplay;
-use super::output::{self, OutputMode};
+use crate::output::{Output, OutputMode};
 use anyhow::Result;
 use realize_core::rpc::control::client;
 use realize_core::rpc::control::client::ChurtenUpdates;
@@ -12,11 +12,11 @@ use tokio_util::sync::CancellationToken;
 /// Execute the churten start command
 pub(crate) async fn execute_churten_start(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let churten = client::get_churten(&control).await?;
     churten.start_request().send().promise.await?;
-    output::print_success(output_mode, "OK", "Churten started");
+    output.print_success("OK", "Churten started");
 
     Ok(0)
 }
@@ -24,11 +24,11 @@ pub(crate) async fn execute_churten_start(
 /// Execute the churten stop command
 pub(crate) async fn execute_churten_stop(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let churten = client::get_churten(&control).await?;
     churten.shutdown_request().send().promise.await?;
-    output::print_success(output_mode, "OK", "Churten stopped");
+    output.print_success("OK", "Churten stopped");
 
     Ok(0)
 }
@@ -36,13 +36,13 @@ pub(crate) async fn execute_churten_stop(
 /// Execute the churten is_running command
 pub(crate) async fn execute_churten_is_running(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let churten = client::get_churten(&control).await?;
     let is_running_result = churten.is_running_request().send().promise.await?;
     let is_running = is_running_result.get()?.get_running();
-    output::print_info(output_mode, format!("{}", is_running));
-    if output_mode == OutputMode::Quiet {
+    output.print_info(format!("{}", is_running));
+    if output.mode() == OutputMode::Quiet {
         if is_running { Ok(0) } else { Ok(10) }
     } else {
         Ok(0)
@@ -52,7 +52,7 @@ pub(crate) async fn execute_churten_is_running(
 /// Execute the churten connect command
 pub(crate) async fn execute_churten_connect(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let shutdown = CancellationToken::new();
     task::spawn({
@@ -70,23 +70,18 @@ pub(crate) async fn execute_churten_connect(
     let rx = client::subscribe_to_churten(&churten).await?;
     let jobs = client::all_jobs(&churten).await?;
 
-    // Run in a normal Tokio environmen, outside LocalSet).
-    task::spawn(async move {
-        let mut display = ChurtenDisplay::new(output_mode, jobs);
-        let res = connect(&mut display, rx, shutdown).await;
-        display.finished().await;
+    let mut display = ChurtenDisplay::default(output, jobs);
+    let res = connect(&mut display, rx, shutdown).await;
+    display.finished().await;
+    res?;
 
-        res
-    })
-    .await??;
-
-    output::print_info(output_mode, "Churten stopped");
+    output.print_info("Churten stopped");
 
     Ok(0)
 }
 
 async fn connect(
-    display: &mut ChurtenDisplay,
+    display: &mut ChurtenDisplay<'_>,
     mut rx: mpsc::Receiver<ChurtenUpdates>,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {

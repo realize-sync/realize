@@ -1,4 +1,4 @@
-use super::output::{self, OutputMode};
+use crate::output::Output;
 use anyhow::Result;
 use realize_core::rpc::control::control_capnp;
 use realize_core::rpc::result_capnp;
@@ -6,7 +6,7 @@ use realize_core::rpc::result_capnp;
 /// Execute the attr list command
 pub(crate) async fn execute_attr_list(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     arena: &str,
     paths: &Vec<String>,
 ) -> Result<i32> {
@@ -32,11 +32,11 @@ pub(crate) async fn execute_attr_list(
                     }
                     msg.push_str(attr?.to_str()?);
                 }
-                output::print_info(output_mode, msg);
+                output.print_info(msg);
             }
             result_capnp::result::Which::Err(err) => {
                 has_errors = true;
-                handle_error(output_mode, arena, path, "", err?)?;
+                handle_error(output, arena, path, "", err?)?;
             }
         }
     }
@@ -47,7 +47,7 @@ pub(crate) async fn execute_attr_list(
 /// Execute the attr get command
 pub(crate) async fn execute_attr_get(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     attr: &str,
     arena: &str,
     paths: &Vec<String>,
@@ -66,15 +66,12 @@ pub(crate) async fn execute_attr_get(
         match response.which()? {
             result_capnp::result::Which::Ok(response) => {
                 let value = response?.get_value()?.to_str()?;
-                output::print_info(
-                    output_mode,
-                    format!("{}: {attr}={value}", msg_tag(arena, path)),
-                );
+                output.print_info(format!("{}: {attr}={value}", msg_tag(arena, path)));
             }
             result_capnp::result::Which::Err(err) => {
                 let err = err?;
                 has_errors = true;
-                handle_error(output_mode, arena, path, attr, err)?;
+                handle_error(output, arena, path, attr, err)?;
             }
         }
     }
@@ -85,7 +82,7 @@ pub(crate) async fn execute_attr_get(
 /// Execute the attr set command
 pub(crate) async fn execute_attr_set(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     attr: &str,
     value: &str,
     arena: &str,
@@ -105,16 +102,12 @@ pub(crate) async fn execute_attr_set(
 
         match response.which()? {
             result_capnp::result::Which::Ok(_) => {
-                output::print_success(
-                    output_mode,
-                    "OK",
-                    &format!("{}: attribute set", msg_tag(arena, path)),
-                );
+                output.print_success("OK", &format!("{}: attribute set", msg_tag(arena, path)));
             }
             result_capnp::result::Which::Err(err) => {
                 let err = err?;
                 has_errors = true;
-                handle_error(output_mode, arena, path, attr, err)?;
+                handle_error(output, arena, path, attr, err)?;
             }
         }
     }
@@ -176,7 +169,7 @@ fn msg_tag(arena: &str, path: &str) -> String {
 
 /// Handle AttrErrors from capnp.
 fn handle_error(
-    output_mode: OutputMode,
+    output: &Output,
     arena: &str,
     path: &str,
     attrname: &str,
@@ -184,19 +177,16 @@ fn handle_error(
 ) -> Result<(), anyhow::Error> {
     match err.which()? {
         control_capnp::attr_error::Which::NoSuchAttribute(_) => {
-            output::print_error(
-                output_mode,
-                format!("{}: no such attribute '{attrname}'", msg_tag(arena, path)),
-            );
+            output.print_error(format!(
+                "{}: no such attribute '{attrname}'",
+                msg_tag(arena, path)
+            ));
         }
         control_capnp::attr_error::Which::InvalidAttributeValue(_) => {
-            output::print_error(
-                output_mode,
-                format!(
-                    "{}: invalid value for attribute '{attrname}'",
-                    msg_tag(arena, path)
-                ),
-            );
+            output.print_error(format!(
+                "{}: invalid value for attribute '{attrname}'",
+                msg_tag(arena, path)
+            ));
         }
         control_capnp::attr_error::Which::UnknownArena(_) => {
             // It's not worth it to continue to process other paths;
@@ -204,10 +194,7 @@ fn handle_error(
             anyhow::bail!("unknown arena '{arena}'")
         }
         control_capnp::attr_error::Which::PathNotFound(_) => {
-            output::print_error(
-                output_mode,
-                format!("{}: path not found", msg_tag(arena, path)),
-            );
+            output.print_error(format!("{}: path not found", msg_tag(arena, path)));
         }
     };
 

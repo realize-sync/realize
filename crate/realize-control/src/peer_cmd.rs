@@ -1,18 +1,18 @@
-use super::output::{self, OutputMode};
+use crate::output::Output;
 use anyhow::Result;
 use realize_core::rpc::control::control_capnp;
 
 /// Execute the peer query command
 pub(crate) async fn execute_peer_query(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let request = control.list_peers_request();
     let result = request.send().promise.await?;
     let peers = result.get()?.get_res()?;
 
     if peers.len() == 0 {
-        output::print_info(output_mode, "No peers found");
+        output.print_info("No peers found");
     } else {
         for i in 0..peers.len() {
             let peer_info = peers.get(i);
@@ -28,7 +28,7 @@ pub(crate) async fn execute_peer_query(
                 "disconnected"
             };
 
-            output::print_info(output_mode, format!("{peer}: {status}"));
+            output.print_info(format!("{peer}: {status}"));
         }
     }
 
@@ -39,13 +39,13 @@ pub(crate) async fn execute_peer_query(
 pub(crate) async fn execute_peer_connect(
     control: &control_capnp::control::Client,
     peer: &str,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let mut request = control.keep_connected_request();
     request.get().set_peer(peer);
     request.send().promise.await?;
 
-    output::print_success(output_mode, "OK", format!("Connecting to peer: {peer}"));
+    output.print_success("OK", format!("Connecting to peer: {peer}"));
     Ok(0)
 }
 
@@ -53,12 +53,12 @@ pub(crate) async fn execute_peer_connect(
 pub(crate) async fn execute_peer_disconnect(
     control: &control_capnp::control::Client,
     peer: &str,
-    output_mode: OutputMode,
+    output: &Output,
 ) -> Result<i32> {
     let mut request = control.disconnect_request();
     request.get().set_peer(peer);
     request.send().promise.await?;
 
-    output::print_success(output_mode, "OK", format!("Disconnected from peer: {peer}"));
+    output.print_success("OK", format!("Disconnected from peer: {peer}"));
     Ok(0)
 }

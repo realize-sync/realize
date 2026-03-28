@@ -1,4 +1,4 @@
-use super::output::{self, OutputMode};
+use crate::output::Output;
 use anyhow::Result;
 use realize_core::rpc::{control::control_capnp, result_capnp};
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -6,7 +6,7 @@ use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
 /// Execute the peer query command
 pub(crate) async fn execute_arena_create(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     name: &str,
     path: &std::path::Path,
 ) -> Result<i32> {
@@ -19,12 +19,12 @@ pub(crate) async fn execute_arena_create(
     // TODO: display errors and warnings
     match result.get()?.get_res()?.which()? {
         result_capnp::result::Which::Ok(_) => {
-            output::print_success(output_mode, "OK", "Arena {name} created locally");
+            output.print_success("OK", "Arena {name} created locally");
 
             Ok(0)
         }
         result_capnp::result::Which::Err(_) => {
-            output::print_error(output_mode, "Failed to create arena {name}");
+            output.print_error("Failed to create arena {name}");
 
             Ok(1)
         }
@@ -34,7 +34,7 @@ pub(crate) async fn execute_arena_create(
 /// Execute the peer query command
 pub(crate) async fn execute_arena_remove(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     name: &str,
     delete_files: bool,
     keep_database: bool,
@@ -63,33 +63,27 @@ pub(crate) async fn execute_arena_remove(
             {
                 if delete_files {
                     std::fs::remove_dir_all(&dir)?;
-                    output::print_success(
-                        output_mode,
-                        "OK",
-                        "Arena {name} removed and deleted from: {dir:?}",
-                    );
+                    output.print_success("OK", "Arena {name} removed and deleted from: {dir:?}");
                 } else if !keep_database {
                     std::fs::remove_dir_all(workdir)?;
-                    output::print_success(
-                        output_mode,
+                    output.print_success(
                         "OK",
                         "Arena {name} removed and database deleted.\n  Files available in {dir:?}",
                     );
                 } else {
-                    output::print_success(
-                        output_mode,
+                    output.print_success(
                         "OK",
                         "Arena {name} removed.\n  Files available in {dir:?}\n  Database available in {workdir:?}",
                     );
                 }
             } else {
-                output::print_warning(output_mode, "WARN", "Arena {name} did not exist");
+                output.print_warning("WARN", "Arena {name} did not exist");
             }
 
             Ok(0)
         }
         result_capnp::result::Which::Err(_) => {
-            output::print_error(output_mode, "Failed to delete arena {name}");
+            output.print_error("Failed to delete arena {name}");
 
             Ok(1)
         }
@@ -98,7 +92,7 @@ pub(crate) async fn execute_arena_remove(
 
 pub(crate) async fn execute_arena_empty_trash(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     name: Option<&str>,
 ) -> Result<i32> {
     let mut request = control.empty_trash_request();
@@ -109,13 +103,13 @@ pub(crate) async fn execute_arena_empty_trash(
     let _ = request.send().promise.await?;
 
     let name_str = name.unwrap_or("all arenas");
-    output::print_success(output_mode, "OK", format!("Trash emptied for {name_str}"));
+    output.print_success("OK", format!("Trash emptied for {name_str}"));
     Ok(0)
 }
 
 pub(crate) async fn execute_arena_empty_cache(
     control: &control_capnp::control::Client,
-    output_mode: OutputMode,
+    output: &Output,
     name: Option<&str>,
 ) -> Result<i32> {
     let mut request = control.empty_cache_request();
@@ -126,6 +120,6 @@ pub(crate) async fn execute_arena_empty_cache(
     let _ = request.send().promise.await?;
 
     let name_str = name.unwrap_or("all arenas");
-    output::print_success(output_mode, "OK", format!("Cache emptied for {name_str}"));
+    output.print_success("OK", format!("Cache emptied for {name_str}"));
     Ok(0)
 }

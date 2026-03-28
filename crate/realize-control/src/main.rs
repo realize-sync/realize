@@ -7,6 +7,8 @@ use realize_core::utils::logging;
 use std::path::PathBuf;
 use tokio::task::LocalSet;
 
+use crate::output::Output;
+
 mod arena_cmd;
 mod attr_cmd;
 mod churten_cmd;
@@ -195,12 +197,11 @@ async fn main() {
     if cli.output == OutputMode::Progress && !Term::stdout().is_term() {
         cli.output = OutputMode::Plain;
     }
-
-    let output_mode = cli.output;
-    let status = match execute(cli).await {
+    let output = Output::default(cli.output);
+    let status = match execute(cli, &output).await {
         Ok(code) => code,
         Err(err) => {
-            output::print_error(output_mode, &format!("{err:#}"));
+            output.print_error(&format!("{err:#}"));
 
             1
         }
@@ -208,7 +209,7 @@ async fn main() {
     std::process::exit(status);
 }
 
-async fn execute(cli: Cli) -> anyhow::Result<i32> {
+async fn execute(cli: Cli, output: &Output) -> anyhow::Result<i32> {
     // Resolve socket path
     let socket_path = resolve_socket_path(cli.socket)?;
     log::debug!("Connecting to {socket_path:?}");
@@ -222,31 +223,31 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
             match cli.command {
                 Commands::Churten { command } => match command {
                     ChurtenCommands::Start => {
-                        churten_cmd::execute_churten_start(&control, cli.output).await
+                        churten_cmd::execute_churten_start(&control, output).await
                     }
                     ChurtenCommands::Stop => {
-                        churten_cmd::execute_churten_stop(&control, cli.output).await
+                        churten_cmd::execute_churten_stop(&control, output).await
                     }
                     ChurtenCommands::IsRunning => {
-                        churten_cmd::execute_churten_is_running(&control, cli.output).await
+                        churten_cmd::execute_churten_is_running(&control, output).await
                     }
                     ChurtenCommands::Connect => {
-                        churten_cmd::execute_churten_connect(&control, cli.output).await
+                        churten_cmd::execute_churten_connect(&control, output).await
                     }
                 },
 
                 Commands::Peer { command } => match command {
-                    PeerCommands::Query => peer_cmd::execute_peer_query(&control, cli.output).await,
+                    PeerCommands::Query => peer_cmd::execute_peer_query(&control, output).await,
                     PeerCommands::Connect { peer } => {
-                        peer_cmd::execute_peer_connect(&control, &peer, cli.output).await
+                        peer_cmd::execute_peer_connect(&control, &peer, output).await
                     }
                     PeerCommands::Disconnect { peer } => {
-                        peer_cmd::execute_peer_disconnect(&control, &peer, cli.output).await
+                        peer_cmd::execute_peer_disconnect(&control, &peer, output).await
                     }
                 },
                 Commands::Arena { command } => match command {
                     ArenaCommands::Create { name, path } => {
-                        arena_cmd::execute_arena_create(&control, cli.output, &name, &path).await
+                        arena_cmd::execute_arena_create(&control, output, &name, &path).await
                     }
                     ArenaCommands::Remove {
                         name,
@@ -255,7 +256,7 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                     } => {
                         arena_cmd::execute_arena_remove(
                             &control,
-                            cli.output,
+                            output,
                             &name,
                             delete_files,
                             keep_database,
@@ -263,21 +264,20 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                         .await
                     }
                     ArenaCommands::EmptyTrash { name } => {
-                        arena_cmd::execute_arena_empty_trash(&control, cli.output, name.as_deref())
+                        arena_cmd::execute_arena_empty_trash(&control, output, name.as_deref())
                             .await
                     }
                     ArenaCommands::EmptyCache { name } => {
-                        arena_cmd::execute_arena_empty_cache(&control, cli.output, name.as_deref())
+                        arena_cmd::execute_arena_empty_cache(&control, output, name.as_deref())
                             .await
                     }
                 },
                 Commands::Attr { command } => match command {
                     AttrCommands::List { arena, paths } => {
-                        attr_cmd::execute_attr_list(&control, cli.output, &arena, &paths).await
+                        attr_cmd::execute_attr_list(&control, output, &arena, &paths).await
                     }
                     AttrCommands::Get { attr, arena, paths } => {
-                        attr_cmd::execute_attr_get(&control, cli.output, &attr, &arena, &paths)
-                            .await
+                        attr_cmd::execute_attr_get(&control, output, &attr, &arena, &paths).await
                     }
                     AttrCommands::Set {
                         attr,
@@ -285,10 +285,8 @@ async fn execute(cli: Cli) -> anyhow::Result<i32> {
                         arena,
                         paths,
                     } => {
-                        attr_cmd::execute_attr_set(
-                            &control, cli.output, &attr, &value, &arena, &paths,
-                        )
-                        .await
+                        attr_cmd::execute_attr_set(&control, output, &attr, &value, &arena, &paths)
+                            .await
                     }
                 },
             }

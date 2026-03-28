@@ -1,8 +1,8 @@
 #![allow(dead_code)] // WIP
 
 use clap::ValueEnum;
-use console::style;
-use indicatif::ProgressStyle;
+use console::{Term, style};
+use indicatif::{ProgressStyle, TermLike};
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub(crate) enum OutputMode {
@@ -23,6 +23,12 @@ pub(crate) enum OutputMode {
     Log,
 }
 
+pub(crate) struct Output {
+    mode: OutputMode,
+    stdout: Option<Box<dyn TermLike>>,
+    stderr: Option<Box<dyn TermLike>>,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MessageType {
     SUCCESS,
@@ -31,69 +37,85 @@ pub(crate) enum MessageType {
     PROGRESS,
 }
 
-/// Print a warning message to stderr, with standard format.
-pub(crate) fn print_warning<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
-    let tag = tag.as_ref();
-    let msg = msg.as_ref();
-    log::warn!("{tag} {msg}");
-    match mode {
-        OutputMode::Log => {}
-        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
+impl Output {
+    pub(crate) fn default(mode: OutputMode) -> Output {
+        match mode {
+            OutputMode::Quiet => Output::new(mode, None, Some(Box::new(Term::stderr()))),
+            OutputMode::Plain | OutputMode::Progress => Output::new(
+                mode,
+                Some(Box::new(Term::stdout())),
+                Some(Box::new(Term::stderr())),
+            ),
+            OutputMode::Log => Output::new(mode, None, None),
+        }
+    }
+
+    pub(crate) fn new(
+        mode: OutputMode,
+        stdout: Option<Box<dyn TermLike>>,
+        stderr: Option<Box<dyn TermLike>>,
+    ) -> Self {
+        Output {
+            mode,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Returns the current output mode.
+    pub(crate) fn mode(&self) -> OutputMode {
+        self.mode
+    }
+
+    /// Print a warning message to stderr, with standard format.
+    pub(crate) fn print_warning<T: AsRef<str>, U: AsRef<str>>(&self, tag: T, msg: U) {
+        let tag = tag.as_ref();
+        let msg = msg.as_ref();
+        log::warn!("{tag} {msg}");
+        if let Some(term) = &self.stderr {
             let tag = style(tag).for_stderr().yellow().bold();
-            eprintln!("{tag} {msg}");
+            let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
-}
 
-/// Print a progress message to stderr, with standard format.
-pub(crate) fn print_progress<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
-    let tag = tag.as_ref();
-    let msg = msg.as_ref();
-    log::warn!("{tag} {msg}");
-    match mode {
-        OutputMode::Log => {}
-        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
+    /// Print a progress message to stderr, with standard format.
+    pub(crate) fn print_progress<T: AsRef<str>, U: AsRef<str>>(&self, tag: T, msg: U) {
+        let tag = tag.as_ref();
+        let msg = msg.as_ref();
+        log::warn!("{tag} {msg}");
+        if let Some(term) = &self.stdout {
             let tag = style(tag).for_stdout().cyan().bold();
-            println!("{tag} {msg}");
+            let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
-}
 
-/// Print an error message to stderr, with standard format.
-pub(crate) fn print_error<T: AsRef<str>>(mode: OutputMode, msg: T) {
-    let msg = msg.as_ref();
-    log::error!("{msg}");
-    match mode {
-        OutputMode::Log => {}
-        OutputMode::Quiet | OutputMode::Plain | OutputMode::Progress => {
+    /// Print an error message to stderr, with standard format.
+    pub(crate) fn print_error<T: AsRef<str>>(&self, msg: T) {
+        let msg = msg.as_ref();
+        log::error!("{msg}");
+        if let Some(term) = &self.stderr {
             let tag = style("ERROR").for_stderr().red().bold();
-            eprintln!("{tag} {msg}");
+            let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
-}
 
-/// Print an success message to stdout, with standard format.
-pub(crate) fn print_success<T: AsRef<str>, U: AsRef<str>>(mode: OutputMode, tag: T, msg: U) {
-    let tag = tag.as_ref();
-    let msg = msg.as_ref();
-    log::info!("{tag} {msg}");
-    match mode {
-        OutputMode::Log | OutputMode::Quiet => {}
-        OutputMode::Plain | OutputMode::Progress => {
+    /// Print an success message to stdout, with standard format.
+    pub(crate) fn print_success<T: AsRef<str>, U: AsRef<str>>(&self, tag: T, msg: U) {
+        let tag = tag.as_ref();
+        let msg = msg.as_ref();
+        log::info!("{tag} {msg}");
+        if let Some(term) = &self.stdout {
             let tag = style(tag).for_stdout().green().bold();
-            println!("{tag} {msg}");
+            let _ = term.write_line(&format!("{tag} {msg}"));
         }
     }
-}
 
-/// Print an info message to stdout, with standard format.
-pub(crate) fn print_info<T: AsRef<str>>(mode: OutputMode, msg: T) {
-    let msg = msg.as_ref();
-    log::info!("{msg}");
-    match mode {
-        OutputMode::Log | OutputMode::Quiet => {}
-        OutputMode::Plain | OutputMode::Progress => {
-            println!("{msg}");
+    /// Print an info message to stdout, with standard format.
+    pub(crate) fn print_info<T: AsRef<str>>(&self, msg: T) {
+        let msg = msg.as_ref();
+        log::info!("{msg}");
+        if let Some(term) = &self.stdout {
+            let _ = term.write_line(msg);
         }
     }
 }
