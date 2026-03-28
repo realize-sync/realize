@@ -70,10 +70,19 @@ pub(crate) async fn execute_churten_connect(
     let rx = client::subscribe_to_churten(&churten).await?;
     let jobs = client::all_jobs(&churten).await?;
 
-    let mut display = ChurtenDisplay::default(output, jobs);
-    let res = connect(&mut display, rx, shutdown).await;
-    display.finished().await;
-    res?;
+    // Run in a normal Tokio environment, outside LocalSet
+    task::spawn({
+        let output = output.clone();
+        async move {
+            let mut display = ChurtenDisplay::default(output);
+            display.init(&jobs);
+            let res = connect(&mut display, rx, shutdown).await;
+            display.finished().await;
+
+            res
+        }
+    })
+    .await??;
 
     output.print_info("Churten stopped");
 
@@ -81,7 +90,7 @@ pub(crate) async fn execute_churten_connect(
 }
 
 async fn connect(
-    display: &mut ChurtenDisplay<'_>,
+    display: &mut ChurtenDisplay,
     mut rx: mpsc::Receiver<ChurtenUpdates>,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {

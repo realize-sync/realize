@@ -1,5 +1,7 @@
 #![allow(dead_code)] // WIP
 
+use std::sync::Arc;
+
 use clap::ValueEnum;
 use console::{StyledObject, Term, style};
 use indicatif::{ProgressStyle, TermLike};
@@ -23,10 +25,11 @@ pub(crate) enum OutputMode {
     Log,
 }
 
+#[derive(Clone)]
 pub(crate) struct Output {
     mode: OutputMode,
-    stdout: Option<Box<dyn TermLike>>,
-    stderr: Option<Box<dyn TermLike>>,
+    stdout: Option<Arc<dyn TermLike>>,
+    stderr: Option<Arc<dyn TermLike>>,
     stdout_style: bool,
     stderr_style: bool,
 }
@@ -42,11 +45,11 @@ pub(crate) enum MessageType {
 impl Output {
     pub(crate) fn default(mode: OutputMode) -> Output {
         match mode {
-            OutputMode::Quiet => Output::new(mode, None, Some(Box::new(Term::stderr()))),
+            OutputMode::Quiet => Output::new(mode, None, Some(Arc::new(Term::stderr()))),
             OutputMode::Plain | OutputMode::Progress => Output::new(
                 mode,
-                Some(Box::new(Term::stdout())),
-                Some(Box::new(Term::stderr())),
+                Some(Arc::new(Term::stdout())),
+                Some(Arc::new(Term::stderr())),
             ),
             OutputMode::Log => Output::new(mode, None, None),
         }
@@ -54,8 +57,8 @@ impl Output {
 
     pub(crate) fn new(
         mode: OutputMode,
-        stdout: Option<Box<dyn TermLike>>,
-        stderr: Option<Box<dyn TermLike>>,
+        stdout: Option<Arc<dyn TermLike>>,
+        stderr: Option<Arc<dyn TermLike>>,
     ) -> Self {
         Output {
             mode,

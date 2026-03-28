@@ -9,8 +9,8 @@ use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::collections::HashMap;
 
-pub(crate) struct ChurtenDisplay<'a> {
-    output: &'a Output,
+pub(crate) struct ChurtenDisplay {
+    output: Output,
     tracker: JobInfoTracker,
     multi: MultiProgress,
     overall_bar: ProgressBar,
@@ -21,24 +21,19 @@ pub(crate) struct ChurtenDisplay<'a> {
     had_jobs: bool,
 }
 
-impl<'a> ChurtenDisplay<'a> {
-    pub(crate) fn default(output: &'a Output, initial: Vec<JobInfo>) -> Self {
+impl ChurtenDisplay {
+    pub(crate) fn default(output: Output) -> Self {
         let target = if output.mode() == OutputMode::Progress {
             ProgressDrawTarget::stdout()
         } else {
             ProgressDrawTarget::hidden()
         };
 
-        Self::new(output, initial, target)
+        Self::new(output, target)
     }
 
-    pub(crate) fn new(
-        output: &'a Output,
-        initial: Vec<JobInfo>,
-        target: ProgressDrawTarget,
-    ) -> Self {
-        let mut tracker = JobInfoTracker::new(16);
-        tracker.init(initial);
+    pub(crate) fn new(output: Output, target: ProgressDrawTarget) -> Self {
+        let tracker = JobInfoTracker::new(16);
         let multi = MultiProgress::with_draw_target(target);
         let overall_bar = multi.add(ProgressBar::no_length());
         update_overall_bar(&overall_bar, tracker.active_len());
@@ -62,9 +57,7 @@ impl<'a> ChurtenDisplay<'a> {
             ChurtenUpdates::Reset(jobs) => {
                 let total = jobs.len();
                 log_jobs(&jobs, total);
-                if self.output.mode() == OutputMode::Progress {
-                    self.init_bars(&jobs);
-                }
+                self.init(&jobs);
                 self.tracker.init(jobs);
             }
             ChurtenUpdates::Notify(n) => {
@@ -144,7 +137,11 @@ impl<'a> ChurtenDisplay<'a> {
         };
     }
 
-    fn init_bars(&mut self, jobs: &Vec<JobInfo>) {
+    pub(crate) fn init(&mut self, jobs: &Vec<JobInfo>) {
+        if self.output.mode() != OutputMode::Progress {
+            return;
+        }
+
         let mut existing = std::mem::take(&mut self.job_bars);
         let mut active_count = 0;
         for job in jobs {
@@ -343,4 +340,86 @@ fn finished_job_name(job: &JobInfo) -> &'static str {
 
 fn display_path(job: &JobInfo) -> String {
     format!("[{}]/{}", job.arena, job.job.path())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::testing::{OutputFixture, forced_style};
+    use console::set_colors_enabled;
+    use indicatif::TermLike;
+    use realize_types::{Hash, Path};
+
+    struct Fixture {
+        out: OutputFixture,
+        display: ChurtenDisplay,
+    }
+
+    impl Fixture {
+        fn setup() -> anyhow::Result<Self> {
+            set_colors_enabled(true);
+            let out = OutputFixture::setup(OutputMode::Progress)?;
+            let display = ChurtenDisplay::new(
+                out.output.clone(),
+                ProgressDrawTarget::term_like(Box::new(out.actual.clone())),
+            );
+
+            Ok(Self { out, display })
+        }
+
+        /// Return the actual terminal content.
+        pub fn actual(&self) -> String {
+            self.out.actual()
+        }
+
+        /// Return the expected terminal content
+        pub fn expected(&self) -> String {
+            self.out.expected()
+        }
+    }
+
+    #[test]
+    fn empty() -> anyhow::Result<()> {
+        let fixture = Fixture::setup()?;
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} for more jobs. Press Ctrl-C to stop",
+            forced_style("     Waiting").yellow().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn one_job() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            arena: Arena::from("myarena"),
+            id: JobId(1),
+            job: Arc::new(Job::Download(Path::parse("foo/bar")?, Hash([1u8; 32]))),
+            progress: JobProgress::Running,
+            action: Some(JobAction::Download),
+            byte_progress: None,
+            notification_index: 0,
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 1 active job",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
 }

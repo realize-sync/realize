@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use console::{StyledObject, style};
 use indicatif::InMemoryTerm;
 
@@ -22,8 +24,8 @@ impl OutputFixture {
         let expected = InMemoryTerm::new(24, 80);
         let mut output = Output::new(
             mode,
-            Some(Box::new(actual.clone())),
-            Some(Box::new(actual.clone())),
+            Some(Arc::new(actual.clone())),
+            Some(Arc::new(actual.clone())),
         );
         output.set_stdout_style(true);
         output.set_stderr_style(true);
@@ -37,11 +39,23 @@ impl OutputFixture {
 
     /// Return the actual terminal content.
     pub fn actual(&self) -> String {
-        String::from_utf8(self.actual.contents_formatted()).unwrap()
+        contents_string(self.actual.contents_formatted())
     }
 
     /// Return the expected terminal content
     pub fn expected(&self) -> String {
-        String::from_utf8(self.expected.contents_formatted()).unwrap()
+        contents_string(self.expected.contents_formatted())
     }
+}
+
+/// Cleanup formatted content from InMemoryTerm.
+fn contents_string(mut bytes: Vec<u8>) -> String {
+    bytes.drain(bytes.len() - 3..); // final reset
+
+    let mut content = String::from_utf8(bytes).unwrap();
+    while content.ends_with(" ") {
+        content.pop();
+    }
+
+    content
 }
