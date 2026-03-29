@@ -76,7 +76,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     ) -> Self {
         let (tx, mut rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
 
-        let tracker = Arc::new(RwLock::new(JobInfoTracker::new(16)));
+        let tracker = Arc::new(RwLock::new(JobInfoTracker::new()));
         tokio::spawn({
             let tracker = Arc::clone(&tracker);
 
@@ -107,8 +107,8 @@ impl<H: JobHandler + 'static> Churten<H> {
             .tracker
             .read()
             .await
-            .active()
-            .map(|info| ((info.arena, info.id), info.clone()))
+            .iter()
+            .map(|info| (info.global_job_id(), info.clone()))
             .collect();
         for (arena, id, job, retry) in all_jobs {
             let key = (arena, id);
@@ -143,7 +143,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     ///
     /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
     pub(crate) async fn active_jobs(&self) -> Vec<JobInfo> {
-        self.tracker.read().await.active().cloned().collect()
+        self.tracker.read().await.iter().cloned().collect()
     }
 
     /// Subscribe to [ChurtenNotification]s.

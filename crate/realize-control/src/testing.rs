@@ -42,10 +42,26 @@ impl OutputFixture {
         contents_string(self.actual.contents_formatted())
     }
 
+    /// Return some rows from the actual terminal content.
+    pub fn actual_rows(&self, range: std::ops::Range<usize>) -> String {
+        rows(self.actual(), range)
+    }
+
     /// Return the expected terminal content
     pub fn expected(&self) -> String {
         contents_string(self.expected.contents_formatted())
     }
+}
+
+/// Return a string containing a subset of the rows in the given content.
+fn rows(content: String, range: std::ops::Range<usize>) -> String {
+    content
+        .split("\n")
+        .skip(range.start)
+        .take(range.end - range.start)
+        .map(|row| row.strip_suffix("\u{1b}[m").unwrap_or(row))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Cleanup formatted content from InMemoryTerm.

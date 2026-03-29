@@ -33,10 +33,10 @@ impl ChurtenDisplay {
     }
 
     pub(crate) fn new(output: Output, target: ProgressDrawTarget) -> Self {
-        let tracker = JobInfoTracker::new(16);
+        let tracker = JobInfoTracker::new();
         let multi = MultiProgress::with_draw_target(target);
         let overall_bar = multi.add(ProgressBar::no_length());
-        update_overall_bar(&overall_bar, tracker.active_len());
+        update_overall_bar(&overall_bar, tracker.len());
 
         Self {
             output,
@@ -121,13 +121,13 @@ impl ChurtenDisplay {
     fn print_has_jobs(&mut self, n: &ChurtenNotification) {
         match n {
             ChurtenNotification::New { .. } => {
-                if !self.had_jobs && self.tracker.has_active_jobs() {
+                if !self.had_jobs && !self.tracker.is_empty() {
                     self.had_jobs = true;
                     self.output.print_progress("Processing", "...");
                 }
             }
             ChurtenNotification::Finish { .. } => {
-                if self.had_jobs && !self.tracker.has_active_jobs() {
+                if self.had_jobs && self.tracker.is_empty() {
                     self.had_jobs = false;
                     self.output
                         .print_progress("Waiting", "for more jobs. Press Ctrl-C to stop");
@@ -148,7 +148,8 @@ impl ChurtenDisplay {
             let id = job.global_job_id();
             let bar = existing.remove(&id);
             if job.progress.is_finished() {
-                if let Some(bar) = bar {
+                if let Some(mut bar) = bar {
+                    update_bar_for_job(&mut bar, job);
                     self.finish_bar(bar, &job);
                 }
             } else {
@@ -176,16 +177,16 @@ impl ChurtenDisplay {
                 ChurtenNotification::New { .. } => {
                     let bar = self.create_bar(job);
                     self.job_bars.insert(n.global_job_id(), bar);
-                    update_overall_bar(&self.overall_bar, self.tracker.active_len());
-                }
-                ChurtenNotification::Finish { .. } => {
-                    if let Some(bar) = self.job_bars.remove(&n.global_job_id()) {
-                        self.finish_bar(bar, &job);
-                        update_overall_bar(&self.overall_bar, self.tracker.active_len());
-                    }
+                    update_overall_bar(&self.overall_bar, self.tracker.len());
                 }
                 _ => {
-                    if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
+                    if job.progress.is_finished() {
+                        if let Some(mut bar) = self.job_bars.remove(&n.global_job_id()) {
+                            update_bar_for_job(&mut bar, job);
+                            self.finish_bar(bar, job);
+                            update_overall_bar(&self.overall_bar, self.tracker.len());
+                        }
+                    } else if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
                         update_bar_for_job(bar, job);
                     }
                 }
@@ -203,34 +204,12 @@ impl ChurtenDisplay {
         bar
     }
 
-    fn finish_bar(&self, mut bar: ProgressBar, job: &JobInfo) {
-        update_bar_for_job(&mut bar, job);
-        match &job.progress {
-            JobProgress::Done => {
-                // If notifications were lost, progress might not have
-                // reached 100% even though it's finished.
-                if let Some(length) = bar.length() {
-                    bar.set_position(length);
-                }
-                bar.set_prefix(finished_job_name(job));
-                bar.set_style(output::progress_style(
-                    MessageType::SUCCESS,
-                    bar.length().is_some(),
-                ));
-            }
-            JobProgress::Failed(err) => {
-                bar.set_message(format!("{}: {err}", display_path(job)));
-                bar.set_style(output::progress_style(MessageType::ERROR, false));
-            }
-            _ => {
-                bar.set_style(output::progress_style(
-                    MessageType::WARNING,
-                    bar.length().is_some(),
-                ));
-            }
+    fn finish_bar(&self, bar: ProgressBar, job: &JobInfo) {
+        if job.progress == JobProgress::Done {
+            bar.finish();
+        } else {
+            bar.finish_and_clear();
         }
-
-        bar.finish();
     }
 
     fn log_notification(&self, n: &ChurtenNotification) {
@@ -291,13 +270,50 @@ fn format_log_string(job: &JobInfo, prefix: &str) -> String {
 }
 
 fn update_bar_for_job(bar: &mut ProgressBar, job: &JobInfo) {
-    bar.set_prefix(prefix_for_job(job));
-    if let Some((current, total)) = &job.byte_progress {
-        if bar.length().is_none() {
-            bar.set_style(output::progress_style(MessageType::PROGRESS, true));
+    match &job.progress {
+        JobProgress::Pending => {
+            bar.set_prefix("Pending");
+            set_bar_style(bar, MessageType::PROGRESS, None);
         }
+        JobProgress::Running => {
+            bar.set_prefix(prefix_for_job(job));
+            set_bar_style(bar, MessageType::PROGRESS, job.byte_progress.as_ref());
+        }
+        JobProgress::Done => {
+            bar.set_prefix(finished_job_name(job));
+            set_bar_style(
+                bar,
+                MessageType::SUCCESS,
+                job.byte_progress.map(|(_, total)| (total, total)).as_ref(),
+            );
+        }
+        JobProgress::Abandoned => {
+            bar.set_prefix("Abandoned");
+            set_bar_style(bar, MessageType::WARNING, None);
+        }
+        JobProgress::Cancelled => {
+            bar.set_prefix("Cancelled");
+            set_bar_style(bar, MessageType::WARNING, None);
+        }
+        JobProgress::NoPeers => {
+            bar.set_prefix("Connecting");
+            set_bar_style(bar, MessageType::WARNING, job.byte_progress.as_ref());
+        }
+        JobProgress::Failed(_) => {
+            bar.set_prefix("Retry");
+            set_bar_style(bar, MessageType::ERROR, job.byte_progress.as_ref());
+        }
+    }
+}
+
+fn set_bar_style(bar: &mut ProgressBar, style: MessageType, byte_progress: Option<&(u64, u64)>) {
+    if let Some((current, total)) = byte_progress {
+        bar.set_style(output::progress_style(style, true));
         bar.set_length(*total);
-        bar.set_position(*current)
+        bar.set_position(*current);
+    } else {
+        bar.set_style(output::progress_style(style, false));
+        bar.unset_length();
     }
 }
 
@@ -374,9 +390,29 @@ mod tests {
             self.out.actual()
         }
 
+        /// Return the actual terminal content.
+        pub fn actual_rows(&self, range: std::ops::Range<usize>) -> String {
+            self.out.actual_rows(range)
+        }
+
         /// Return the expected terminal content
         pub fn expected(&self) -> String {
             self.out.expected()
+        }
+    }
+
+    fn test_job() -> JobInfo {
+        JobInfo {
+            arena: Arena::from("myarena"),
+            id: JobId(1),
+            job: Arc::new(Job::Download(
+                Path::parse("foo/bar").unwrap(),
+                Hash([1u8; 32]),
+            )),
+            progress: JobProgress::Running,
+            action: Some(JobAction::Download),
+            byte_progress: None,
+            notification_index: 0,
         }
     }
 
@@ -398,15 +434,7 @@ mod tests {
     #[test]
     fn one_job() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup()?;
-        fixture.display.init(&vec![JobInfo {
-            arena: Arena::from("myarena"),
-            id: JobId(1),
-            job: Arc::new(Job::Download(Path::parse("foo/bar")?, Hash([1u8; 32]))),
-            progress: JobProgress::Running,
-            action: Some(JobAction::Download),
-            byte_progress: None,
-            notification_index: 0,
-        }]);
+        fixture.display.init(&vec![test_job()]);
 
         let exp = &fixture.out.expected;
         exp.write_line(&format!(
@@ -419,6 +447,142 @@ mod tests {
         ))?;
 
         assert_eq!(fixture.expected(), fixture.actual());
+
+        Ok(())
+    }
+
+    #[test]
+    fn pending() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::Pending,
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar",
+            forced_style("     Pending").cyan().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn download() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::Running,
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn download_with_byte_progress() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::Running,
+            byte_progress: Some((1024 * 1024, 4 * 1024 * 1024)), // 1M / 4M
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar                           (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_peers() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::NoPeers,
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar",
+            forced_style("  Connecting").yellow().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn no_peers_with_byte_progress() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::NoPeers,
+            byte_progress: Some((1024 * 1024, 4 * 1024 * 1024)), // 1M / 4M
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar                           (1.00 MiB/4.00 MiB) 25%",
+            forced_style("  Connecting").yellow().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::Failed("test".to_string()),
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar",
+            forced_style("       Retry").red().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn failed_byte_progress() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        fixture.display.init(&vec![JobInfo {
+            progress: JobProgress::Failed("test".to_string()),
+            byte_progress: Some((1024 * 1024, 4 * 1024 * 1024)), // 1M / 4M
+            ..test_job()
+        }]);
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo/bar                           (1.00 MiB/4.00 MiB) 25%",
+            forced_style("       Retry").red().bold(),
+        ))?;
+
+        assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
 
         Ok(())
     }

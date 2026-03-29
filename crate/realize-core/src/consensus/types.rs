@@ -124,8 +124,8 @@ impl JobProgress {
             JobProgress::Done => true,
             JobProgress::Abandoned => true,
             JobProgress::Cancelled => true,
-            JobProgress::NoPeers => true,
-            JobProgress::Failed(_) => true,
+            JobProgress::NoPeers => false,
+            JobProgress::Failed(_) => false,
         }
     }
 }
