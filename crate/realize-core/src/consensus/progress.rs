@@ -21,7 +21,6 @@ pub(crate) struct TxByteCountProgress {
     resolution_bytes: u64,
     burst_limiter: Duration,
     last_bytecount_update: Option<(u64, u64, Instant)>,
-    index: u32,
 }
 
 impl TxByteCountProgress {
@@ -38,8 +37,6 @@ impl TxByteCountProgress {
             resolution_bytes: 1,
             burst_limiter: Duration::ZERO,
             last_bytecount_update: None,
-            // Start at 0, this way New is 0 and Start is 1.
-            index: 2,
         }
     }
 
@@ -84,33 +81,22 @@ impl TxByteCountProgress {
             }
         }
     }
-
-    fn next_index(&mut self) -> u32 {
-        let index = self.index;
-        self.index += 1;
-
-        index
-    }
 }
 
 impl ByteCountProgress for TxByteCountProgress {
     fn update_action(&mut self, action: JobAction) {
-        let index = self.next_index();
         let _ = self.tx.send(ChurtenNotification::UpdateAction {
             arena: self.arena,
             job_id: self.job_id,
-            index,
             action,
         });
     }
     fn update(&mut self, current_bytes: u64, total_bytes: u64) {
         if self.should_send(current_bytes, total_bytes) {
             self.last_bytecount_update = Some((current_bytes, total_bytes, Instant::now()));
-            let index = self.next_index();
             let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
                 arena: self.arena,
                 job_id: self.job_id,
-                index,
                 current_bytes,
                 total_bytes,
             });
@@ -235,14 +221,12 @@ mod tests {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
                     action: JobAction::Download,
-                    index: 2,
                 },
                 ChurtenNotification::UpdateByteCount {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
                     current_bytes: 0,
                     total_bytes: 1024,
-                    index: 3,
                 }
             ],
             notifications

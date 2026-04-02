@@ -729,7 +729,6 @@ mod tests {
                         arena,
                         job_id: JobId(1),
                         action: JobAction::Download,
-                        index: 2,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -742,7 +741,6 @@ mod tests {
                         job_id: JobId(1),
                         current_bytes: 50,
                         total_bytes: 100,
-                        index: 3,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -755,7 +753,6 @@ mod tests {
                         job_id: JobId(1),
                         current_bytes: 100,
                         total_bytes: 100,
-                        index: 4,
                     }),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
@@ -764,7 +761,7 @@ mod tests {
 
                 // Expect the job to succeed
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::Finish {
+                    ChurtenUpdates::Notify(ChurtenNotification::Stop {
                         arena,
                         job_id: JobId(1),
                         progress: JobProgress::Done,
@@ -873,7 +870,7 @@ mod tests {
                 barrier.wait().await;
                 while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
-                        ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
+                        ChurtenUpdates::Notify(ChurtenNotification::Stop { .. }) => {
                             break;
                         }
                         _ => {}
@@ -955,7 +952,7 @@ mod tests {
                 // Wait for the job to fail
                 while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
-                        ChurtenUpdates::Notify(ChurtenNotification::Finish { .. }) => {
+                        ChurtenUpdates::Notify(ChurtenNotification::Stop { .. }) => {
                             break;
                         }
                         _ => {}

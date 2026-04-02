@@ -1,7 +1,7 @@
 use crate::output::Output;
 
 use super::output::{self, MessageType, OutputMode};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget};
 use realize_core::consensus::tracker::{JobInfo, JobInfoTracker};
 use realize_core::consensus::types::{ChurtenNotification, JobAction, JobProgress};
 use realize_core::rpc::control::client::ChurtenUpdates;
@@ -61,7 +61,9 @@ impl ChurtenDisplay {
                 self.tracker.init(jobs);
             }
             ChurtenUpdates::Notify(n) => {
+                eprintln!("==== Notify {n:?}");
                 if !self.tracker.update(&n) {
+                    eprintln!("==== OUT OF ORDER");
                     return;
                 }
 
@@ -70,20 +72,19 @@ impl ChurtenDisplay {
                     OutputMode::Log => {}
                     OutputMode::Progress => self.update_bar_from_notification(&n),
                     OutputMode::Plain => {
-                        self.print_success(&n);
-                        self.print_errors(&n);
+                        self.print_all_success(&n);
+                        self.print_all_error(&n);
                         self.print_has_jobs(&n);
                     }
-                    OutputMode::Quiet => self.print_errors(&n),
+                    OutputMode::Quiet => self.print_all_error(&n),
                 }
             }
         }
     }
 
-    /// Print failed jobs, for non-terminal and quiet mode.
-    fn print_errors(&mut self, n: &ChurtenNotification) {
+    fn print_all_error(&mut self, n: &ChurtenNotification) {
         match n {
-            ChurtenNotification::Finish { progress, .. } => match progress {
+            ChurtenNotification::Stop { progress, .. } => match progress {
                 JobProgress::Pending | JobProgress::Done => {}
                 JobProgress::Failed(msg) => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
@@ -102,14 +103,12 @@ impl ChurtenDisplay {
         }
     }
 
-    /// Print successful job, for non-terminal mode.
-    fn print_success(&mut self, n: &ChurtenNotification) {
+    fn print_all_success(&mut self, n: &ChurtenNotification) {
         match n {
-            ChurtenNotification::Finish { progress, .. } => match progress {
+            ChurtenNotification::Stop { progress, .. } => match progress {
                 JobProgress::Done => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
-                        self.output
-                            .print_success(finished_job_name(job), display_path(job));
+                        print_job_done(&self.output, job);
                     }
                 }
                 _ => {}
@@ -126,7 +125,7 @@ impl ChurtenDisplay {
                     self.output.print_progress("Processing", "...");
                 }
             }
-            ChurtenNotification::Finish { .. } => {
+            ChurtenNotification::Stop { .. } => {
                 if self.had_jobs && self.tracker.is_empty() {
                     self.had_jobs = false;
                     self.output
@@ -147,7 +146,7 @@ impl ChurtenDisplay {
         for job in jobs {
             let id = job.global_job_id();
             let bar = existing.remove(&id);
-            if job.progress.is_finished() {
+            if job.progress.is_final() {
                 if let Some(mut bar) = bar {
                     update_bar_for_job(&mut bar, job);
                     self.finish_bar(bar, &job);
@@ -164,6 +163,7 @@ impl ChurtenDisplay {
                 }
             }
         }
+        self.tracker.remove_finished();
         existing
             .into_values()
             .for_each(|bar| bar.finish_and_clear());
@@ -179,14 +179,24 @@ impl ChurtenDisplay {
                     self.job_bars.insert(n.global_job_id(), bar);
                     update_overall_bar(&self.overall_bar, self.tracker.len());
                 }
-                _ => {
-                    if job.progress.is_finished() {
+                ChurtenNotification::Stop { progress, .. } => {
+                    if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
+                        update_bar_for_job(bar, job);
+                    }
+                    eprintln!("==== STOP {progress:?}");
+                    if progress.is_final() {
                         if let Some(mut bar) = self.job_bars.remove(&n.global_job_id()) {
+                            eprintln!("==== REMOVE {progress:?}");
                             update_bar_for_job(&mut bar, job);
                             self.finish_bar(bar, job);
+                            self.tracker.remove_finished();
                             update_overall_bar(&self.overall_bar, self.tracker.len());
+                            eprintln!("==== REMOVED {progress:?}");
                         }
-                    } else if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
+                    }
+                }
+                _ => {
+                    if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
                         update_bar_for_job(bar, job);
                     }
                 }
@@ -205,10 +215,12 @@ impl ChurtenDisplay {
     }
 
     fn finish_bar(&self, bar: ProgressBar, job: &JobInfo) {
+        bar.finish_and_clear();
         if job.progress == JobProgress::Done {
-            bar.finish();
-        } else {
-            bar.finish_and_clear();
+            let output = self.output.clone();
+            self.multi.suspend(|| {
+                print_job_done(&output, job);
+            });
         }
     }
 
@@ -216,7 +228,7 @@ impl ChurtenDisplay {
         if let Some(job) = self.tracker.get(&n.global_job_id()) {
             match n {
                 ChurtenNotification::New { .. } => {}
-                ChurtenNotification::Start { .. } | ChurtenNotification::Finish { .. } => {
+                ChurtenNotification::Start { .. } | ChurtenNotification::Stop { .. } => {
                     let progress = &job.progress;
                     match progress {
                         JobProgress::Pending => {}
@@ -241,6 +253,14 @@ impl ChurtenDisplay {
             }
         }
     }
+}
+
+fn print_job_done(output: &Output, job: &JobInfo) {
+    let mut msg = display_path(job);
+    if let Some((_, total)) = &job.byte_progress {
+        msg = format!("{} ({})", msg, HumanBytes(*total));
+    }
+    output.print_success(finished_job_name(job), msg);
 }
 
 fn log_jobs(jobs: &Vec<JobInfo>, total: usize) {
@@ -412,7 +432,6 @@ mod tests {
             progress: JobProgress::Running,
             action: Some(JobAction::Download),
             byte_progress: None,
-            notification_index: 0,
         }
     }
 
@@ -583,6 +602,192 @@ mod tests {
         ))?;
 
         assert_eq!(fixture.expected(), fixture.actual_rows(0..1));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiple_jobs_from_notifications() -> anyhow::Result<()> {
+        let mut fixture = Fixture::setup()?;
+        let arena = Arena::from("myarena");
+        let job1 = JobId(1);
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::New {
+                arena,
+                job_id: job1,
+                job: Arc::new(Job::Download(Path::parse("foo").unwrap(), Hash([1u8; 32]))),
+            }))
+            .await;
+
+        let exp = &fixture.out.expected;
+        exp.write_line(&format!(
+            "{} [myarena]/foo",
+            forced_style("     Pending").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 1 active job",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        let job2 = JobId(2);
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::New {
+                arena,
+                job_id: job2,
+                job: Arc::new(Job::Download(Path::parse("bar").unwrap(), Hash([1u8; 32]))),
+            }))
+            .await;
+
+        exp.reset();
+        exp.write_line(&format!(
+            "{} [myarena]/foo",
+            forced_style("     Pending").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} [myarena]/bar",
+            forced_style("     Pending").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 2 active jobs",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+                arena,
+                job_id: job2,
+            }))
+            .await;
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::UpdateAction {
+                arena,
+                job_id: job2,
+                action: JobAction::Download,
+            }))
+            .await;
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(
+                ChurtenNotification::UpdateByteCount {
+                    arena,
+                    job_id: job2,
+                    current_bytes: 1024 * 1024,
+                    total_bytes: 4 * 1024 * 1024,
+                },
+            ))
+            .await;
+
+        exp.reset();
+        exp.write_line(&format!(
+            "{} [myarena]/foo",
+            forced_style("     Pending").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} [myarena]/bar                               (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 2 active jobs",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+                arena,
+                job_id: job1,
+            }))
+            .await;
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::Stop {
+                arena,
+                job_id: job1,
+                progress: JobProgress::NoPeers,
+            }))
+            .await;
+
+        exp.reset();
+        exp.write_line(&format!(
+            "{} [myarena]/foo",
+            forced_style("  Connecting").yellow().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} [myarena]/bar                               (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 2 active jobs",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+                arena,
+                job_id: job1,
+            }))
+            .await;
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(
+                ChurtenNotification::UpdateByteCount {
+                    arena,
+                    job_id: job1,
+                    current_bytes: 1024 * 1024,
+                    total_bytes: 4 * 1024 * 1024,
+                },
+            ))
+            .await;
+
+        exp.reset();
+        exp.write_line(&format!(
+            "{} [myarena]/foo                               (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} [myarena]/bar                               (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 2 active jobs",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
+
+        fixture
+            .display
+            .update(ChurtenUpdates::Notify(ChurtenNotification::Stop {
+                arena,
+                job_id: job2,
+                progress: JobProgress::Done,
+            }))
+            .await;
+
+        exp.reset();
+        exp.write_line(&format!(
+            "{} [myarena]/bar (4.00 MiB)",
+            forced_style("Downloaded").green().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} [myarena]/foo                               (1.00 MiB/4.00 MiB) 25%",
+            forced_style("    Download").cyan().bold(),
+        ))?;
+        exp.write_line(&format!(
+            "{} 1 active job",
+            forced_style("  Processing").cyan().bold(),
+        ))?;
+        assert_eq!(fixture.expected(), fixture.actual());
 
         Ok(())
     }

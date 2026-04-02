@@ -84,12 +84,10 @@ struct ChurtenNotification {
   struct UpdateByteCount {
     currentBytes @0: UInt64;
     totalBytes @1: UInt64;
-    index @2: UInt32;
   }
 
   struct UpdateAction {
     action @0: JobAction;
-    index @1: UInt32;
   }
 }
 
@@ -105,7 +103,6 @@ struct JobInfo {
   progress @3: JobProgress;
   action @4: JobAction;
   byteProgress @5: ByteProgress;
-  notificationIndex @6: UInt32;
 }
 
 struct ByteProgress {

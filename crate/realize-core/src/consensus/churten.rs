@@ -82,7 +82,9 @@ impl<H: JobHandler + 'static> Churten<H> {
 
             async move {
                 while let Ok(n) = rx.recv().await {
-                    tracker.write().await.update(&n);
+                    let mut lock = tracker.write().await;
+                    lock.update(&n);
+                    lock.remove_finished();
                 }
             }
         });
@@ -131,7 +133,6 @@ impl<H: JobHandler + 'static> Churten<H> {
                     progress,
                     action: None,
                     byte_progress: None,
-                    notification_index: 0,
                 },
             );
         }
@@ -246,7 +247,7 @@ async fn background_job<H: JobHandler>(
                             }
                         },
                     };
-                    let _ = tx.send(ChurtenNotification::Finish {
+                    let _ = tx.send(ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: match &status {
@@ -403,7 +404,6 @@ mod tests {
                         arena,
                         job_id,
                         action: JobAction::Download,
-                        index: 2,
                     },
                     rx.recv().await?
                 );
@@ -414,7 +414,6 @@ mod tests {
                         job_id,
                         current_bytes: 0,
                         total_bytes: 11,
-                        index: 3,
                     },
                     rx.recv().await?
                 );
@@ -425,7 +424,6 @@ mod tests {
                         job_id,
                         current_bytes: 11,
                         total_bytes: 11,
-                        index: 4,
                     },
                     rx.recv().await?
                 );
@@ -435,13 +433,12 @@ mod tests {
                         arena,
                         job_id,
                         action: JobAction::Verify,
-                        index: 5,
                     },
                     rx.recv().await?
                 );
 
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done
@@ -497,7 +494,7 @@ mod tests {
 
                 // the job cannot connect to the peer, because it is disconnected
                 while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
-                    if let ChurtenNotification::Finish { progress, .. } = n {
+                    if let ChurtenNotification::Stop { progress, .. } = n {
                         assert_eq!(JobProgress::NoPeers, progress);
                         break;
                     }
@@ -506,7 +503,7 @@ mod tests {
                 // upon reconnection, the job is retried and succeeds
                 testing::connect(&household_a, b).await?;
                 while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
-                    if let ChurtenNotification::Finish { progress, .. } = n {
+                    if let ChurtenNotification::Stop { progress, .. } = n {
                         assert_eq!(JobProgress::Done, progress);
                         break;
                     }
@@ -629,7 +626,6 @@ mod tests {
                         job_id,
                         current_bytes: 50 * 1024,
                         total_bytes: 100 * 1024,
-                        index: 2,
                     },
                     rx.recv().await?
                 );
@@ -640,14 +636,13 @@ mod tests {
                         job_id,
                         current_bytes: 100 * 1024,
                         total_bytes: 100 * 1024,
-                        index: 3,
                     },
                     rx.recv().await?
                 );
 
                 // Check Done notification
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -705,7 +700,7 @@ mod tests {
 
                 // Check Abandoned notification
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Abandoned,
@@ -760,7 +755,7 @@ mod tests {
 
                 // Check Failed notification
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Failed(JobError::InconsistentHash.to_string()),
@@ -822,7 +817,7 @@ mod tests {
 
                 // Check Cancelled notification
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Cancelled
@@ -880,7 +875,7 @@ mod tests {
 
                 // Check Done notification (no progress updates)
                 assert_eq!(
-                    ChurtenNotification::Finish {
+                    ChurtenNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -966,7 +961,7 @@ mod tests {
                     ));
                     assert!(matches!(
                         job_notifications[2],
-                        ChurtenNotification::Finish {
+                        ChurtenNotification::Stop {
                             progress: JobProgress::Done,
                             ..
                         }
@@ -1013,7 +1008,7 @@ mod tests {
                     tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
                 {
                     match notification {
-                        ChurtenNotification::Finish { .. } => {
+                        ChurtenNotification::Stop { .. } => {
                             finished_count += 1;
                             if finished_count == 3 {
                                 break;

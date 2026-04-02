@@ -12,11 +12,13 @@ pub enum ChurtenNotification {
         job: Arc<Job>,
     },
 
-    /// Start a pending job, which enters state [JobProgress::Running].
+    /// Start processing a pending job, which enters state
+    /// [JobProgress::Running].
     Start { arena: Arena, job_id: JobId },
 
-    /// Finish a job, successfully or not.
-    Finish {
+    /// Stop processing the job. [JobProgress] specifies the new job
+    /// status, which might be a final status..
+    Stop {
         arena: Arena,
         job_id: JobId,
         progress: JobProgress,
@@ -30,10 +32,6 @@ pub enum ChurtenNotification {
     UpdateAction {
         arena: Arena,
         job_id: JobId,
-
-        /// Notification sequence index for this specific job, for
-        /// de-duplication.
-        index: u32,
         action: JobAction,
     },
 
@@ -43,10 +41,6 @@ pub enum ChurtenNotification {
     UpdateByteCount {
         arena: Arena,
         job_id: JobId,
-
-        /// Notification sequence index for this specific job, for
-        /// de-duplication.
-        index: u32,
 
         /// Current number of bytes.
         ///
@@ -73,7 +67,7 @@ impl ChurtenNotification {
         match self {
             ChurtenNotification::New { arena, .. } => *arena,
             ChurtenNotification::Start { arena, .. } => *arena,
-            ChurtenNotification::Finish { arena, .. } => *arena,
+            ChurtenNotification::Stop { arena, .. } => *arena,
             ChurtenNotification::UpdateByteCount { arena, .. } => *arena,
             ChurtenNotification::UpdateAction { arena, .. } => *arena,
         }
@@ -82,7 +76,7 @@ impl ChurtenNotification {
         match self {
             ChurtenNotification::New { job_id, .. } => *job_id,
             ChurtenNotification::Start { job_id, .. } => *job_id,
-            ChurtenNotification::Finish { job_id, .. } => *job_id,
+            ChurtenNotification::Stop { job_id, .. } => *job_id,
             ChurtenNotification::UpdateByteCount { job_id, .. } => *job_id,
             ChurtenNotification::UpdateAction { job_id, .. } => *job_id,
         }
@@ -117,7 +111,8 @@ pub enum JobProgress {
 }
 
 impl JobProgress {
-    pub fn is_finished(&self) -> bool {
+    /// Return true if this is a final progress.
+    pub fn is_final(&self) -> bool {
         match self {
             JobProgress::Pending => false,
             JobProgress::Running => false,
