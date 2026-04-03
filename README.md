@@ -6,55 +6,27 @@
 
 Realize is a decentralized file-syncing solution, with support for
 partial syncing. Available files are presented as a unified filesystem
-that combines remote files, with local data and modifications.
+that combines remote files with local data and modifications.
 
 When remote files change, updates are tracked locally and later
 synchronized with trusted peers. Peers may choose which files they
 keep locally and share with others and which files are only available
 through the cache.
 
-This project is written in Rust and supports Linux and MacOS (with
-certain limitations).
-
-## **Work In Progress**
-
-> [!IMPORTANT] The Realize project is currently under development.
-> While it is usable, it is not reliable and documentation is very
-> much lacking. There are no guarantees of backward compatibility.
+This project is written in Rust and supports Linux and MacOS (through
+FUSE). At this point, it is only available as a command-line tool.
 
 ## Design
 
 For a detailed description of the project architecture and features,
 refer to the [design document](spec/design.md).
 
-Realize will advance through several key stages:
-
-1. Implement basic file transfer between peers via a command line
-   tool.
-
-2. Expose remote files, partially cached locally, as a filesystem. See
-   [The Unreal](spec/unreal.md). *available*
-
-3. Provide a customizable, merged view of local and remote files on
-   Linux and MacOS. See [The Real](spec/real.md). *in progress*
-
-4. Add a user interface for MacOS and Linux. *planned*
-
-5. Offer installable packages for MacOS and Linux. *planned*
-
-6. Develop a customizable merged view for MacOS. *planned*
-
-7. Include support for Windows. *planned*
-
 ## Development
 
 ### Requirements
 
-- Linux for the complete system (as it requires
-  [inotify](https://man7.org/linux/man-pages/man7/inotify.7.html)); a
-  subset of functionality is also available on MacOS.
-
-- Rust for development.
+- Linux or MacOS with MacFUSE or FUSE-t installed.
+- Rust development environment
 
 ### Getting Started
 
@@ -95,8 +67,3 @@ For questions or support, please [open a discussion
 thread](https://github.com/realize-sync/realize/discussions) or [create
 an issue](https://github.com/realize-sync/realize/issues) in the
 repository.
-
-## Get Involved
-
-Stay updated as we continue developing the Realize project. Follow us
-on GitHub for the latest releases and discussions!
