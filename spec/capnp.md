@@ -1,22 +1,33 @@
----
-description: Working with capnp protos
-globs: *.rs
-alwaysApply: false
----
+# Programming with Capnp Protocol Buffers
 
-# Capnp Protocol Buffer Best Practices
+This document attempts to provide some help for working with capnp
+protocol buffers in Rust projects.
 
-This rule documents best practices for working with capnp protocol buffers in Rust projects.
+## References
 
-## Rule Details
+- [Capnp Rust Documentation](https://docs.rs/capnp)
+- [Capnp Schema Language](https://capnproto.org/language.html)
+- [Capnp Rust Examples](https://github.com/capnproto/capnproto-rust)
 
-- **Pattern**: `*.rs`
-- **Severity**: Warning
-- **Category**: Protocol Buffers
+## Best Practices
+
+In short,
+
+1. **Always bind Result values to variables** before using them multiple times
+2. **Use `into_reader()`** to convert Builder to Reader for reading
+3. **Handle union variants carefully** - they return `Result<Reader, Error>`
+4. **Boolean methods return bool**, not Result
+5. **Write comprehensive round-trip tests** for all data structures
+6. **Use meaningful error messages** when converting between types
+7. **Document the relationship** between capnp and Rust types
+8. **Use `reborrow()`** when building nested structures to avoid ownership issues
+9. **Create lists with correct size** using `init_res(actual_size)`
+10. **Handle async RPC methods** with `Promise::from_future`
+11. **Test RPC methods** with integration tests that verify the full client-server flow
 
 ## Key Concepts
 
-### 1. Generated Code 
+### 1. Generated Code
 
 Capnp generates Rust code with the following structure:
 - **Reader types**: For reading data from capnp messages
@@ -24,7 +35,12 @@ Capnp generates Rust code with the following structure:
 - **Which enums**: For handling union types
 - **Owned types**: Type aliases for owned versions
 
-The code is generated automatically from .capnp files by cargo commands such as "cargo check", "cargo test" or "cargo build"; this is controlled by a build.rs file.
+The code is generated automatically from .capnp files by cargo
+commands such as "cargo check", "cargo test" or "cargo build"; this is
+controlled by a `build.rs` file.
+
+When adding a new capnp file, add it to the relevant crate's
+`build.rs` file then import it from the appropriate rust package.
 
 ### 2. Message Lifecycle
 
@@ -379,26 +395,6 @@ nested.set_field(value);
 dest.set_other_field(other_value); // Works
 ```
 
-## Best Practices
-
-1. **Always bind Result values to variables** before using them multiple times
-2. **Use `into_reader()`** to convert Builder to Reader for reading
-3. **Handle union variants carefully** - they return `Result<Reader, Error>`
-4. **Boolean methods return bool**, not Result
-5. **Write comprehensive round-trip tests** for all data structures
-6. **Use meaningful error messages** when converting between types
-7. **Document the relationship** between capnp and Rust types
-8. **Use `reborrow()`** when building nested structures to avoid ownership issues
-9. **Create lists with correct size** using `init_res(actual_size)`
-10. **Handle async RPC methods** with `Promise::from_future`
-11. **Test RPC methods** with integration tests that verify the full client-server flow
-
-## References
-
-- [Capnp Rust Documentation](https://docs.rs/capnp)
-- [Capnp Schema Language](https://capnproto.org/language.html)
-- [Capnp Rust Examples](https://github.com/capnproto/capnproto-rust)
-
 ## Examples
 
 ### Complete Example: RPC Server with Lists
@@ -532,4 +528,5 @@ async fn test_recent_jobs() -> anyhow::Result<()> {
 }
 ```
 
-This rule ensures proper handling of capnp protocol buffers in Rust projects, preventing common pitfalls and maintaining type safety.
+This ensures proper handling of capnp protocol buffers in Rust
+projects, preventing common pitfalls and maintaining type safety.
