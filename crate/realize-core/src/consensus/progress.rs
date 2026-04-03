@@ -1,4 +1,4 @@
-use super::types::{ChurtenNotification, JobAction};
+use super::types::{TransferNotification, JobAction};
 use realize_storage::JobId;
 use realize_types::Arena;
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ pub(crate) trait ByteCountProgress {
 ///
 /// The number of bytecount update may optionally be limited.
 pub(crate) struct TxByteCountProgress {
-    tx: broadcast::Sender<ChurtenNotification>,
+    tx: broadcast::Sender<TransferNotification>,
     arena: Arena,
     job_id: JobId,
     resolution_bytes: u64,
@@ -28,7 +28,7 @@ impl TxByteCountProgress {
     pub(crate) fn new(
         arena: Arena,
         job_id: JobId,
-        tx: broadcast::Sender<ChurtenNotification>,
+        tx: broadcast::Sender<TransferNotification>,
     ) -> Self {
         Self {
             arena,
@@ -85,7 +85,7 @@ impl TxByteCountProgress {
 
 impl ByteCountProgress for TxByteCountProgress {
     fn update_action(&mut self, action: JobAction) {
-        let _ = self.tx.send(ChurtenNotification::UpdateAction {
+        let _ = self.tx.send(TransferNotification::UpdateAction {
             arena: self.arena,
             job_id: self.job_id,
             action,
@@ -94,7 +94,7 @@ impl ByteCountProgress for TxByteCountProgress {
     fn update(&mut self, current_bytes: u64, total_bytes: u64) {
         if self.should_send(current_bytes, total_bytes) {
             self.last_bytecount_update = Some((current_bytes, total_bytes, Instant::now()));
-            let _ = self.tx.send(ChurtenNotification::UpdateByteCount {
+            let _ = self.tx.send(TransferNotification::UpdateByteCount {
                 arena: self.arena,
                 job_id: self.job_id,
                 current_bytes,
@@ -159,9 +159,9 @@ mod tests {
     use tokio::task::{self, JoinHandle};
 
     struct Fixture {
-        accumulator: Option<JoinHandle<Vec<ChurtenNotification>>>,
-        tx: Option<broadcast::Sender<ChurtenNotification>>,
-        weak_tx: broadcast::WeakSender<ChurtenNotification>,
+        accumulator: Option<JoinHandle<Vec<TransferNotification>>>,
+        tx: Option<broadcast::Sender<TransferNotification>>,
+        weak_tx: broadcast::WeakSender<TransferNotification>,
     }
 
     impl Fixture {
@@ -193,7 +193,7 @@ mod tests {
             )
         }
 
-        async fn take_notifications(&mut self) -> anyhow::Result<Vec<ChurtenNotification>> {
+        async fn take_notifications(&mut self) -> anyhow::Result<Vec<TransferNotification>> {
             assert!(
                 self.weak_tx.upgrade().is_none(),
                 "Drop channel before calling take_notifications"
@@ -217,12 +217,12 @@ mod tests {
         let notifications = fixture.take_notifications().await?;
         assert_eq!(
             vec![
-                ChurtenNotification::UpdateAction {
+                TransferNotification::UpdateAction {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
                     action: JobAction::Download,
                 },
-                ChurtenNotification::UpdateByteCount {
+                TransferNotification::UpdateByteCount {
                     arena: Arena::from("myarena"),
                     job_id: JobId(1),
                     current_bytes: 0,
@@ -272,12 +272,12 @@ mod tests {
         Ok(())
     }
 
-    fn min_delta(notifications: Vec<ChurtenNotification>) -> u64 {
+    fn min_delta(notifications: Vec<TransferNotification>) -> u64 {
         let mut last = None;
         let mut ret = u64::max_value();
         for n in notifications {
             match n {
-                ChurtenNotification::UpdateByteCount { current_bytes, .. } => {
+                TransferNotification::UpdateByteCount { current_bytes, .. } => {
                     if let Some(last_current_bytes) = last {
                         ret = min(ret, delta(last_current_bytes, current_bytes));
                     }

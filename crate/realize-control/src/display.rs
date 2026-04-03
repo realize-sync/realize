@@ -3,13 +3,13 @@ use crate::output::Output;
 use super::output::{self, MessageType, OutputMode};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget};
 use realize_core::consensus::tracker::{JobInfo, JobInfoTracker};
-use realize_core::consensus::types::{ChurtenNotification, JobAction, JobProgress};
-use realize_core::rpc::control::client::ChurtenUpdates;
+use realize_core::consensus::types::{TransferNotification, JobAction, JobProgress};
+use realize_core::rpc::control::client::TransferUpdates;
 use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::collections::HashMap;
 
-pub(crate) struct ChurtenDisplay {
+pub(crate) struct TransferDisplay {
     output: Output,
     tracker: JobInfoTracker,
     multi: MultiProgress,
@@ -21,7 +21,7 @@ pub(crate) struct ChurtenDisplay {
     had_jobs: bool,
 }
 
-impl ChurtenDisplay {
+impl TransferDisplay {
     pub(crate) fn default(output: Output) -> Self {
         let target = if output.mode() == OutputMode::Progress {
             ProgressDrawTarget::stdout()
@@ -52,15 +52,15 @@ impl ChurtenDisplay {
         self.overall_bar.finish_and_clear();
     }
 
-    pub(crate) async fn update(&mut self, updates: ChurtenUpdates) {
+    pub(crate) async fn update(&mut self, updates: TransferUpdates) {
         match updates {
-            ChurtenUpdates::Reset(jobs) => {
+            TransferUpdates::Reset(jobs) => {
                 let total = jobs.len();
                 log_jobs(&jobs, total);
                 self.init(&jobs);
                 self.tracker.init(jobs);
             }
-            ChurtenUpdates::Notify(n) => {
+            TransferUpdates::Notify(n) => {
                 eprintln!("==== Notify {n:?}");
                 if !self.tracker.update(&n) {
                     eprintln!("==== OUT OF ORDER");
@@ -82,9 +82,9 @@ impl ChurtenDisplay {
         }
     }
 
-    fn print_all_error(&mut self, n: &ChurtenNotification) {
+    fn print_all_error(&mut self, n: &TransferNotification) {
         match n {
-            ChurtenNotification::Stop { progress, .. } => match progress {
+            TransferNotification::Stop { progress, .. } => match progress {
                 JobProgress::Pending | JobProgress::Done => {}
                 JobProgress::Failed(msg) => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
@@ -103,9 +103,9 @@ impl ChurtenDisplay {
         }
     }
 
-    fn print_all_success(&mut self, n: &ChurtenNotification) {
+    fn print_all_success(&mut self, n: &TransferNotification) {
         match n {
-            ChurtenNotification::Stop { progress, .. } => match progress {
+            TransferNotification::Stop { progress, .. } => match progress {
                 JobProgress::Done => {
                     if let Some(job) = self.tracker.get(&n.global_job_id()) {
                         print_job_done(&self.output, job);
@@ -117,15 +117,15 @@ impl ChurtenDisplay {
         }
     }
 
-    fn print_has_jobs(&mut self, n: &ChurtenNotification) {
+    fn print_has_jobs(&mut self, n: &TransferNotification) {
         match n {
-            ChurtenNotification::New { .. } => {
+            TransferNotification::New { .. } => {
                 if !self.had_jobs && !self.tracker.is_empty() {
                     self.had_jobs = true;
                     self.output.print_progress("Processing", "...");
                 }
             }
-            ChurtenNotification::Stop { .. } => {
+            TransferNotification::Stop { .. } => {
                 if self.had_jobs && self.tracker.is_empty() {
                     self.had_jobs = false;
                     self.output
@@ -171,15 +171,15 @@ impl ChurtenDisplay {
         update_overall_bar(&self.overall_bar, active_count);
     }
 
-    fn update_bar_from_notification(&mut self, n: &ChurtenNotification) {
+    fn update_bar_from_notification(&mut self, n: &TransferNotification) {
         if let Some(job) = self.tracker.get(&n.global_job_id()) {
             match n {
-                ChurtenNotification::New { .. } => {
+                TransferNotification::New { .. } => {
                     let bar = self.create_bar(job);
                     self.job_bars.insert(n.global_job_id(), bar);
                     update_overall_bar(&self.overall_bar, self.tracker.len());
                 }
-                ChurtenNotification::Stop { progress, .. } => {
+                TransferNotification::Stop { progress, .. } => {
                     if let Some(bar) = self.job_bars.get_mut(&n.global_job_id()) {
                         update_bar_for_job(bar, job);
                     }
@@ -224,11 +224,11 @@ impl ChurtenDisplay {
         }
     }
 
-    fn log_notification(&self, n: &ChurtenNotification) {
+    fn log_notification(&self, n: &TransferNotification) {
         if let Some(job) = self.tracker.get(&n.global_job_id()) {
             match n {
-                ChurtenNotification::New { .. } => {}
-                ChurtenNotification::Start { .. } | ChurtenNotification::Stop { .. } => {
+                TransferNotification::New { .. } => {}
+                TransferNotification::Start { .. } | TransferNotification::Stop { .. } => {
                     let progress = &job.progress;
                     match progress {
                         JobProgress::Pending => {}
@@ -246,10 +246,10 @@ impl ChurtenDisplay {
                         }
                     };
                 }
-                ChurtenNotification::UpdateAction { action, .. } => {
+                TransferNotification::UpdateAction { action, .. } => {
                     log::info!("{}", format_log_string(job, &format!("{action:?} ")));
                 }
-                ChurtenNotification::UpdateByteCount { .. } => {}
+                TransferNotification::UpdateByteCount { .. } => {}
             }
         }
     }
@@ -390,14 +390,14 @@ mod tests {
 
     struct Fixture {
         out: OutputFixture,
-        display: ChurtenDisplay,
+        display: TransferDisplay,
     }
 
     impl Fixture {
         fn setup() -> anyhow::Result<Self> {
             set_colors_enabled(true);
             let out = OutputFixture::setup(OutputMode::Progress)?;
-            let display = ChurtenDisplay::new(
+            let display = TransferDisplay::new(
                 out.output.clone(),
                 ProgressDrawTarget::term_like(Box::new(out.actual.clone())),
             );
@@ -613,7 +613,7 @@ mod tests {
         let job1 = JobId(1);
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::New {
+            .update(TransferUpdates::Notify(TransferNotification::New {
                 arena,
                 job_id: job1,
                 job: Arc::new(Job::Download(Path::parse("foo").unwrap(), Hash([1u8; 32]))),
@@ -634,7 +634,7 @@ mod tests {
         let job2 = JobId(2);
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::New {
+            .update(TransferUpdates::Notify(TransferNotification::New {
                 arena,
                 job_id: job2,
                 job: Arc::new(Job::Download(Path::parse("bar").unwrap(), Hash([1u8; 32]))),
@@ -658,7 +658,7 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+            .update(TransferUpdates::Notify(TransferNotification::Start {
                 arena,
                 job_id: job2,
             }))
@@ -666,7 +666,7 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::UpdateAction {
+            .update(TransferUpdates::Notify(TransferNotification::UpdateAction {
                 arena,
                 job_id: job2,
                 action: JobAction::Download,
@@ -674,8 +674,8 @@ mod tests {
             .await;
         fixture
             .display
-            .update(ChurtenUpdates::Notify(
-                ChurtenNotification::UpdateByteCount {
+            .update(TransferUpdates::Notify(
+                TransferNotification::UpdateByteCount {
                     arena,
                     job_id: job2,
                     current_bytes: 1024 * 1024,
@@ -701,7 +701,7 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+            .update(TransferUpdates::Notify(TransferNotification::Start {
                 arena,
                 job_id: job1,
             }))
@@ -709,7 +709,7 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::Stop {
+            .update(TransferUpdates::Notify(TransferNotification::Stop {
                 arena,
                 job_id: job1,
                 progress: JobProgress::NoPeers,
@@ -733,15 +733,15 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::Start {
+            .update(TransferUpdates::Notify(TransferNotification::Start {
                 arena,
                 job_id: job1,
             }))
             .await;
         fixture
             .display
-            .update(ChurtenUpdates::Notify(
-                ChurtenNotification::UpdateByteCount {
+            .update(TransferUpdates::Notify(
+                TransferNotification::UpdateByteCount {
                     arena,
                     job_id: job1,
                     current_bytes: 1024 * 1024,
@@ -767,7 +767,7 @@ mod tests {
 
         fixture
             .display
-            .update(ChurtenUpdates::Notify(ChurtenNotification::Stop {
+            .update(TransferUpdates::Notify(TransferNotification::Stop {
                 arena,
                 job_id: job2,
                 progress: JobProgress::Done,

@@ -2,9 +2,9 @@ use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::sync::Arc;
 
-/// Notifications broadcast by [Churten].
+/// Notifications broadcast by [Transfer].
 #[derive(Debug, Clone, PartialEq)]
-pub enum ChurtenNotification {
+pub enum TransferNotification {
     /// Report a new job, in state [JobProgress::Pending].
     New {
         arena: Arena,
@@ -57,7 +57,7 @@ pub enum ChurtenNotification {
     },
 }
 
-impl ChurtenNotification {
+impl TransferNotification {
     /// A globally-unique identifier for the job.
     pub fn global_job_id(&self) -> (Arena, JobId) {
         (self.arena(), self.job_id())
@@ -65,25 +65,25 @@ impl ChurtenNotification {
 
     pub fn arena(&self) -> Arena {
         match self {
-            ChurtenNotification::New { arena, .. } => *arena,
-            ChurtenNotification::Start { arena, .. } => *arena,
-            ChurtenNotification::Stop { arena, .. } => *arena,
-            ChurtenNotification::UpdateByteCount { arena, .. } => *arena,
-            ChurtenNotification::UpdateAction { arena, .. } => *arena,
+            TransferNotification::New { arena, .. } => *arena,
+            TransferNotification::Start { arena, .. } => *arena,
+            TransferNotification::Stop { arena, .. } => *arena,
+            TransferNotification::UpdateByteCount { arena, .. } => *arena,
+            TransferNotification::UpdateAction { arena, .. } => *arena,
         }
     }
     pub fn job_id(&self) -> JobId {
         match self {
-            ChurtenNotification::New { job_id, .. } => *job_id,
-            ChurtenNotification::Start { job_id, .. } => *job_id,
-            ChurtenNotification::Stop { job_id, .. } => *job_id,
-            ChurtenNotification::UpdateByteCount { job_id, .. } => *job_id,
-            ChurtenNotification::UpdateAction { job_id, .. } => *job_id,
+            TransferNotification::New { job_id, .. } => *job_id,
+            TransferNotification::Start { job_id, .. } => *job_id,
+            TransferNotification::Stop { job_id, .. } => *job_id,
+            TransferNotification::UpdateByteCount { job_id, .. } => *job_id,
+            TransferNotification::UpdateAction { job_id, .. } => *job_id,
         }
     }
 }
 
-/// Job progress reported by [ChurtenNotification]
+/// Job progress reported by [TransferNotification]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobProgress {
     /// The job has been created, but not yet started.
@@ -98,7 +98,7 @@ pub enum JobProgress {
     /// The job was abandoned, likely because it is outdated.
     Abandoned,
 
-    /// The job was cancelled by a call to [Churten::shutdown].
+    /// The job was cancelled by a call to [Transfer::shutdown].
     Cancelled,
 
     /// Peers the job needed to connect to were offline.

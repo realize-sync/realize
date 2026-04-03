@@ -11,7 +11,7 @@ use crate::output::Output;
 
 mod arena_cmd;
 mod attr_cmd;
-mod churten_cmd;
+mod transfer_cmd;
 mod display;
 mod output;
 mod peer_cmd;
@@ -40,9 +40,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Churten {
+    Transfer {
         #[command(subcommand)]
-        command: ChurtenCommands,
+        command: TransferCommands,
     },
 
     Peer {
@@ -61,17 +61,17 @@ enum Commands {
 }
 
 #[derive(Subcommand, Debug)]
-enum ChurtenCommands {
-    /// Start churten
+enum TransferCommands {
+    /// Start transfer
     Start,
-    /// Stop churten
+    /// Stop transfer
     Stop,
-    /// Check if churten is running.
+    /// Check if transfer is running.
     ///
     /// In quiet mode, print nothing and exit with status 10 if
-    /// churten is not running.
+    /// transfer is not running.
     IsRunning,
-    /// Connect and print statusnotifications, start churten if
+    /// Connect and print statusnotifications, start transfer if
     /// necessary.
     Connect,
 }
@@ -222,18 +222,18 @@ async fn execute(cli: Cli, output: &Output) -> anyhow::Result<i32> {
 
             // Execute the appropriate command
             match cli.command {
-                Commands::Churten { command } => match command {
-                    ChurtenCommands::Start => {
-                        churten_cmd::execute_churten_start(&control, output).await
+                Commands::Transfer { command } => match command {
+                    TransferCommands::Start => {
+                        transfer_cmd::execute_transfer_start(&control, output).await
                     }
-                    ChurtenCommands::Stop => {
-                        churten_cmd::execute_churten_stop(&control, output).await
+                    TransferCommands::Stop => {
+                        transfer_cmd::execute_transfer_stop(&control, output).await
                     }
-                    ChurtenCommands::IsRunning => {
-                        churten_cmd::execute_churten_is_running(&control, output).await
+                    TransferCommands::IsRunning => {
+                        transfer_cmd::execute_transfer_is_running(&control, output).await
                     }
-                    ChurtenCommands::Connect => {
-                        churten_cmd::execute_churten_connect(&control, output).await
+                    TransferCommands::Connect => {
+                        transfer_cmd::execute_transfer_connect(&control, output).await
                     }
                 },
 

@@ -7,7 +7,7 @@ $Rust.parentModule("rpc::control");
 
 # Control the local realize server.
 interface Control {
-  churten @0 () -> (churten: Churten);
+  transfer @0 () -> (transfer: Transfer);
   
   listPeers @1 () -> (res:List(PeerConnectionInfo));
   # list peers and their connection status
@@ -39,7 +39,7 @@ struct PeerConnectionInfo {
 
 
 
-interface Churten {
+interface Transfer {
   subscribe @0 (subscriber: Subscriber) -> ();
   start @1 () -> ();
   shutdown @2 () -> ();
@@ -47,7 +47,7 @@ interface Churten {
   allJobs @4 () -> (jobs: List(JobInfo)); # List pending, active and failed jobs.
 
   interface Subscriber {
-    notify @0 (notification: ChurtenNotification) -> stream;
+    notify @0 (notification: TransferNotification) -> stream;
 
     reset @1 (jobs: List(JobInfo)) -> stream;
     # Provide a list of active jobs as catchup and as a
@@ -59,7 +59,7 @@ interface Churten {
   }
 }
 
-struct ChurtenNotification {
+struct TransferNotification {
   arena @0: Text;
   jobId @1: UInt64;
 

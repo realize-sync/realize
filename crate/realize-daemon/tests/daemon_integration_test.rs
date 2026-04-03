@@ -400,15 +400,15 @@ async fn daemon_binds_socket() -> anyhow::Result<()> {
             let control: realize_core::rpc::control::control_capnp::control::Client =
                 unixsocket::connect(&fixture.socket).await?;
 
-            let churten = control
-                .churten_request()
+            let transfer = control
+                .transfer_request()
                 .send()
                 .promise
                 .await?
                 .get()?
-                .get_churten()?;
+                .get_transfer()?;
 
-            let is_running_result = churten.is_running_request().send().promise.await?;
+            let is_running_result = transfer.is_running_request().send().promise.await?;
             assert!(!is_running_result.get()?.get_running());
 
             Ok::<_, anyhow::Error>(())

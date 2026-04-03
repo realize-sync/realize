@@ -1,5 +1,5 @@
 use super::config::Config;
-use crate::consensus::churten::Churten;
+use crate::consensus::transfer::Transfer;
 use crate::fs::downloader::Downloader;
 use crate::fs::fuse::{self, FuseHandle};
 use crate::rpc::Household;
@@ -96,10 +96,10 @@ impl SetupHelper {
         };
 
         let token = CancellationToken::new();
-        let mut churten = Churten::new(&self.storage, &self.household);
-        churten.start();
+        let mut transfer = Transfer::new(&self.storage, &self.household);
+        transfer.start();
         let control_server =
-            ControlServer::new(Arc::clone(&self.storage), churten, self.household.clone());
+            ControlServer::new(Arc::clone(&self.storage), transfer, self.household.clone());
         unixsocket::bind(
             local,
             path.as_ref(),

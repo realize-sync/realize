@@ -2,18 +2,18 @@
 #![allow(refining_impl_trait)] // for capnp-rpc
 
 use super::control_capnp;
-use super::control_capnp::churten::{
+use super::control_capnp::transfer::{
     self, AllJobsParams, AllJobsResults, IsRunningParams, IsRunningResults, ShutdownParams,
     ShutdownResults, StartParams, StartResults, SubscribeParams, SubscribeResults,
 };
 use super::control_capnp::control::{
-    self, ChurtenParams, ChurtenResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
+    self, TransferParams, TransferResults, CreateArenaParams, CreateArenaResults, DisconnectParams,
     DisconnectResults, GetAttrParams, GetAttrResults, KeepConnectedParams, KeepConnectedResults,
     ListAttrParams, ListAttrResults, ListPeersParams, ListPeersResults, RemoveArenaParams,
     RemoveArenaResults, SetAttrParams, SetAttrResults,
 };
 use super::convert;
-use crate::consensus::churten::{Churten, JobHandler};
+use crate::consensus::transfer::{Transfer, JobHandler};
 use crate::rpc::{Household, household::ConnectionStatus};
 use capnp::capability::Promise;
 use realize_storage::{SanityCheck, Storage, StorageError};
@@ -27,19 +27,19 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(crate) struct ControlServer<H: JobHandler + 'static> {
     storage: Arc<Storage>,
-    churten: Rc<RefCell<Churten<H>>>,
+    transfer: Rc<RefCell<Transfer<H>>>,
     household: Arc<Household>,
 }
 
 impl<H: JobHandler + 'static> ControlServer<H> {
     pub(crate) fn new(
         storage: Arc<Storage>,
-        churten: Churten<H>,
+        transfer: Transfer<H>,
         household: Arc<Household>,
     ) -> ControlServer<H> {
         Self {
             storage,
-            churten: Rc::new(RefCell::new(churten)),
+            transfer: Rc::new(RefCell::new(transfer)),
             household,
         }
     }
@@ -50,15 +50,15 @@ impl<H: JobHandler + 'static> ControlServer<H> {
 }
 
 impl<H: JobHandler + 'static> control::Server for ControlServer<H> {
-    fn churten(
+    fn transfer(
         self: Rc<Self>,
-        _: ChurtenParams,
-        mut results: ChurtenResults,
+        _: TransferParams,
+        mut results: TransferResults,
     ) -> Promise<(), capnp::Error> {
         results
             .get()
-            .set_churten(capnp_rpc::new_client(ChurtenServer {
-                churten: self.churten.clone(),
+            .set_transfer(capnp_rpc::new_client(TransferServer {
+                transfer: self.transfer.clone(),
             }));
 
         Promise::ok(())
@@ -342,24 +342,24 @@ fn fill_issue(
 }
 
 #[derive(Clone)]
-struct ChurtenServer<H: JobHandler + 'static> {
-    churten: Rc<RefCell<Churten<H>>>,
+struct TransferServer<H: JobHandler + 'static> {
+    transfer: Rc<RefCell<Transfer<H>>>,
 }
 
-impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
+impl<H: JobHandler + 'static> transfer::Server for TransferServer<H> {
     fn subscribe(
         self: Rc<Self>,
         params: SubscribeParams,
         _: SubscribeResults,
     ) -> Promise<(), capnp::Error> {
-        let mut rx = self.churten.borrow().subscribe();
-        let churten = self.churten.clone();
+        let mut rx = self.transfer.borrow().subscribe();
+        let transfer = self.transfer.clone();
 
         Promise::from_future(async move {
             let subscriber = params.get()?.get_subscriber()?;
 
             // First send an initial set of jobs.
-            send_active_jobs(&churten, &subscriber).await?;
+            send_active_jobs(&transfer, &subscriber).await?;
 
             // Forward notifications from tx to the subscriber in the
             // background.
@@ -389,7 +389,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
                             // dropping events in the queue. The client
                             // rely on the set of active jobs to catch up.
                             rx.resubscribe();
-                            if send_active_jobs(&churten, &subscriber).await.is_err() {
+                            if send_active_jobs(&transfer, &subscriber).await.is_err() {
                                 return;
                             }
                         }
@@ -402,7 +402,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
     }
 
     fn start(self: Rc<Self>, _: StartParams, _: StartResults) -> Promise<(), capnp::Error> {
-        self.churten.borrow_mut().start();
+        self.transfer.borrow_mut().start();
 
         Promise::ok(())
     }
@@ -412,7 +412,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         _: ShutdownParams,
         _: ShutdownResults,
     ) -> Promise<(), capnp::Error> {
-        self.churten.borrow_mut().shutdown();
+        self.transfer.borrow_mut().shutdown();
 
         Promise::ok(())
     }
@@ -424,7 +424,7 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
     ) -> Promise<(), capnp::Error> {
         results
             .get()
-            .set_running(self.churten.borrow().is_running());
+            .set_running(self.transfer.borrow().is_running());
 
         Promise::ok(())
     }
@@ -434,9 +434,9 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
         _: AllJobsParams,
         mut results: AllJobsResults,
     ) -> Promise<(), capnp::Error> {
-        let churten = self.churten.clone();
+        let transfer = self.transfer.clone();
         Promise::from_future(async move {
-            let all_jobs = churten
+            let all_jobs = transfer
                 .borrow()
                 .all_jobs()
                 .await
@@ -453,10 +453,10 @@ impl<H: JobHandler + 'static> churten::Server for ChurtenServer<H> {
 }
 
 async fn send_active_jobs<H: JobHandler + 'static>(
-    churten: &Rc<RefCell<Churten<H>>>,
-    subscriber: &control_capnp::churten::subscriber::Client,
+    transfer: &Rc<RefCell<Transfer<H>>>,
+    subscriber: &control_capnp::transfer::subscriber::Client,
 ) -> Result<(), capnp::Error> {
-    let jobs = churten.borrow().active_jobs().await;
+    let jobs = transfer.borrow().active_jobs().await;
 
     let mut request = subscriber.reset_request();
     let mut builder = request.get().init_jobs(jobs.len() as u32);
@@ -501,11 +501,11 @@ fn parse_peer(reader: capnp::text::Reader<'_>) -> Result<Peer, capnp::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::churten::{JobHandler, JobHandlerImpl};
+    use crate::consensus::transfer::{JobHandler, JobHandlerImpl};
     use crate::consensus::jobs::JobError;
     use crate::consensus::progress::{ByteCountProgress, TxByteCountProgress};
-    use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
-    use crate::rpc::control::client::{self, ChurtenUpdates, TxChurtenSubscriber};
+    use crate::consensus::types::{TransferNotification, JobAction, JobProgress};
+    use crate::rpc::control::client::{self, TransferUpdates, TxTransferSubscriber};
     use crate::rpc::testing::{self, HouseholdFixture};
     use crate::rpc::{Household, PeerStatus, result_capnp};
     use assert_fs::TempDir;
@@ -610,8 +610,8 @@ mod tests {
             handler: H,
         ) -> anyhow::Result<PathBuf> {
             let storage = self.inner.storage(peer)?;
-            let churten = Churten::with_handler(Arc::clone(storage), household.clone(), handler);
-            let server = ControlServer::new(Arc::clone(storage), churten, household);
+            let transfer = Transfer::with_handler(Arc::clone(storage), household.clone(), handler);
+            let server = ControlServer::new(Arc::clone(storage), transfer, household);
 
             let sockpath = self
                 .tempdir
@@ -632,7 +632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_rpc_job_succeeds() -> anyhow::Result<()> {
+    async fn transfer_rpc_job_succeeds() -> anyhow::Result<()> {
         let fixture = Fixture::setup().await?;
         let arena = HouseholdFixture::test_arena();
         let peer = HouseholdFixture::a();
@@ -648,27 +648,27 @@ mod tests {
         local
             .run_until(async move {
                 let control = client::connect(&sockpath).await?;
-                let churten = client::get_churten(&control).await?;
+                let transfer = client::get_transfer(&control).await?;
 
-                // Start churten
-                churten.start_request().send().promise.await?;
+                // Start transfer
+                transfer.start_request().send().promise.await?;
 
                 // Check if it's running
-                let is_running_result = churten.is_running_request().send().promise.await?;
+                let is_running_result = transfer.is_running_request().send().promise.await?;
                 assert!(is_running_result.get()?.get_running());
 
                 // Set up a subscription
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<ChurtenUpdates>(10);
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<TransferUpdates>(10);
 
-                let mut subscribe_request = churten.subscribe_request();
+                let mut subscribe_request = transfer.subscribe_request();
                 subscribe_request
                     .get()
-                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                    .set_subscriber(TxTransferSubscriber::new(tx).as_client());
                 subscribe_request.send().promise.await?;
 
                 // Wait for the initial set of jobs (empty)
                 assert_eq!(
-                    ChurtenUpdates::Reset(vec![]),
+                    TransferUpdates::Reset(vec![]),
                     tokio::time::timeout(Duration::from_secs(3), rx.recv())
                         .await?
                         .unwrap()
@@ -703,7 +703,7 @@ mod tests {
 
                 // Verify the notifications
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::New {
+                    TransferUpdates::Notify(TransferNotification::New {
                         arena,
                         job_id: JobId(1),
                         job: Arc::new(Job::Download(foo.clone(), hash.clone()))
@@ -714,7 +714,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::Start {
+                    TransferUpdates::Notify(TransferNotification::Start {
                         arena,
                         job_id: JobId(1),
                     }),
@@ -725,7 +725,7 @@ mod tests {
 
                 // Expect progress sent by FakeJobHandler
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::UpdateAction {
+                    TransferUpdates::Notify(TransferNotification::UpdateAction {
                         arena,
                         job_id: JobId(1),
                         action: JobAction::Download,
@@ -736,7 +736,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::UpdateByteCount {
+                    TransferUpdates::Notify(TransferNotification::UpdateByteCount {
                         arena,
                         job_id: JobId(1),
                         current_bytes: 50,
@@ -748,7 +748,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::UpdateByteCount {
+                    TransferUpdates::Notify(TransferNotification::UpdateByteCount {
                         arena,
                         job_id: JobId(1),
                         current_bytes: 100,
@@ -761,7 +761,7 @@ mod tests {
 
                 // Expect the job to succeed
                 assert_eq!(
-                    ChurtenUpdates::Notify(ChurtenNotification::Stop {
+                    TransferUpdates::Notify(TransferNotification::Stop {
                         arena,
                         job_id: JobId(1),
                         progress: JobProgress::Done,
@@ -771,11 +771,11 @@ mod tests {
                         .unwrap()
                 );
 
-                // Shutdown churten
-                churten.shutdown_request().send().promise.await?;
+                // Shutdown transfer
+                transfer.shutdown_request().send().promise.await?;
 
-                // Make sure that churten is no longer running
-                let is_running_result = churten.is_running_request().send().promise.await?;
+                // Make sure that transfer is no longer running
+                let is_running_result = transfer.is_running_request().send().promise.await?;
                 assert!(!is_running_result.get()?.get_running());
 
                 Ok::<(), anyhow::Error>(())
@@ -803,21 +803,21 @@ mod tests {
         local
             .run_until(async move {
                 let control: control::Client = unixsocket::connect(&sockpath).await?;
-                let churten = control
-                    .churten_request()
+                let transfer = control
+                    .transfer_request()
                     .send()
                     .promise
                     .await?
                     .get()?
-                    .get_churten()?;
+                    .get_transfer()?;
 
-                // Start churten
-                churten.start_request().send().promise.await?;
+                // Start transfer
+                transfer.start_request().send().promise.await?;
                 let (tx, mut rx) = mpsc::channel(10);
-                let mut subscribe_request = churten.subscribe_request();
+                let mut subscribe_request = transfer.subscribe_request();
                 subscribe_request
                     .get()
-                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                    .set_subscriber(TxTransferSubscriber::new(tx).as_client());
                 subscribe_request.send().promise.await?;
 
                 // Create a job by setting up a file to download
@@ -846,8 +846,8 @@ mod tests {
                     .await?;
 
                 // The job should be listed right away, whether or not
-                // it has been picked up by churten.
-                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                // it has been picked up by transfer.
+                let all_jobs_result = transfer.all_jobs_request().send().promise.await?;
                 let jobs = all_jobs_result.get()?.get_jobs()?;
 
                 assert_eq!(jobs.len(), 1);
@@ -870,19 +870,19 @@ mod tests {
                 barrier.wait().await;
                 while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
-                        ChurtenUpdates::Notify(ChurtenNotification::Stop { .. }) => {
+                        TransferUpdates::Notify(TransferNotification::Stop { .. }) => {
                             break;
                         }
                         _ => {}
                     }
                 }
 
-                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                let all_jobs_result = transfer.all_jobs_request().send().promise.await?;
                 let jobs = all_jobs_result.get()?.get_jobs()?;
                 assert_eq!(jobs.len(), 0);
 
-                // Shutdown churten
-                churten.shutdown_request().send().promise.await?;
+                // Shutdown transfer
+                transfer.shutdown_request().send().promise.await?;
 
                 Ok::<(), anyhow::Error>(())
             })
@@ -908,21 +908,21 @@ mod tests {
         local
             .run_until(async move {
                 let control: control::Client = unixsocket::connect(&sockpath).await?;
-                let churten = control
-                    .churten_request()
+                let transfer = control
+                    .transfer_request()
                     .send()
                     .promise
                     .await?
                     .get()?
-                    .get_churten()?;
+                    .get_transfer()?;
 
-                // Start churten
-                churten.start_request().send().promise.await?;
+                // Start transfer
+                transfer.start_request().send().promise.await?;
                 let (tx, mut rx) = mpsc::channel(10);
-                let mut subscribe_request = churten.subscribe_request();
+                let mut subscribe_request = transfer.subscribe_request();
                 subscribe_request
                     .get()
-                    .set_subscriber(TxChurtenSubscriber::new(tx).as_client());
+                    .set_subscriber(TxTransferSubscriber::new(tx).as_client());
                 subscribe_request.send().promise.await?;
 
                 // Create a job by setting up a file to download
@@ -952,7 +952,7 @@ mod tests {
                 // Wait for the job to fail
                 while let Some(n) = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await? {
                     match n {
-                        ChurtenUpdates::Notify(ChurtenNotification::Stop { .. }) => {
+                        TransferUpdates::Notify(TransferNotification::Stop { .. }) => {
                             break;
                         }
                         _ => {}
@@ -960,7 +960,7 @@ mod tests {
                 }
 
                 // Make sure it's listed with the right status
-                let all_jobs_result = churten.all_jobs_request().send().promise.await?;
+                let all_jobs_result = transfer.all_jobs_request().send().promise.await?;
                 let jobs = all_jobs_result.get()?.get_jobs()?;
 
                 assert_eq!(jobs.len(), 1);
@@ -977,8 +977,8 @@ mod tests {
                 let job_info = job.get_job()?;
                 assert_eq!(job_info.get_path()?, "foo");
 
-                // Shutdown churten
-                churten.shutdown_request().send().promise.await?;
+                // Shutdown transfer
+                transfer.shutdown_request().send().promise.await?;
 
                 Ok::<(), anyhow::Error>(())
             })

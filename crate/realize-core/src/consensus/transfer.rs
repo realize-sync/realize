@@ -3,7 +3,7 @@
 use super::jobs::{self, JobError};
 use super::progress::TxByteCountProgress;
 use super::tracker::{JobInfo, JobInfoTracker};
-use super::types::{ChurtenNotification, JobProgress};
+use super::types::{TransferNotification, JobProgress};
 use crate::rpc::{Household, HouseholdOperationError, PeerStatus};
 use futures::StreamExt;
 use realize_storage::{Job, JobId, JobStatus, RetryJob, Storage, StorageError};
@@ -30,7 +30,7 @@ const BROADCAST_CHANNEL_RESOLUTION_BYTES: u64 = 1024;
 /// through.
 const BROADCAST_CHANNEL_BURST_LIMIT: Duration = Duration::from_millis(500);
 
-/// A type that processes jobs and returns the result for [Churten].
+/// A type that processes jobs and returns the result for [Transfer].
 ///
 /// Outside of tests, this is normally [JobHandlerImpl].
 pub(crate) trait JobHandler: Sync + Send + Clone {
@@ -47,18 +47,18 @@ pub(crate) trait JobHandler: Sync + Send + Clone {
 /// Bring the local store and peers closer together.
 ///
 /// Maintains a background job that checks whatever needs to be done
-/// and does it. Call [Churten::subscribe] to be notified of what
+/// and does it. Call [Transfer::subscribe] to be notified of what
 /// happens on that job.
-pub(crate) struct Churten<H: JobHandler> {
+pub(crate) struct Transfer<H: JobHandler> {
     storage: Arc<Storage>,
     household: Arc<Household>,
     handler: H,
     task: Option<(JoinHandle<()>, CancellationToken)>,
-    tx: broadcast::Sender<ChurtenNotification>,
+    tx: broadcast::Sender<TransferNotification>,
     tracker: Arc<RwLock<JobInfoTracker>>,
 }
 
-impl Churten<JobHandlerImpl> {
+impl Transfer<JobHandlerImpl> {
     pub(crate) fn new(storage: &Arc<Storage>, household: &Arc<Household>) -> Self {
         Self::with_handler(
             Arc::clone(storage),
@@ -68,7 +68,7 @@ impl Churten<JobHandlerImpl> {
     }
 }
 
-impl<H: JobHandler + 'static> Churten<H> {
+impl<H: JobHandler + 'static> Transfer<H> {
     pub(crate) fn with_handler(
         storage: Arc<Storage>,
         household: Arc<Household>,
@@ -102,7 +102,7 @@ impl<H: JobHandler + 'static> Churten<H> {
     ///
     /// The number of finished jobs reported by this method is limited.
     ///
-    /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
+    /// This is a snapshot; for up-to-date information, call [Transfer::subscribe].
     pub(crate) async fn all_jobs(&self) -> Result<Vec<JobInfo>, StorageError> {
         let all_jobs = self.storage.all_jobs().await?;
         let mut ret: HashMap<(Arena, JobId), JobInfo> = self
@@ -142,13 +142,13 @@ impl<H: JobHandler + 'static> Churten<H> {
 
     /// Return a list of active jobs.
     ///
-    /// This is a snapshot; for up-to-date information, call [Churten::subscribe].
+    /// This is a snapshot; for up-to-date information, call [Transfer::subscribe].
     pub(crate) async fn active_jobs(&self) -> Vec<JobInfo> {
         self.tracker.read().await.iter().cloned().collect()
     }
 
-    /// Subscribe to [ChurtenNotification]s.
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ChurtenNotification> {
+    /// Subscribe to [TransferNotification]s.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<TransferNotification> {
         self.tx.subscribe()
     }
 
@@ -198,7 +198,7 @@ const PARALLEL_JOB_COUNT: usize = 4;
 async fn background_job<H: JobHandler>(
     storage: &Arc<Storage>,
     handler: &H,
-    tx: broadcast::Sender<ChurtenNotification>,
+    tx: broadcast::Sender<TransferNotification>,
     mut peer_status: broadcast::Receiver<PeerStatus>,
     shutdown: CancellationToken,
 ) {
@@ -207,7 +207,7 @@ async fn background_job<H: JobHandler>(
         .job_stream()
         .map(|(arena, job_id, job)| {
             let job = Arc::new(job);
-            let _ = tx.send(ChurtenNotification::New {
+            let _ = tx.send(TransferNotification::New {
                 arena,
                 job_id,
                 job: Arc::clone(&job),
@@ -247,7 +247,7 @@ async fn background_job<H: JobHandler>(
                             }
                         },
                     };
-                    let _ = tx.send(ChurtenNotification::Stop {
+                    let _ = tx.send(TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: match &status {
@@ -276,11 +276,11 @@ async fn run_job<H: JobHandler>(
     arena: Arena,
     job_id: JobId,
     job: Arc<Job>,
-    tx: &broadcast::Sender<ChurtenNotification>,
+    tx: &broadcast::Sender<TransferNotification>,
     shutdown: CancellationToken,
 ) -> (Arena, JobId, Result<JobStatus, JobError>) {
     log::debug!("[{arena}] Job #{job_id} Starting {job:?}");
-    let _ = tx.send(ChurtenNotification::Start { arena, job_id });
+    let _ = tx.send(TransferNotification::Start { arena, job_id });
     let mut progress = TxByteCountProgress::new(arena, job_id, tx.clone())
         .with_min_byte_delta(BROADCAST_CHANNEL_RESOLUTION_BYTES)
         .with_burst_limit(BROADCAST_CHANNEL_BURST_LIMIT);
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_downloads_file() -> anyhow::Result<()> {
+    async fn transfer_downloads_file() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -374,19 +374,19 @@ mod tests {
                 let storage = fixture.inner.storage(a)?;
                 testing::connect(&household_a, b).await?;
 
-                let mut churten = Churten::with_handler(
+                let mut transfer = Transfer::with_handler(
                     Arc::clone(&storage),
                     household_a.clone(),
                     JobHandlerImpl::new(&storage, &household_a),
                 );
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "this is foo").await?;
                 let job_id = JobId(1);
                 assert_eq!(
-                    ChurtenNotification::New {
+                    TransferNotification::New {
                         arena,
                         job_id,
                         job: Arc::new(Job::Download(foo, hash)),
@@ -395,12 +395,12 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 assert_eq!(
-                    ChurtenNotification::UpdateAction {
+                    TransferNotification::UpdateAction {
                         arena,
                         job_id,
                         action: JobAction::Download,
@@ -409,7 +409,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::UpdateByteCount {
+                    TransferNotification::UpdateByteCount {
                         arena,
                         job_id,
                         current_bytes: 0,
@@ -419,7 +419,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::UpdateByteCount {
+                    TransferNotification::UpdateByteCount {
                         arena,
                         job_id,
                         current_bytes: 11,
@@ -429,7 +429,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::UpdateAction {
+                    TransferNotification::UpdateAction {
                         arena,
                         job_id,
                         action: JobAction::Verify,
@@ -438,7 +438,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done
@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_nopeers() -> anyhow::Result<()> {
+    async fn transfer_nopeers() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -484,17 +484,17 @@ mod tests {
                 // b is disconnected; downloading won't succeed
                 testing::disconnect(&household_a, b).await?;
 
-                let mut churten = Churten::with_handler(
+                let mut transfer = Transfer::with_handler(
                     Arc::clone(&storage),
                     household_a.clone(),
                     JobHandlerImpl::new(&storage, &household_a),
                 );
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 // the job cannot connect to the peer, because it is disconnected
                 while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
-                    if let ChurtenNotification::Stop { progress, .. } = n {
+                    if let TransferNotification::Stop { progress, .. } = n {
                         assert_eq!(JobProgress::NoPeers, progress);
                         break;
                     }
@@ -503,7 +503,7 @@ mod tests {
                 // upon reconnection, the job is retried and succeeds
                 testing::connect(&household_a, b).await?;
                 while let Ok(n) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await? {
-                    if let ChurtenNotification::Stop { progress, .. } = n {
+                    if let TransferNotification::Stop { progress, .. } = n {
                         assert_eq!(JobProgress::Done, progress);
                         break;
                     }
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_job_succeeds() -> anyhow::Result<()> {
+    async fn transfer_job_succeeds() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -598,10 +598,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(true);
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
@@ -609,19 +609,19 @@ mod tests {
                 let job = Arc::new(Job::Download(foo.clone(), hash));
                 // Check Pending notification
                 assert_eq!(
-                    ChurtenNotification::New { arena, job_id, job },
+                    TransferNotification::New { arena, job_id, job },
                     rx.recv().await?
                 );
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check progress updates
                 assert_eq!(
-                    ChurtenNotification::UpdateByteCount {
+                    TransferNotification::UpdateByteCount {
                         arena,
                         job_id,
                         current_bytes: 50 * 1024,
@@ -631,7 +631,7 @@ mod tests {
                 );
 
                 assert_eq!(
-                    ChurtenNotification::UpdateByteCount {
+                    TransferNotification::UpdateByteCount {
                         arena,
                         job_id,
                         current_bytes: 100 * 1024,
@@ -642,7 +642,7 @@ mod tests {
 
                 // Check Done notification
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_job_abandoned() -> anyhow::Result<()> {
+    async fn transfer_job_abandoned() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -673,10 +673,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Abandoned("fake")));
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
@@ -684,7 +684,7 @@ mod tests {
 
                 // Check Pending notification
                 assert_eq!(
-                    ChurtenNotification::New {
+                    TransferNotification::New {
                         arena,
                         job_id,
                         job: Arc::new(Job::Download(foo.clone(), hash)),
@@ -694,13 +694,13 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Abandoned notification
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Abandoned,
@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_job_fails() -> anyhow::Result<()> {
+    async fn transfer_job_fails() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -731,10 +731,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(move || Err(JobError::InconsistentHash));
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
@@ -743,19 +743,19 @@ mod tests {
 
                 // Check Pending notification
                 assert_eq!(
-                    ChurtenNotification::New { arena, job_id, job },
+                    TransferNotification::New { arena, job_id, job },
                     rx.recv().await?
                 );
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Failed notification
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Failed(JobError::InconsistentHash.to_string()),
@@ -775,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_job_cancelled() -> anyhow::Result<()> {
+    async fn transfer_job_cancelled() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -790,10 +790,10 @@ mod tests {
 
                 // Create a handler that will be cancelled
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_cancel(true);
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
@@ -801,7 +801,7 @@ mod tests {
 
                 // Check Pending notification
                 assert_eq!(
-                    ChurtenNotification::New {
+                    TransferNotification::New {
                         arena,
                         job_id,
                         job: Arc::new(Job::Download(foo.clone(), hash.clone()))
@@ -811,13 +811,13 @@ mod tests {
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Cancelled notification
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Cancelled
@@ -837,7 +837,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_job_no_progress_updates() -> anyhow::Result<()> {
+    async fn transfer_job_no_progress_updates() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -851,10 +851,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done)).with_progress(false);
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
                 let (foo, hash) = fixture.inner.write_file(b, "foo", "test content").await?;
@@ -863,19 +863,19 @@ mod tests {
 
                 // Check Pending notification
                 assert_eq!(
-                    ChurtenNotification::New { arena, job_id, job },
+                    TransferNotification::New { arena, job_id, job },
                     rx.recv().await?
                 );
 
                 // Check Running notification
                 assert_eq!(
-                    ChurtenNotification::Start { arena, job_id },
+                    TransferNotification::Start { arena, job_id },
                     rx.recv().await?
                 );
 
                 // Check Done notification (no progress updates)
                 assert_eq!(
-                    ChurtenNotification::Stop {
+                    TransferNotification::Stop {
                         arena,
                         job_id,
                         progress: JobProgress::Done,
@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn churten_multiple_jobs_parallel() -> anyhow::Result<()> {
+    async fn transfer_multiple_jobs_parallel() -> anyhow::Result<()> {
         let mut fixture = Fixture::setup().await?;
         fixture
             .inner
@@ -905,10 +905,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::Done));
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
 
@@ -953,15 +953,15 @@ mod tests {
                 {
                     assert!(matches!(
                         job_notifications[0],
-                        ChurtenNotification::New { .. }
+                        TransferNotification::New { .. }
                     ));
                     assert!(matches!(
                         job_notifications[1],
-                        ChurtenNotification::Start { .. }
+                        TransferNotification::Start { .. }
                     ));
                     assert!(matches!(
                         job_notifications[2],
-                        ChurtenNotification::Stop {
+                        TransferNotification::Stop {
                             progress: JobProgress::Done,
                             ..
                         }
@@ -990,10 +990,10 @@ mod tests {
                 testing::connect(&household_a, b).await?;
 
                 let handler = FakeJobHandler::new(|| Ok(JobStatus::NoPeers));
-                let mut churten =
-                    Churten::with_handler(Arc::clone(&storage), household_a.clone(), handler);
-                let mut rx = churten.subscribe();
-                churten.start();
+                let mut transfer =
+                    Transfer::with_handler(Arc::clone(&storage), household_a.clone(), handler);
+                let mut rx = transfer.subscribe();
+                transfer.start();
 
                 storage.set_arena_mark(arena, Mark::Keep).await?;
 
@@ -1008,7 +1008,7 @@ mod tests {
                     tokio::time::timeout(Duration::from_secs(10), rx.recv()).await?
                 {
                     match notification {
-                        ChurtenNotification::Stop { .. } => {
+                        TransferNotification::Stop { .. } => {
                             finished_count += 1;
                             if finished_count == 3 {
                                 break;
@@ -1019,7 +1019,7 @@ mod tests {
                 }
 
                 // Make sure the jobs are reported
-                let all_jobs = churten.all_jobs().await.unwrap();
+                let all_jobs = transfer.all_jobs().await.unwrap();
                 assert_unordered::assert_eq_unordered!(
                     vec![
                         Job::Download(foo1, hash1),

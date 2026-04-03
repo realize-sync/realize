@@ -1,58 +1,58 @@
 use std::sync::Arc;
 
 use super::control_capnp;
-use super::control_capnp::churten_notification;
+use super::control_capnp::transfer_notification;
 use crate::consensus::tracker::JobInfo;
-use crate::consensus::types::{ChurtenNotification, JobAction, JobProgress};
+use crate::consensus::types::{TransferNotification, JobAction, JobProgress};
 use realize_storage::{Job, JobId};
 use realize_types::{Arena, Hash, Path};
 
-/// Convert capnp ChurtenNotification to rust.
+/// Convert capnp TransferNotification to rust.
 pub(crate) fn parse_notification(
-    reader: churten_notification::Reader<'_>,
-) -> Result<ChurtenNotification, capnp::Error> {
+    reader: transfer_notification::Reader<'_>,
+) -> Result<TransferNotification, capnp::Error> {
     let arena = parse_arena(reader.get_arena()?)?;
     let job_id = JobId(reader.get_job_id());
 
     match reader.which()? {
-        churten_notification::Which::New(new_reader) => {
+        transfer_notification::Which::New(new_reader) => {
             let job_reader = new_reader?.get_job()?;
             let job = parse_job(job_reader)?;
 
-            Ok(ChurtenNotification::New {
+            Ok(TransferNotification::New {
                 arena,
                 job_id,
                 job: std::sync::Arc::new(job),
             })
         }
-        churten_notification::Which::Start(_) => Ok(ChurtenNotification::Start { arena, job_id }),
-        churten_notification::Which::Finish(update_reader_result) => {
+        transfer_notification::Which::Start(_) => Ok(TransferNotification::Start { arena, job_id }),
+        transfer_notification::Which::Finish(update_reader_result) => {
             let update_reader = update_reader_result?;
             let progress_reader = update_reader.get_progress()?;
             let progress = parse_progress(progress_reader)?;
 
-            Ok(ChurtenNotification::Stop {
+            Ok(TransferNotification::Stop {
                 arena,
                 job_id,
                 progress,
             })
         }
-        churten_notification::Which::UpdateByteCount(reader) => {
+        transfer_notification::Which::UpdateByteCount(reader) => {
             let reader = reader?;
-            Ok(ChurtenNotification::UpdateByteCount {
+            Ok(TransferNotification::UpdateByteCount {
                 arena,
                 job_id,
                 current_bytes: reader.get_current_bytes(),
                 total_bytes: reader.get_total_bytes(),
             })
         }
-        churten_notification::Which::UpdateAction(reader) => {
+        transfer_notification::Which::UpdateAction(reader) => {
             let reader = reader?;
             let action = parse_action(reader.get_action()?)?.ok_or_else(|| {
                 capnp::Error::failed("A JobAction must be set in UpdateAction".to_string())
             })?;
 
-            Ok(ChurtenNotification::UpdateAction {
+            Ok(TransferNotification::UpdateAction {
                 arena,
                 job_id,
                 action,
@@ -61,10 +61,10 @@ pub(crate) fn parse_notification(
     }
 }
 
-/// Convert rust ChurtenNotification to capnp.
+/// Convert rust TransferNotification to capnp.
 pub(crate) fn fill_notification(
-    source: ChurtenNotification,
-    mut dest: churten_notification::Builder<'_>,
+    source: TransferNotification,
+    mut dest: transfer_notification::Builder<'_>,
 ) {
     let arena = source.arena();
     let job_id = source.job_id();
@@ -72,20 +72,20 @@ pub(crate) fn fill_notification(
     dest.set_arena(&arena.as_str());
     dest.set_job_id(job_id.as_u64());
     match &source {
-        ChurtenNotification::New { job, .. } => {
+        TransferNotification::New { job, .. } => {
             fill_job(job, dest.reborrow().init_new().init_job());
         }
-        ChurtenNotification::Start { .. } => {
+        TransferNotification::Start { .. } => {
             dest.reborrow().init_start();
         }
-        ChurtenNotification::Stop { progress, .. } => {
+        TransferNotification::Stop { progress, .. } => {
             fill_progress(progress, dest.reborrow().init_finish().init_progress());
         }
-        ChurtenNotification::UpdateAction { action, .. } => {
+        TransferNotification::UpdateAction { action, .. } => {
             let mut update = dest.reborrow().init_update_action();
             update.set_action(to_capnp_action(Some(action)));
         }
-        ChurtenNotification::UpdateByteCount {
+        TransferNotification::UpdateByteCount {
             current_bytes,
             total_bytes,
             ..
@@ -241,47 +241,47 @@ mod tests {
     use capnp::message::Builder;
     use capnp::serialize_packed;
 
-    fn create_test_notification() -> ChurtenNotification {
+    fn create_test_notification() -> TransferNotification {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
         let path = Path::parse("test/file.txt").unwrap();
         let hash = Hash([0x42; 32]);
         let job = Job::Download(path, hash);
 
-        ChurtenNotification::New {
+        TransferNotification::New {
             arena,
             job_id,
             job: std::sync::Arc::new(job),
         }
     }
 
-    fn create_test_update_notification() -> ChurtenNotification {
+    fn create_test_update_notification() -> TransferNotification {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::Stop {
+        TransferNotification::Stop {
             arena,
             job_id,
             progress: JobProgress::Done,
         }
     }
 
-    fn create_test_update_failed_notification() -> ChurtenNotification {
+    fn create_test_update_failed_notification() -> TransferNotification {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::Stop {
+        TransferNotification::Stop {
             arena,
             job_id,
             progress: JobProgress::Failed("error".to_string()),
         }
     }
 
-    fn create_test_update_byte_count_notification() -> ChurtenNotification {
+    fn create_test_update_byte_count_notification() -> TransferNotification {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::UpdateByteCount {
+        TransferNotification::UpdateByteCount {
             arena,
             job_id,
             current_bytes: 42,
@@ -289,27 +289,27 @@ mod tests {
         }
     }
 
-    fn create_test_update_action_notification() -> ChurtenNotification {
+    fn create_test_update_action_notification() -> TransferNotification {
         let arena = Arena::from("test-arena");
         let job_id = JobId(123);
 
-        ChurtenNotification::UpdateAction {
+        TransferNotification::UpdateAction {
             arena,
             job_id,
             action: JobAction::Download,
         }
     }
 
-    fn round_trip_test(original: ChurtenNotification) {
+    fn round_trip_test(original: TransferNotification) {
         // Convert to capnp
         let mut message = Builder::new_default();
-        let mut builder = message.init_root::<churten_notification::Builder>();
+        let mut builder = message.init_root::<transfer_notification::Builder>();
         fill_notification(original.clone(), builder.reborrow());
 
         // Convert back to rust
         let msg_reader = message.into_reader();
         let reader = msg_reader
-            .get_root::<churten_notification::Reader>()
+            .get_root::<transfer_notification::Reader>()
             .unwrap();
         let parsed = parse_notification(reader).unwrap();
 
@@ -348,7 +348,7 @@ mod tests {
         let job_id = JobId(123);
 
         for action in [JobAction::Download, JobAction::Verify, JobAction::Repair] {
-            let notification = ChurtenNotification::UpdateAction {
+            let notification = TransferNotification::UpdateAction {
                 arena,
                 job_id,
                 action,
@@ -369,7 +369,7 @@ mod tests {
             JobProgress::Cancelled,
             JobProgress::Failed("Test error".to_string()),
         ] {
-            let notification = ChurtenNotification::Stop {
+            let notification = TransferNotification::Stop {
                 arena,
                 job_id,
                 progress,
@@ -384,7 +384,7 @@ mod tests {
 
         // Convert to capnp and serialize
         let mut message = Builder::new_default();
-        let mut builder = message.init_root::<churten_notification::Builder>();
+        let mut builder = message.init_root::<transfer_notification::Builder>();
         fill_notification(original.clone(), builder.reborrow());
 
         let mut buffer = Vec::new();
@@ -395,7 +395,7 @@ mod tests {
             serialize_packed::read_message(&mut &buffer[..], capnp::message::ReaderOptions::new())
                 .unwrap();
         let reader = message_reader
-            .get_root::<churten_notification::Reader>()
+            .get_root::<transfer_notification::Reader>()
             .unwrap();
         let parsed = parse_notification(reader).unwrap();
 

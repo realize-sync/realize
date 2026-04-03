@@ -114,14 +114,14 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn churten_is_running() -> anyhow::Result<()> {
+async fn transfer_is_running() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
 
     local
         .run_until(async move {
             // Test the control command with timeout
-            let mut control_cmd = fixture.control_command(&["churten", "is-running"])?;
+            let mut control_cmd = fixture.control_command(&["transfer", "is-running"])?;
             let output =
                 tokio::time::timeout(Duration::from_secs(3), control_cmd.output()).await??;
             if !output.status.success() {
@@ -144,7 +144,7 @@ async fn churten_is_running() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn churten_is_running_quiet() -> anyhow::Result<()> {
+async fn transfer_is_running_quiet() -> anyhow::Result<()> {
     let local = LocalSet::new();
     let fixture = Fixture::setup(&local).await?;
 
@@ -152,7 +152,7 @@ async fn churten_is_running_quiet() -> anyhow::Result<()> {
         .run_until(async move {
             // Test the quiet mode
             let output = fixture
-                .control_command(&["--output=quiet", "churten", "is-running"])?
+                .control_command(&["--output=quiet", "transfer", "is-running"])?
                 .output()
                 .await?;
 

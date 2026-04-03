@@ -1,4 +1,4 @@
-use super::types::{ChurtenNotification, JobAction, JobProgress};
+use super::types::{TransferNotification, JobAction, JobProgress};
 use realize_storage::{Job, JobId};
 use realize_types::Arena;
 use std::collections::{HashMap, hash_map::IntoValues};
@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 /// Information about a job and its progress.
 ///
-/// This structure is a snapshot of [ChurtenNotification]s for a given
+/// This structure is a snapshot of [TransferNotification]s for a given
 /// job, built by the [JobInfoTracker]
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobInfo {
@@ -84,12 +84,12 @@ impl JobInfoTracker {
     ///
     /// Return false if the notification was a duplicate or came
     /// out-of-sequence.
-    pub fn update(&mut self, notification: &ChurtenNotification) -> bool {
+    pub fn update(&mut self, notification: &TransferNotification) -> bool {
         let arena = notification.arena();
         let job_id = notification.job_id();
         let global_id = notification.global_job_id();
         match notification {
-            ChurtenNotification::New { job, .. } => {
+            TransferNotification::New { job, .. } => {
                 if !self.jobs.contains_key(&global_id) {
                     self.jobs.insert(
                         global_id,
@@ -105,7 +105,7 @@ impl JobInfoTracker {
                     return true;
                 }
             }
-            ChurtenNotification::Start { .. } => {
+            TransferNotification::Start { .. } => {
                 if let Some(info) = self.jobs.get_mut(&global_id)
                     && (info.progress != JobProgress::Running && !info.progress.is_final())
                 {
@@ -113,7 +113,7 @@ impl JobInfoTracker {
                     return true;
                 }
             }
-            ChurtenNotification::Stop { progress, .. } => {
+            TransferNotification::Stop { progress, .. } => {
                 if let Some(info) = self.jobs.get_mut(&global_id)
                     && (info.progress == JobProgress::Running
                         || info.progress == JobProgress::Pending)
@@ -123,7 +123,7 @@ impl JobInfoTracker {
                     return true;
                 }
             }
-            ChurtenNotification::UpdateAction { action, .. } => {
+            TransferNotification::UpdateAction { action, .. } => {
                 if let Some(info) = self.jobs.get_mut(&global_id)
                     && info.progress == JobProgress::Running
                 {
@@ -132,7 +132,7 @@ impl JobInfoTracker {
                     return true;
                 }
             }
-            ChurtenNotification::UpdateByteCount {
+            TransferNotification::UpdateByteCount {
                 current_bytes,
                 total_bytes,
                 ..
@@ -190,71 +190,71 @@ mod tests {
             (self.arena, self.job_id)
         }
 
-        fn create_notification(&self, notification_type: &str) -> ChurtenNotification {
+        fn create_notification(&self, notification_type: &str) -> TransferNotification {
             match notification_type {
-                "new" => ChurtenNotification::New {
+                "new" => TransferNotification::New {
                     arena: self.arena,
                     job_id: self.job_id,
                     job: Arc::clone(&self.job),
                 },
-                "start" => ChurtenNotification::Start {
+                "start" => TransferNotification::Start {
                     arena: self.arena,
                     job_id: self.job_id,
                 },
-                "done" => ChurtenNotification::Stop {
+                "done" => TransferNotification::Stop {
                     arena: self.arena,
                     job_id: self.job_id,
                     progress: JobProgress::Done,
                 },
-                "failed" => ChurtenNotification::Stop {
+                "failed" => TransferNotification::Stop {
                     arena: self.arena,
                     job_id: self.job_id,
                     progress: JobProgress::Failed("test".to_string()),
                 },
-                "abandoned" => ChurtenNotification::Stop {
+                "abandoned" => TransferNotification::Stop {
                     arena: self.arena,
                     job_id: self.job_id,
                     progress: JobProgress::Abandoned,
                 },
-                "update_action(0)" => ChurtenNotification::UpdateAction {
+                "update_action(0)" => TransferNotification::UpdateAction {
                     arena: self.arena,
                     job_id: self.job_id,
                     action: JobAction::Download,
                 },
-                "update_action(1)" => ChurtenNotification::UpdateAction {
+                "update_action(1)" => TransferNotification::UpdateAction {
                     arena: self.arena,
                     job_id: self.job_id,
                     action: JobAction::Download,
                 },
-                "update_action(2)" => ChurtenNotification::UpdateAction {
+                "update_action(2)" => TransferNotification::UpdateAction {
                     arena: self.arena,
                     job_id: self.job_id,
                     action: JobAction::Download,
                 },
-                "update_action(3)" => ChurtenNotification::UpdateAction {
+                "update_action(3)" => TransferNotification::UpdateAction {
                     arena: self.arena,
                     job_id: self.job_id,
                     action: JobAction::Verify,
                 },
-                "update_byte_count(0)" => ChurtenNotification::UpdateByteCount {
+                "update_byte_count(0)" => TransferNotification::UpdateByteCount {
                     arena: self.arena,
                     job_id: self.job_id,
                     current_bytes: 50,
                     total_bytes: 1000,
                 },
-                "update_byte_count(1)" => ChurtenNotification::UpdateByteCount {
+                "update_byte_count(1)" => TransferNotification::UpdateByteCount {
                     arena: self.arena,
                     job_id: self.job_id,
                     current_bytes: 100,
                     total_bytes: 1000,
                 },
-                "update_byte_count(2)" => ChurtenNotification::UpdateByteCount {
+                "update_byte_count(2)" => TransferNotification::UpdateByteCount {
                     arena: self.arena,
                     job_id: self.job_id,
                     current_bytes: 100,
                     total_bytes: 1000,
                 },
-                "update_byte_count(3)" => ChurtenNotification::UpdateByteCount {
+                "update_byte_count(3)" => TransferNotification::UpdateByteCount {
                     arena: self.arena,
                     job_id: self.job_id,
                     current_bytes: 200,

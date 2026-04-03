@@ -1,4 +1,4 @@
-pub(crate) mod churten;
+pub(crate) mod transfer;
 pub mod jobs;
 pub(crate) mod progress;
 pub mod tracker;
